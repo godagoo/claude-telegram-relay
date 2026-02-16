@@ -301,6 +301,8 @@ See the `templates/` directory in the [LTLClaude repository](https://github.com/
 - Local markdown files with YAML frontmatter in `~/.claude-relay/secondbrain/` (002-secondbrain-integration)
 - Bash 5.x (setup script), YAML (podmgr config), Python 3.12 + podmgr (Little-Town-Labs/podman-systemd-manager), Podman (003-secondbrain-infra)
 - `/var/lib/secondbrain/` (service account home), `/mnt/fileshare/` (003-secondbrain-infra)
+- TypeScript 5.9+ on Node.js 18 + grammy 1.21+, pino 9.5+, zod 3.24+, Node.js `fs/promises`, `path`, `fs` (no new npm deps) (004-file-access)
+- In-memory snapshot for share watcher state; no new persistent files for this feature (004-file-access)
 
 ## Recent Changes
 - 001-modular-service-layer: Added TypeScript 5.9+ on Node.js 18+ + grammy 1.21+, pino 9.5+, zod 3.24+

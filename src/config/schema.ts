@@ -20,7 +20,10 @@ export const configSchema = z.object({
 
   claudePath: z.string().default("claude").describe("Path to Claude CLI executable"),
 
-  claudeModel: z.string().optional().describe("Claude model ID to use (e.g. claude-haiku-4-5-20251001)"),
+  claudeModel: z
+    .string()
+    .optional()
+    .describe("Claude model ID to use (e.g. claude-haiku-4-5-20251001)"),
 
   relayDir: z.string().default(defaultRelayDir).describe("Base directory for relay data"),
 
@@ -51,6 +54,32 @@ export const configSchema = z.object({
     .positive()
     .default(120000)
     .describe("Default timeout for Claude CLI invocations in milliseconds (default 2min)"),
+
+  // File access (optional, disabled by default)
+  files: z
+    .object({
+      shareRoot: z.string().optional().describe("Absolute path to mounted Windows share"),
+      brainRoot: z.string().optional().describe("Absolute path to SecondBrain data directory"),
+      maxReadBytes: z
+        .number()
+        .int()
+        .positive()
+        .default(51200)
+        .describe("Max bytes injectable by /read (default 50 KB)"),
+      sharePollIntervalMs: z
+        .number()
+        .int()
+        .positive()
+        .default(10000)
+        .describe("Share watcher poll interval in ms (default 10s)"),
+      brainDebounceMs: z
+        .number()
+        .int()
+        .positive()
+        .default(2000)
+        .describe("Brain watcher debounce delay in ms (default 2s)"),
+    })
+    .optional(),
 
   // SecondBrain (optional, disabled by default)
   secondbrain: z
@@ -144,5 +173,33 @@ export function parseEnvVars(): ConfigInput {
       ? Number.parseInt(process.env["CLI_TIMEOUT_MS"], 10)
       : undefined,
     secondbrain: parseSecondBrainEnvVars(),
+    files: parseFilesEnvVars(),
+  };
+}
+
+/**
+ * Parse file access env vars into config input.
+ */
+function parseFilesEnvVars(): ConfigInput["files"] {
+  const shareRoot = process.env["FILES_SHARE_ROOT"];
+  const brainRoot = process.env["FILES_BRAIN_ROOT"];
+
+  // Fall back to secondbrain.dataDir for brainRoot when not explicitly set
+  const resolvedBrainRoot = brainRoot ?? process.env["SECONDBRAIN_DATA_DIR"] ?? undefined;
+
+  if (!shareRoot && !resolvedBrainRoot) return undefined;
+
+  return {
+    shareRoot,
+    brainRoot: resolvedBrainRoot,
+    maxReadBytes: process.env["FILES_MAX_READ_BYTES"]
+      ? Number.parseInt(process.env["FILES_MAX_READ_BYTES"], 10)
+      : undefined,
+    sharePollIntervalMs: process.env["FILES_SHARE_POLL_INTERVAL_MS"]
+      ? Number.parseInt(process.env["FILES_SHARE_POLL_INTERVAL_MS"], 10)
+      : undefined,
+    brainDebounceMs: process.env["FILES_BRAIN_DEBOUNCE_MS"]
+      ? Number.parseInt(process.env["FILES_BRAIN_DEBOUNCE_MS"], 10)
+      : undefined,
   };
 }

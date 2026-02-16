@@ -12,3 +12,4 @@ export { SynthesisService } from "./synthesis";
 export { DigestService } from "./digest";
 export { FixerService } from "./fixer";
 export { SchedulerService } from "./scheduler";
+export { FileService } from "./files";

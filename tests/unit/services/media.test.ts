@@ -77,12 +77,8 @@ describe("Media Handlers", () => {
       expect(fetch).toHaveBeenCalledWith(expect.stringContaining("photos/test.jpg"));
 
       // Should call Claude with image prompt
-      expect(mockClaudeCall).toHaveBeenCalledWith(
-        expect.stringContaining("[Image:")
-      );
-      expect(mockClaudeCall).toHaveBeenCalledWith(
-        expect.stringContaining("What is this?")
-      );
+      expect(mockClaudeCall).toHaveBeenCalledWith(expect.stringContaining("[Image:"));
+      expect(mockClaudeCall).toHaveBeenCalledWith(expect.stringContaining("What is this?"));
 
       // Should return the response
       expect(result).toBe("It's a cat!");
@@ -179,9 +175,7 @@ describe("Media Handlers", () => {
         logger: mockLogger,
       });
 
-      expect(mockClaudeCall).toHaveBeenCalledWith(
-        expect.stringContaining("Analyze this image")
-      );
+      expect(mockClaudeCall).toHaveBeenCalledWith(expect.stringContaining("Analyze this image"));
     });
   });
 
@@ -228,12 +222,8 @@ describe("Media Handlers", () => {
       });
 
       expect(ctx.getFile).toHaveBeenCalled();
-      expect(mockClaudeCall).toHaveBeenCalledWith(
-        expect.stringContaining("[File:")
-      );
-      expect(mockClaudeCall).toHaveBeenCalledWith(
-        expect.stringContaining("Summarize this")
-      );
+      expect(mockClaudeCall).toHaveBeenCalledWith(expect.stringContaining("[File:"));
+      expect(mockClaudeCall).toHaveBeenCalledWith(expect.stringContaining("Summarize this"));
       expect(result).toBe("Summary: ...");
       expect(fs.unlink).toHaveBeenCalled();
     });
@@ -301,9 +291,7 @@ describe("Media Handlers", () => {
         logger: mockLogger,
       });
 
-      expect(mockClaudeCall).toHaveBeenCalledWith(
-        expect.stringContaining("data.csv")
-      );
+      expect(mockClaudeCall).toHaveBeenCalledWith(expect.stringContaining("data.csv"));
     });
   });
 

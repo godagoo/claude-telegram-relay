@@ -17,6 +17,7 @@ import {
   CaptureService,
   ClaudeService,
   DigestService,
+  FileService,
   FixerService,
   MemoryService,
   ScannerService,
@@ -27,7 +28,10 @@ import {
   handlePhoto,
   handleVoice,
 } from "./services";
+import { WatcherService } from "./services/watcher";
 import type { AppConfig } from "./types";
+import { FileAccessError } from "./types/files";
+import type { ShareDiff } from "./types/files";
 import {
   MessageQueue,
   createLockManager,
@@ -52,7 +56,10 @@ async function checkClaudeCli(claudePath: string): Promise<void> {
     await execFileAsync(claudePath, ["--version"]);
     log.info("Claude CLI available");
   } catch {
-    log.error({ claudePath }, "Claude CLI not found. Install it or set CLAUDE_PATH.");
+    log.error(
+      { claudePath },
+      "Claude CLI not found. Install it or set CLAUDE_PATH.",
+    );
     process.exit(1);
   }
 }
@@ -81,7 +88,10 @@ async function main(): Promise<void> {
   // Create required directories
   await mkdir(config.tempDir, { recursive: true });
   await mkdir(config.uploadsDir, { recursive: true });
-  log.debug({ tempDir: config.tempDir, uploadsDir: config.uploadsDir }, "Directories created");
+  log.debug(
+    { tempDir: config.tempDir, uploadsDir: config.uploadsDir },
+    "Directories created",
+  );
 
   // Acquire lock
   const lockManager = createLockManager(config.lockFile);
@@ -102,9 +112,12 @@ async function startBot(config: AppConfig): Promise<void> {
   const sessionManager = new SessionManager(
     config.sessionFile,
     config.sessionTtlMs,
-    createLogger("session")
+    createLogger("session"),
   );
-  const memoryService = new MemoryService(config.memoryFile, createLogger("memory"));
+  const memoryService = new MemoryService(
+    config.memoryFile,
+    createLogger("memory"),
+  );
   const queue = new MessageQueue();
 
   // Auth middleware
@@ -126,19 +139,64 @@ async function startBot(config: AppConfig): Promise<void> {
     await ctx.reply("Session cleared. Starting fresh conversation.");
   });
 
+  // /help command — list available commands
+  bot.command("help", async (ctx) => {
+    const lines = [
+      "**Available commands:**",
+      "",
+      "/new — start a fresh conversation",
+      "/help — show this message",
+    ];
+
+    if (config.secondbrain?.enabled) {
+      lines.push(
+        "",
+        "**SecondBrain:**",
+        "/capture <thought> — save a note or idea",
+        "/stats — show capture statistics",
+        "/review — list items needing review",
+        "/digest — generate a daily digest",
+        "/fix <category> — re-categorise a capture",
+      );
+    }
+
+    if (config.files?.shareRoot || config.files?.brainRoot) {
+      lines.push(
+        "",
+        "**File access:**",
+        "/files — list configured roots",
+        "/files <root>/<path> — browse a directory  e.g. /files share/People",
+        "/read <root>/<path> — inject file into Claude  e.g. /read share/Notes.md",
+        "/search <query> — search file names  e.g. /search alice",
+      );
+    }
+
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  });
+
   // SecondBrain commands (only when enabled)
+  let scannerServiceForReindex: ScannerService | undefined;
   if (config.secondbrain?.enabled) {
     const sbLog = createLogger("secondbrain");
     const captureService = new CaptureService(config, claudeService, sbLog);
-    const scannerService = new ScannerService(config, sbLog);
-    const synthesisService = new SynthesisService(scannerService, config, sbLog);
-    const digestService = new DigestService(claudeService, synthesisService, config, sbLog);
+    scannerServiceForReindex = new ScannerService(config, sbLog);
+    const synthesisService = new SynthesisService(
+      scannerServiceForReindex,
+      config,
+      sbLog,
+    );
+    const digestService = new DigestService(
+      claudeService,
+      synthesisService,
+      config,
+      sbLog,
+    );
     const fixerService = new FixerService(config, sbLog);
     const schedulerService = new SchedulerService(
       digestService,
       (chatId, text) => bot.api.sendMessage(chatId, text),
       config,
-      sbLog
+      sbLog,
     );
 
     schedulerService.start();
@@ -150,11 +208,14 @@ async function startBot(config: AppConfig): Promise<void> {
         return;
       }
       await ctx.replyWithChatAction("typing");
-      const result = await captureService.capture(text, ctx.from?.id.toString());
+      const result = await captureService.capture(
+        text,
+        ctx.from?.id.toString(),
+      );
       const reviewNote = result.needsReview ? " (needs review)" : "";
       await ctx.reply(
         `Captured as **${result.category}** (${(result.confidence * 100).toFixed(0)}% confidence)${reviewNote}\nFile: \`${result.filename}\``,
-        { parse_mode: "Markdown" }
+        { parse_mode: "Markdown" },
       );
     });
 
@@ -168,21 +229,25 @@ async function startBot(config: AppConfig): Promise<void> {
         `Needs review: ${stats.needsReview}`,
         "",
         "**By Category:**",
-        ...Object.entries(stats.byCategory).map(([cat, count]) => `  ${cat}: ${count}`),
+        ...Object.entries(stats.byCategory).map(
+          ([cat, count]) => `  ${cat}: ${count}`,
+        ),
       ];
       await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
     });
 
     bot.command("review", async (ctx) => {
       await ctx.replyWithChatAction("typing");
-      const docs = await scannerService.getNeedsReview();
+      const docs = await scannerServiceForReindex!.getNeedsReview();
       if (docs.length === 0) {
         await ctx.reply("No items need review. All clear!");
         return;
       }
       const lines = ["**Items Needing Review:**", ""];
       for (const doc of docs) {
-        lines.push(`- \`${doc.filename}\` (${(doc.confidence * 100).toFixed(0)}%) — ${doc.title}`);
+        lines.push(
+          `- \`${doc.filename}\` (${(doc.confidence * 100).toFixed(0)}%) — ${doc.title}`,
+        );
       }
       lines.push("", "Use `/fix <filename> <category>` to reclassify.");
       await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
@@ -201,25 +266,181 @@ async function startBot(config: AppConfig): Promise<void> {
       const args = ctx.match?.trim().split(/\s+/) ?? [];
       if (args.length === 1 && args[0]) {
         // /fix <category> — fix last capture
-        const filename = await fixerService.findLastUserFile(ctx.from?.id.toString() ?? "");
+        const filename = await fixerService.findLastUserFile(
+          ctx.from?.id.toString() ?? "",
+        );
         if (!filename) {
           await ctx.reply("No recent captures found to fix.");
           return;
         }
-        const result = await fixerService.fixCapture(args[0], filename, ctx.from?.id.toString());
+        const result = await fixerService.fixCapture(
+          args[0],
+          filename,
+          ctx.from?.id.toString(),
+        );
         await ctx.reply(result.message);
       } else if (args.length >= 2 && args[0] && args[1]) {
         // /fix <filename> <category>
-        const result = await fixerService.fixCapture(args[1], args[0], ctx.from?.id.toString());
+        const result = await fixerService.fixCapture(
+          args[1],
+          args[0],
+          ctx.from?.id.toString(),
+        );
         await ctx.reply(result.message);
       } else {
-        await ctx.reply("Usage: `/fix <category>` or `/fix <filename> <category>`", {
-          parse_mode: "Markdown",
-        });
+        await ctx.reply(
+          "Usage: `/fix <category>` or `/fix <filename> <category>`",
+          {
+            parse_mode: "Markdown",
+          },
+        );
       }
     });
 
     sbLog.info("SecondBrain commands registered");
+  }
+
+  // File access commands (only when configured)
+  let watcherService: WatcherService | undefined;
+  if (config.files?.shareRoot || config.files?.brainRoot) {
+    const filesLog = createLogger("files");
+    const fileService = new FileService(config.files, filesLog);
+
+    // Determine the authorized chat ID for watcher notifications
+    const authorizedChatId =
+      config.allowedUserId || config.secondbrain?.chatId || "";
+
+    // onShareChange callback — send Telegram notification
+    const onShareChange = async (diff: ShareDiff) => {
+      const lines: string[] = ["Files changed on share:"];
+      for (const f of diff.added) lines.push(`  + ${f}`);
+      for (const f of diff.modified) lines.push(`  ~ ${f}`);
+      for (const f of diff.deleted) lines.push(`  - ${f}`);
+      if (authorizedChatId) {
+        try {
+          await bot.api.sendMessage(authorizedChatId, lines.join("\n"));
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          filesLog.warn(
+            { error: msg },
+            "Failed to send share change notification",
+          );
+        }
+      }
+    };
+
+    // onBrainChange callback — trigger scanner re-index (if secondbrain enabled)
+    const onBrainChange = async () => {
+      if (config.secondbrain?.enabled && scannerServiceForReindex) {
+        try {
+          await scannerServiceForReindex.scanAllDocuments();
+          filesLog.info("Brain change: scanner re-index complete");
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          filesLog.warn({ error: msg }, "Brain change: re-index failed");
+        }
+      }
+    };
+
+    watcherService = new WatcherService(
+      config.files,
+      { onShareChange, onBrainChange },
+      fileService.pendingWrites,
+      filesLog,
+    );
+
+    // /files command — browse directories
+    // Usage: /files [<root>/<path>]
+    // Examples: /files  /files share  /files share/People
+    bot.command("files", async (ctx) => {
+      const args = ctx.match?.trim() || undefined;
+      try {
+        const entries = await fileService.list(args);
+        if (entries.length === 0) {
+          await ctx.reply("(empty directory)");
+          return;
+        }
+        const lines = entries.map((e) =>
+          e.type === "directory" ? `[DIR] ${e.name}/` : `[FILE] ${e.name}`,
+        );
+        await ctx.reply(lines.join("\n"));
+      } catch (err: unknown) {
+        if (err instanceof FileAccessError) {
+          await ctx.reply(`Error: ${err.message}`);
+        } else {
+          await ctx.reply("Unexpected error listing files.");
+        }
+      }
+    });
+
+    // /read <root/path> — inject file content into Claude prompt
+    // Example: /read share/People/Alice.md
+    bot.command("read", async (ctx) => {
+      const rawPath = ctx.match?.trim();
+      if (!rawPath) {
+        await ctx.reply(
+          "Usage: /read <root/path>  e.g. /read share/People/Alice.md",
+        );
+        return;
+      }
+      try {
+        const result = await fileService.read(rawPath);
+        await ctx.replyWithChatAction("typing");
+
+        const filePrefix = `File content from ${rawPath}:\n\n${result.text}\n\n---\n\n`;
+        const memoryContext = await memoryService.getContext();
+        const prompt = claudeService.buildPrompt(
+          `${filePrefix}(File injected — you may now answer questions about it.)`,
+          memoryContext || undefined,
+        );
+        const response = await claudeService.call(prompt);
+        await sessionManager.updateActivity();
+
+        let reply = response;
+        if (result.truncated) {
+          reply += `\n\n_(File was truncated at ${config.files?.maxReadBytes ?? 51200} bytes)_`;
+        }
+        await sendResponse(ctx, reply);
+      } catch (err: unknown) {
+        if (err instanceof FileAccessError) {
+          await ctx.reply(`Error: ${err.message}`);
+        } else {
+          await ctx.reply("Unexpected error reading file.");
+        }
+      }
+    });
+
+    // /search <query> — search file names across configured roots
+    // Example: /search alice  /search share/alice
+    bot.command("search", async (ctx) => {
+      const query = ctx.match?.trim();
+      if (!query) {
+        await ctx.reply("Usage: /search <query>  e.g. /search alice");
+        return;
+      }
+      try {
+        const results = await fileService.search(query);
+        if (results.length === 0) {
+          await ctx.reply(`No results found for \`${query}\``, {
+            parse_mode: "Markdown",
+          });
+          return;
+        }
+        const lines = results.map(
+          (r, i) =>
+            `${i + 1}. ${r.root}/${r.relativePath}${r.type === "directory" ? "/" : ""}`,
+        );
+        await ctx.reply(lines.join("\n"));
+      } catch (err: unknown) {
+        if (err instanceof FileAccessError) {
+          await ctx.reply(`Error: ${err.message}`);
+        } else {
+          await ctx.reply("Unexpected error searching files.");
+        }
+      }
+    });
+
+    filesLog.info("File access commands registered");
   }
 
   // Text message handler
@@ -232,14 +453,18 @@ async function startBot(config: AppConfig): Promise<void> {
 
     queue.enqueue(async () => {
       const memoryContext = await memoryService.getContext();
-      const prompt = claudeService.buildPrompt(text, memoryContext || undefined);
+      const prompt = claudeService.buildPrompt(
+        text,
+        memoryContext || undefined,
+      );
       const response = await claudeService.call(prompt);
 
       // Update session activity tracking (no CLI session resumption)
       await sessionManager.updateActivity();
 
       // Process intent markers from Claude's response
-      const { cleaned, intents, confirmations } = claudeService.detectIntents(response);
+      const { cleaned, intents, confirmations } =
+        claudeService.detectIntents(response);
 
       if (intents.remember) {
         await memoryService.addFact(intents.remember);
@@ -298,11 +523,17 @@ async function startBot(config: AppConfig): Promise<void> {
     await ctx.reply(handleVoice());
   });
 
-  log.info({ allowedUserId: config.allowedUserId || "ANY" }, "Starting Claude Telegram Relay");
+  log.info(
+    { allowedUserId: config.allowedUserId || "ANY" },
+    "Starting Claude Telegram Relay",
+  );
 
   bot.start({
     onStart: () => {
       log.info("Bot is running");
+      if (watcherService) {
+        watcherService.start();
+      }
     },
   });
 }

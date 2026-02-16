@@ -28,3 +28,13 @@ export type {
   FrontmatterResult,
 } from "./secondbrain";
 export { VALID_CATEGORIES } from "./secondbrain";
+export type {
+  FilesConfig,
+  FileEntry,
+  FileContent,
+  SearchResult,
+  ShareDiff,
+  WatcherCallbacks,
+} from "./files";
+export { FileAccessError } from "./files";
+export type { FileAccessErrorCode } from "./files";

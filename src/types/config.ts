@@ -53,6 +53,9 @@ export interface AppConfig {
 
   /** SecondBrain configuration (optional, disabled by default) */
   secondbrain?: import("./secondbrain").SecondBrainConfig;
+
+  /** File access configuration (optional, disabled by default) */
+  files?: import("./files").FilesConfig;
 }
 
 export interface ClaudeCallOptions {
