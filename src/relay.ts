@@ -10,7 +10,7 @@
 import { Bot, Context } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
-import { join, dirname } from "path";
+import { join, dirname, basename } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
 import {
@@ -362,7 +362,7 @@ bot.on("message:document", async (ctx) => {
   try {
     const file = await ctx.getFile();
     const timestamp = Date.now();
-    const fileName = doc.file_name || `file_${timestamp}`;
+    const fileName = basename(doc.file_name || `file_${timestamp}`);
     const filePath = join(UPLOADS_DIR, `${timestamp}_${fileName}`);
 
     const response = await fetch(
