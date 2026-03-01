@@ -84,12 +84,12 @@ async function installService(config: ServiceDef): Promise<boolean> {
   await run(["npx", "pm2", "delete", config.name]);
 
   const result = await run([
-    "npx", "pm2", "start", config.script,
-    "--interpreter", "bun",
+    "npx", "pm2", "start", "bun",
     "--name", config.name,
     "--cwd", PROJECT_ROOT,
     "-o", join(LOGS_DIR, `${config.name}.log`),
     "-e", join(LOGS_DIR, `${config.name}.error.log`),
+    "--", "run", config.script,
   ]);
 
   if (result.ok) {
