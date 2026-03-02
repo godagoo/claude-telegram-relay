@@ -25,6 +25,14 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
 const CMC_API_KEY =
   process.env.CMC_API_KEY || process.env.COINMARKETCAP_API_KEY || "";
+
+// All chat IDs that should receive crypto reports.
+// CRYPTO_REPORT_CHAT_IDS overrides the default (personal only).
+// Set to a comma-separated list of group IDs + your personal ID.
+// Example: CRYPTO_REPORT_CHAT_IDS=-1001234567890,-1009876543210,7105876857
+const REPORT_CHAT_IDS: string[] = process.env.CRYPTO_REPORT_CHAT_IDS
+  ? process.env.CRYPTO_REPORT_CHAT_IDS.split(",").map((s) => s.trim()).filter(Boolean)
+  : [CHAT_ID];
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 
 const WATCHLIST_ID = "67453707ad745f0bbd4ad54f";
@@ -58,7 +66,7 @@ interface CoinData {
 // TELEGRAM
 // ============================================================
 
-async function sendTelegram(message: string): Promise<boolean> {
+async function sendTelegram(message: string, chatId = CHAT_ID): Promise<boolean> {
   try {
     const res = await fetch(
       `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
@@ -66,7 +74,7 @@ async function sendTelegram(message: string): Promise<boolean> {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          chat_id: CHAT_ID,
+          chat_id: chatId,
           text: message,
           parse_mode: "HTML",
           disable_web_page_preview: true,
@@ -75,13 +83,18 @@ async function sendTelegram(message: string): Promise<boolean> {
     );
     if (!res.ok) {
       const body = await res.text();
-      console.error("Telegram error:", res.status, body);
+      console.error(`Telegram error [chat:${chatId}]:`, res.status, body);
     }
     return res.ok;
   } catch (e) {
-    console.error("Telegram send failed:", e);
+    console.error(`Telegram send failed [chat:${chatId}]:`, e);
     return false;
   }
+}
+
+/** Send a message to all configured report chat IDs. */
+async function broadcast(message: string): Promise<void> {
+  await Promise.all(REPORT_CHAT_IDS.map((id) => sendTelegram(message, id)));
 }
 
 // ============================================================
@@ -378,23 +391,25 @@ async function main() {
     process.exit(1);
   }
 
+  console.log(`Broadcasting to ${REPORT_CHAT_IDS.length} chat(s): ${REPORT_CHAT_IDS.join(", ")}`);
+
   // 1. Always: hourly price snapshot
   const priceMsg = buildPriceSnapshot(coins);
-  const priceSent = await sendTelegram(priceMsg);
-  console.log(`Price snapshot sent: ${priceSent}`);
+  await broadcast(priceMsg);
+  console.log(`Price snapshot broadcast done`);
 
   // 2. At 7pm ET: trade setup
   if (isTradeHour) {
     const tradeMsg = buildTradeSetup(coins);
-    const tradeSent = await sendTelegram(tradeMsg);
-    console.log(`Trade setup sent: ${tradeSent}`);
+    await broadcast(tradeMsg);
+    console.log(`Trade setup broadcast done`);
 
     // 3. Sunday 7pm: weekly recap (Claude-powered)
     if (isSunday) {
       console.log("Sunday — generating weekly recap via Claude...");
       const recapMsg = await buildWeeklyRecap(coins);
-      const recapSent = await sendTelegram(recapMsg);
-      console.log(`Weekly recap sent: ${recapSent}`);
+      await broadcast(recapMsg);
+      console.log(`Weekly recap broadcast done`);
     }
   }
 

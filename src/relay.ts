@@ -35,32 +35,41 @@ const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claud
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
 
-// Session tracking for conversation continuity
-const SESSION_FILE = join(RELAY_DIR, "session.json");
+// Session tracking per chat for conversation continuity
+const SESSIONS_FILE = join(RELAY_DIR, "sessions.json");
 
 interface SessionState {
-  sessionId: string | null;
+  sessionId: string;
   lastActivity: string;
 }
 
 // ============================================================
-// SESSION MANAGEMENT
+// SESSION MANAGEMENT (per chat ID)
 // ============================================================
 
-async function loadSession(): Promise<SessionState> {
+const sessions = new Map<string, SessionState>();
+
+async function loadSessions(): Promise<void> {
   try {
-    const content = await readFile(SESSION_FILE, "utf-8");
-    return JSON.parse(content);
+    const content = await readFile(SESSIONS_FILE, "utf-8");
+    const data = JSON.parse(content) as Record<string, SessionState>;
+    for (const [chatId, state] of Object.entries(data)) {
+      sessions.set(chatId, state);
+    }
   } catch {
-    return { sessionId: null, lastActivity: new Date().toISOString() };
+    // No sessions file yet — start fresh
   }
 }
 
-async function saveSession(state: SessionState): Promise<void> {
-  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2));
+async function saveSessions(): Promise<void> {
+  const data: Record<string, SessionState> = {};
+  for (const [chatId, state] of sessions.entries()) {
+    data[chatId] = state;
+  }
+  await writeFile(SESSIONS_FILE, JSON.stringify(data, null, 2));
 }
 
-let session = await loadSession();
+await loadSessions();
 
 // ============================================================
 // LOCK FILE (prevent multiple instances)
@@ -185,18 +194,22 @@ bot.use(async (ctx, next) => {
 
 async function callClaude(
   prompt: string,
-  options?: { resume?: boolean; imagePath?: string }
+  options?: { resume?: boolean; chatId?: string }
 ): Promise<string> {
   const args = [CLAUDE_PATH, "-p", prompt];
 
-  // Resume previous session if available and requested
-  if (options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
+  const chatId = options?.chatId || "default";
+  const chatSession = sessions.get(chatId);
+
+  // Resume the per-chat session if available
+  if (options?.resume && chatSession?.sessionId) {
+    args.push("--resume", chatSession.sessionId);
   }
 
-  args.push("--output-format", "text");
+  // JSON output lets us capture the session_id reliably
+  args.push("--output-format", "json");
 
-  console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`Calling Claude [chat:${chatId}]: ${prompt.substring(0, 50)}...`);
 
   try {
     const proc = spawn(args, {
@@ -205,7 +218,6 @@ async function callClaude(
       cwd: PROJECT_DIR || undefined,
       env: {
         ...process.env,
-        // Pass through any env vars Claude might need
       },
     });
 
@@ -219,15 +231,22 @@ async function callClaude(
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
-    // Extract session ID from output if present (for --resume)
-    const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
-    if (sessionMatch) {
-      session.sessionId = sessionMatch[1];
-      session.lastActivity = new Date().toISOString();
-      await saveSession(session);
+    // Parse JSON to extract response text and session ID
+    try {
+      const json = JSON.parse(output);
+      if (json.session_id) {
+        sessions.set(chatId, {
+          sessionId: json.session_id,
+          lastActivity: new Date().toISOString(),
+        });
+        await saveSessions();
+      }
+      // `result` holds the plain-text response in Claude CLI JSON mode
+      return (json.result ?? output).trim();
+    } catch {
+      // Not valid JSON — return raw output (shouldn't happen normally)
+      return output.trim();
     }
-
-    return output.trim();
   } catch (error) {
     console.error("Spawn error:", error);
     return `Error: Could not run Claude CLI`;
@@ -241,7 +260,8 @@ async function callClaude(
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
-  console.log(`Message: ${text.substring(0, 50)}...`);
+  const chatId = ctx.chat.id.toString();
+  console.log(`Message [chat:${chatId}]: ${text.substring(0, 50)}...`);
 
   await ctx.replyWithChatAction("typing");
 
@@ -254,7 +274,7 @@ bot.on("message:text", async (ctx) => {
   ]);
 
   const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+  const rawResponse = await callClaude(enrichedPrompt, { resume: true, chatId });
 
   // Parse and save any memory intents, strip tags from response
   const response = await processMemoryIntents(supabase, rawResponse);
@@ -266,7 +286,8 @@ bot.on("message:text", async (ctx) => {
 // Voice messages
 bot.on("message:voice", async (ctx) => {
   const voice = ctx.message.voice;
-  console.log(`Voice message: ${voice.duration}s`);
+  const chatId = ctx.chat.id.toString();
+  console.log(`Voice message [chat:${chatId}]: ${voice.duration}s`);
   await ctx.replyWithChatAction("typing");
 
   if (!process.env.VOICE_PROVIDER) {
@@ -301,7 +322,7 @@ bot.on("message:voice", async (ctx) => {
       relevantContext,
       memoryContext
     );
-    const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+    const rawResponse = await callClaude(enrichedPrompt, { resume: true, chatId });
     const claudeResponse = await processMemoryIntents(supabase, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
@@ -314,7 +335,8 @@ bot.on("message:voice", async (ctx) => {
 
 // Photos/Images
 bot.on("message:photo", async (ctx) => {
-  console.log("Image received");
+  const chatId = ctx.chat.id.toString();
+  console.log(`Image received [chat:${chatId}]`);
   await ctx.replyWithChatAction("typing");
 
   try {
@@ -339,7 +361,7 @@ bot.on("message:photo", async (ctx) => {
 
     await saveMessage("user", `[Image]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, { resume: true, chatId });
 
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
@@ -356,7 +378,8 @@ bot.on("message:photo", async (ctx) => {
 // Documents
 bot.on("message:document", async (ctx) => {
   const doc = ctx.message.document;
-  console.log(`Document: ${doc.file_name}`);
+  const chatId = ctx.chat.id.toString();
+  console.log(`Document [chat:${chatId}]: ${doc.file_name}`);
   await ctx.replyWithChatAction("typing");
 
   try {
@@ -376,7 +399,7 @@ bot.on("message:document", async (ctx) => {
 
     await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, { resume: true, chatId });
 
     await unlink(filePath).catch(() => {});
 
