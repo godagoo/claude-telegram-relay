@@ -38,8 +38,11 @@ const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const WATCHLIST_ID = "67453707ad745f0bbd4ad54f";
 
 const DEFAULT_SYMBOLS = [
-  "BTC", "ETH", "SOL", "BNB", "XRP", "AVAX", "LINK", "DOT",
+  "BTC", "ETH", "SOL", "BNB", "XRP", "AVAX", "LINK", "DOT", "XAUT",
 ];
+
+// Always included regardless of watchlist or CMC_SYMBOLS env override.
+const REQUIRED_SYMBOLS = ["AVAX", "XAUT"];
 
 // ============================================================
 // TYPES
@@ -165,7 +168,9 @@ async function getCoins(): Promise<CoinData[]> {
     symbols = DEFAULT_SYMBOLS;
   }
 
-  return fetchCoinData(symbols);
+  // Merge required symbols so they always appear even if missing from watchlist
+  const merged = [...new Set([...symbols, ...REQUIRED_SYMBOLS])];
+  return fetchCoinData(merged);
 }
 
 // ============================================================

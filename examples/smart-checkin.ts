@@ -176,6 +176,16 @@ async function main() {
     process.exit(1);
   }
 
+  // Quiet hours: only run between 7am and 11pm ET
+  const nowET = new Date(
+    new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
+  );
+  const hourET = nowET.getHours();
+  if (hourET < 7 || hourET >= 23) {
+    console.log(`Quiet hours (${hourET}:xx ET) — skipping check-in`);
+    process.exit(0);
+  }
+
   const { shouldCheckin, message } = await askClaudeToDecide();
 
   if (shouldCheckin && message && message !== "none") {
