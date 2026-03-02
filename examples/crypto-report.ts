@@ -149,6 +149,8 @@ async function fetchCoinData(symbols: string[]): Promise<CoinData[]> {
       coins.push(entries[0] as CoinData);
     } else if (entries && !Array.isArray(entries)) {
       coins.push(entries as CoinData);
+    } else {
+      console.warn(`CMC returned no data for symbol: ${sym}`);
     }
   }
   return coins;
