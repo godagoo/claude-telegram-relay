@@ -27,6 +27,16 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
+
+// Build the full set of allowed user IDs.
+// ALLOWED_USER_IDS is a comma-separated list of additional IDs beyond the owner.
+const ALLOWED_USER_IDS: Set<string> = new Set(
+  [
+    ALLOWED_USER_ID,
+    ...(process.env.ALLOWED_USER_IDS ?? "").split(",").map((s) => s.trim()),
+  ].filter(Boolean)
+);
+
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
@@ -178,8 +188,7 @@ const bot = new Bot(BOT_TOKEN);
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id.toString();
 
-  // If ALLOWED_USER_ID is set, enforce it
-  if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
+  if (ALLOWED_USER_IDS.size > 0 && (!userId || !ALLOWED_USER_IDS.has(userId))) {
     console.log(`Unauthorized: ${userId}`);
     await ctx.reply("This bot is private.");
     return;
@@ -506,7 +515,7 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 // ============================================================
 
 console.log("Starting Claude Telegram Relay...");
-console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
+console.log(`Authorized users: ${ALLOWED_USER_IDS.size ? [...ALLOWED_USER_IDS].join(", ") : "ANY (not recommended)"}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
 
 bot.start({
