@@ -222,6 +222,9 @@ async function callClaude(
     args.push("--resume", chatSession.sessionId);
   }
 
+  // Non-interactive: skip permission prompts so subprocess never hangs
+  args.push("--dangerously-skip-permissions");
+
   // JSON output lets us capture the session_id reliably
   args.push("--output-format", "json");
 
