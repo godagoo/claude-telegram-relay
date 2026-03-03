@@ -143,8 +143,8 @@ if (!BOT_TOKEN) {
 }
 
 // Create directories
-await mkdir(TEMP_DIR, { recursive: true });
-await mkdir(UPLOADS_DIR, { recursive: true });
+await mkdir(TEMP_DIR, { recursive: true, mode: 0o755 });
+await mkdir(UPLOADS_DIR, { recursive: true, mode: 0o755 });
 
 // ============================================================
 // SUPABASE (optional — only if configured)
@@ -362,7 +362,7 @@ bot.on("message:photo", async (ctx) => {
       `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
     );
     const buffer = await response.arrayBuffer();
-    await writeFile(filePath, Buffer.from(buffer));
+    await writeFile(filePath, Buffer.from(buffer), { mode: 0o644 });
 
     // Claude Code can see images via file path
     const caption = ctx.message.caption || "Analyze this image.";
@@ -401,7 +401,7 @@ bot.on("message:document", async (ctx) => {
       `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
     );
     const buffer = await response.arrayBuffer();
-    await writeFile(filePath, Buffer.from(buffer));
+    await writeFile(filePath, Buffer.from(buffer), { mode: 0o644 });
 
     const caption = ctx.message.caption || `Analyze: ${doc.file_name}`;
     const prompt = `[File: ${filePath}]\n\n${caption}`;
