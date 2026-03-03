@@ -20,5 +20,17 @@ module.exports = {
       out_file: join(__dirname, "logs", "relay.log"),
       error_file: join(__dirname, "logs", "relay.error.log"),
     },
+    {
+      name: "claude-crypto-report",
+      script: BUN,
+      args: "run examples/crypto-report.ts",
+      interpreter: "none",
+      cwd: __dirname,
+      watch: false,
+      autorestart: false,            // one-shot: run and exit, don't respawn on exit
+      cron_restart: "0 * * * *",    // top of every hour — script handles its own ET quiet hours
+      out_file: join(__dirname, "logs", "crypto-report.log"),
+      error_file: join(__dirname, "logs", "crypto-report.error.log"),
+    },
   ],
 };
