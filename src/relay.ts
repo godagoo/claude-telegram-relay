@@ -230,6 +230,8 @@ async function callClaude(
   // JSON output lets us capture the session_id reliably
   args.push("--output-format", "json");
 
+  args.push("--model", "claude-haiku-4-5-20251001");
+
   console.log(`Calling Claude [chat:${chatId}]: ${prompt.substring(0, 50)}...`);
 
   try {
