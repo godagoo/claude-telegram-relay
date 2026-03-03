@@ -28,7 +28,7 @@ module.exports = {
       cwd: __dirname,
       watch: false,
       autorestart: false,            // one-shot: run and exit, don't respawn on exit
-      cron_restart: "0 * * * *",    // top of every hour — script handles its own ET quiet hours
+      cron_restart: "0 7-22 * * *", // 7am–10pm ET — matches active hours, avoids quiet period
       out_file: join(__dirname, "logs", "crypto-report.log"),
       error_file: join(__dirname, "logs", "crypto-report.error.log"),
     },

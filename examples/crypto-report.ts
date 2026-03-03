@@ -2,9 +2,12 @@
  * Crypto Report — Price Updates, Trade Setup & Weekly Recap
  *
  * Single consolidated script. Auto-detects what to send based on time/day (ET):
- *   - Every hour 7am–11pm: Price snapshot (price, 24h change, 7d change, bull/bear)
+ *   - Every hour 7am–10pm: Price snapshot (price, 24h change, 7d change, bull/bear)
  *   - Daily at 7pm:        + Trade setup (trend, support/resistance, key levels)
  *   - Sunday at 7pm:       + Weekly recap (macro analysis, predictions — Ivan on Tech style)
+ *
+ * Scheduled via PM2 ecosystem.config.cjs — do NOT add a separate system cron entry,
+ * or it will fire twice per hour.
  *
  * Required env vars:
  *   CMC_API_KEY         - CoinMarketCap Pro API key
@@ -14,12 +17,10 @@
  * Optional env vars:
  *   CMC_SYMBOLS         - Override coin list, comma-separated (e.g. "BTC,ETH,SOL")
  *                         If unset, fetches your watchlist; falls back to defaults.
- *
- * Replace your two cron jobs with this single entry:
- *   0 7-23 * * * cd /root/claude-telegram-relay && /usr/bin/bun run examples/crypto-report.ts >> /tmp/crypto-report.log 2>&1
  */
 
 import { spawn } from "bun";
+import { existsSync, writeFileSync } from "fs";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
@@ -390,6 +391,21 @@ async function main() {
     console.log(`Quiet hours (${hour}:00 ET) — skipping`);
     process.exit(0);
   }
+
+  // Per-hour lock file — prevents double execution if two schedulers overlap
+  const lockHour = [
+    nowET.getFullYear(),
+    String(nowET.getMonth() + 1).padStart(2, "0"),
+    String(nowET.getDate()).padStart(2, "0"),
+    String(hour).padStart(2, "0"),
+  ].join("-");
+  const lockFile = `/tmp/crypto-report-${lockHour}.lock`;
+
+  if (existsSync(lockFile)) {
+    console.log(`Already ran at ${lockHour} ET (lock: ${lockFile}) — skipping duplicate`);
+    process.exit(0);
+  }
+  writeFileSync(lockFile, String(process.pid));
 
   console.log(
     `ET time: ${nowET.toLocaleString()} | hour=${hour} | sunday=${isSunday} | tradeHour=${isTradeHour}`
