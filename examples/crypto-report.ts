@@ -385,6 +385,12 @@ async function main() {
   const isSunday = nowET.getDay() === 0;
   const isTradeHour = hour === 19; // 7pm ET
 
+  // Quiet hours: 11pm–7am ET — exit without sending anything
+  if (hour < 7 || hour >= 23) {
+    console.log(`Quiet hours (${hour}:00 ET) — skipping`);
+    process.exit(0);
+  }
+
   console.log(
     `ET time: ${nowET.toLocaleString()} | hour=${hour} | sunday=${isSunday} | tradeHour=${isTradeHour}`
   );
