@@ -222,6 +222,9 @@ async function callClaude(
     args.push("--resume", chatSession.sessionId);
   }
 
+  // Explicitly grant tools needed in non-interactive relay mode
+  args.push("--allowedTools", "Read,Write,Edit,Bash,WebFetch,WebSearch,Glob,Grep");
+
   // Non-interactive: skip permission prompts so subprocess never hangs
   args.push("--dangerously-skip-permissions");
 
