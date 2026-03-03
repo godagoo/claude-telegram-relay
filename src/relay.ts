@@ -235,13 +235,19 @@ async function callClaude(
   console.log(`Calling Claude [chat:${chatId}]: ${prompt.substring(0, 50)}...`);
 
   try {
+    // Strip Claude Code session markers so the spawned claude process doesn't
+    // think it's running inside a nested session (causes an immediate crash).
+    const childEnv = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([k]) => k !== "CLAUDECODE" && !k.startsWith("CLAUDE_CODE_")
+      )
+    ) as NodeJS.ProcessEnv;
+
     const proc = spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
       cwd: PROJECT_DIR || undefined,
-      env: {
-        ...process.env,
-      },
+      env: childEnv,
     });
 
     const output = await new Response(proc.stdout).text();
