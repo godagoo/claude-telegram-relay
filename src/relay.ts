@@ -9,7 +9,7 @@
 
 import { Bot, Context } from "grammy";
 import { spawn } from "bun";
-import { writeFile, mkdir, readFile, unlink } from "fs/promises";
+import { writeFile, mkdir, readFile, unlink, chmod } from "fs/promises";
 import { join, dirname } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
@@ -143,8 +143,15 @@ if (!BOT_TOKEN) {
 }
 
 // Create directories
+await mkdir(RELAY_DIR, { recursive: true, mode: 0o755 });
 await mkdir(TEMP_DIR, { recursive: true, mode: 0o755 });
 await mkdir(UPLOADS_DIR, { recursive: true, mode: 0o755 });
+
+// Explicitly set permissions regardless of whether dirs already existed
+// (mkdir with mode does not update permissions on pre-existing directories)
+await chmod(RELAY_DIR, 0o755);
+await chmod(TEMP_DIR, 0o755);
+await chmod(UPLOADS_DIR, 0o755);
 
 // ============================================================
 // SUPABASE (optional — only if configured)
@@ -381,6 +388,98 @@ bot.on("message:photo", async (ctx) => {
   } catch (error) {
     console.error("Image error:", error);
     await ctx.reply("Could not process image.");
+  }
+});
+
+// Videos
+bot.on("message:video", async (ctx) => {
+  const video = ctx.message.video;
+  const chatId = ctx.chat.id.toString();
+  console.log(`Video received [chat:${chatId}]: ${video.duration}s, ${video.file_size} bytes`);
+  await ctx.replyWithChatAction("typing");
+
+  if (video.file_size && video.file_size > 20 * 1024 * 1024) {
+    await ctx.reply(
+      "This video is too large for me to download (Telegram's bot API limit is 20 MB). " +
+        "Try sending a shorter clip or share a link instead."
+    );
+    return;
+  }
+
+  try {
+    const file = await ctx.api.getFile(video.file_id);
+    const timestamp = Date.now();
+    const filePath = join(UPLOADS_DIR, `video_${timestamp}.mp4`);
+
+    const response = await fetch(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
+    );
+    const buffer = await response.arrayBuffer();
+    await writeFile(filePath, Buffer.from(buffer), { mode: 0o644 });
+
+    const caption = ctx.message.caption || "";
+    const prompt =
+      `[Video file received: ${filePath}]\n\n` +
+      `User sent a video. Caption: "${caption}". ` +
+      `Note: you cannot view video content directly. Respond based on the caption or let the user know.`;
+
+    await saveMessage("user", `[Video ${video.duration}s]: ${caption}`);
+
+    const claudeResponse = await callClaude(prompt, { resume: true, chatId });
+
+    await unlink(filePath).catch(() => {});
+
+    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    await saveMessage("assistant", cleanResponse);
+    await sendResponse(ctx, cleanResponse);
+  } catch (error) {
+    console.error("Video error:", error);
+    await ctx.reply("Could not process video. It may be too large or unavailable.");
+  }
+});
+
+// Round video messages (video notes)
+bot.on("message:video_note", async (ctx) => {
+  const videoNote = ctx.message.video_note;
+  const chatId = ctx.chat.id.toString();
+  console.log(`Video note received [chat:${chatId}]: ${videoNote.duration}s, ${videoNote.file_size} bytes`);
+  await ctx.replyWithChatAction("typing");
+
+  if (videoNote.file_size && videoNote.file_size > 20 * 1024 * 1024) {
+    await ctx.reply(
+      "This video note is too large for me to download (Telegram's bot API limit is 20 MB)."
+    );
+    return;
+  }
+
+  try {
+    const file = await ctx.api.getFile(videoNote.file_id);
+    const timestamp = Date.now();
+    const filePath = join(UPLOADS_DIR, `video_${timestamp}.mp4`);
+
+    const response = await fetch(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
+    );
+    const buffer = await response.arrayBuffer();
+    await writeFile(filePath, Buffer.from(buffer), { mode: 0o644 });
+
+    const prompt =
+      `[Video file received: ${filePath}]\n\n` +
+      `User sent a round video note (${videoNote.duration}s). ` +
+      `Note: you cannot view video content directly. Let the user know you received it and ask what they need.`;
+
+    await saveMessage("user", `[Video note ${videoNote.duration}s]`);
+
+    const claudeResponse = await callClaude(prompt, { resume: true, chatId });
+
+    await unlink(filePath).catch(() => {});
+
+    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    await saveMessage("assistant", cleanResponse);
+    await sendResponse(ctx, cleanResponse);
+  } catch (error) {
+    console.error("Video note error:", error);
+    await ctx.reply("Could not process video note. It may be too large or unavailable.");
   }
 });
 
