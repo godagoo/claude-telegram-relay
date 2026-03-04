@@ -22,7 +22,7 @@ if (!CMC_KEY) {
 }
 
 // ── Watchlist ────────────────────────────────────────────────
-const COINS = [
+const COINS: { symbol: string; name: string; liquid: boolean; slug?: string }[] = [
   { symbol: "BTC",   name: "Bitcoin",     liquid: true  },
   { symbol: "AVAX",  name: "Avalanche",   liquid: true  },
   { symbol: "SOL",   name: "Solana",      liquid: true  },
@@ -32,7 +32,7 @@ const COINS = [
   { symbol: "BEAM",  name: "Beam",        liquid: false },
   { symbol: "LAND",  name: "Landshare",   liquid: false },
   { symbol: "XAG",   name: "Silver",      liquid: true  },
-  { symbol: "XAUT",  name: "Tether Gold", liquid: true  },
+  { symbol: "XAUT",  name: "Tether Gold", liquid: true, slug: "tether-gold" },
 ];
 
 // ── CMC API ──────────────────────────────────────────────────
@@ -66,6 +66,26 @@ async function fetchQuotes(symbols: string[]): Promise<Map<string, CMCCoin>> {
     // CMC returns array when symbol is ambiguous — take highest market cap (first)
     const coin = Array.isArray(val) ? val[0] : val;
     map.set(sym, coin);
+  }
+  return map;
+}
+
+async function fetchBySlugs(slugToSymbol: Map<string, string>): Promise<Map<string, CMCCoin>> {
+  const url = new URL("https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest");
+  url.searchParams.set("slug", [...slugToSymbol.keys()].join(","));
+  url.searchParams.set("convert", "USD");
+
+  const res = await fetch(url.toString(), {
+    headers: { "X-CMC_PRO_API_KEY": CMC_KEY, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`CMC slug API ${res.status}: ${await res.text()}`);
+
+  const json: any = await res.json();
+  const map = new Map<string, CMCCoin>();
+  // CMC returns slug results keyed by numeric ID — map back to symbol
+  for (const val of Object.values<any>(json.data || {})) {
+    const coin = Array.isArray(val) ? val[0] : val;
+    map.set(coin.symbol, coin);
   }
   return map;
 }
@@ -202,10 +222,22 @@ function leverageBlock(coin: CMCCoin): string {
 
 // ── Main ─────────────────────────────────────────────────────
 async function main() {
-  const symbols = COINS.map(c => c.symbol);
-  let quotes: Map<string, CMCCoin>;
+  const symbolCoins = COINS.filter(c => !c.slug);
+  const slugCoins = COINS.filter(c => c.slug);
+
+  let quotes = new Map<string, CMCCoin>();
   try {
-    quotes = await fetchQuotes(symbols);
+    // Fetch symbol-based coins
+    if (symbolCoins.length > 0) {
+      const symQuotes = await fetchQuotes(symbolCoins.map(c => c.symbol));
+      for (const [k, v] of symQuotes) quotes.set(k, v);
+    }
+    // Fetch slug-based coins (e.g. XAUT → tether-gold)
+    if (slugCoins.length > 0) {
+      const slugMap = new Map(slugCoins.map(c => [c.slug!, c.symbol]));
+      const slugQuotes = await fetchBySlugs(slugMap);
+      for (const [k, v] of slugQuotes) quotes.set(k, v);
+    }
   } catch (err) {
     process.stderr.write(`CMC fetch failed: ${err}\n`);
     process.exit(1);
