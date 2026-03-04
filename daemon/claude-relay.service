@@ -4,21 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
-# UPDATE THIS: Your username
-User=YOUR_USERNAME
-# UPDATE THIS: Path to relay directory
-WorkingDirectory=/home/YOUR_USERNAME/claude-telegram-relay
-# UPDATE THIS: Path to bun
-ExecStart=/home/YOUR_USERNAME/.bun/bin/bun run src/relay.ts
+User=root
+WorkingDirectory=/root/claude-telegram-relay
+ExecStart=/root/.bun/bin/bun run src/bot.ts
 Restart=always
 RestartSec=10
 
 # Environment
-Environment=HOME=/home/YOUR_USERNAME
-Environment=PATH=/home/YOUR_USERNAME/.bun/bin:/usr/local/bin:/usr/bin:/bin
-
-# Optional: Load .env file
-# EnvironmentFile=/home/YOUR_USERNAME/claude-telegram-relay/.env
+Environment=HOME=/root
+Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/root/claude-telegram-relay/.env
 
 # Logging
 StandardOutput=journal
