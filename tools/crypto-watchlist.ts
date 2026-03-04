@@ -82,10 +82,13 @@ async function fetchBySlugs(slugToSymbol: Map<string, string>): Promise<Map<stri
 
   const json: any = await res.json();
   const map = new Map<string, CMCCoin>();
-  // CMC returns slug results keyed by numeric ID — map back to symbol
+  // CMC returns slug results keyed by numeric ID — map back using slugToSymbol
   for (const val of Object.values<any>(json.data || {})) {
     const coin = Array.isArray(val) ? val[0] : val;
-    map.set(coin.symbol, coin);
+    // Use our canonical symbol from COINS (CMC may return different casing)
+    const slug = coin.slug as string;
+    const canonicalSymbol = slugToSymbol.get(slug) || coin.symbol.toUpperCase();
+    map.set(canonicalSymbol, coin);
   }
   return map;
 }
