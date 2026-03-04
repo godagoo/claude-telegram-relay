@@ -1,12 +1,14 @@
 /**
- * AI Core — Anthropic API with Claude Haiku 4.5
+ * AI Core — Dual Mode: Anthropic API or Claude CLI (subscription)
  *
- * Replaces the Claude CLI subprocess approach with direct API calls.
- * Supports native tool_use for skills and integrations.
+ * Mode 1: ANTHROPIC_API_KEY set → Direct API with Haiku 4.5 + tool_use
+ * Mode 2: No API key → Claude CLI subprocess (uses your Claude subscription)
+ *
  * OpenClaw-inspired personality: action-oriented, direct, proactive.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import { spawn } from "bun";
 import { readFile } from "fs/promises";
 import { join, dirname } from "path";
 import { getAllTools, executeTool } from "./skills/index.ts";
@@ -23,15 +25,25 @@ const conversationHistory: Map<string, Anthropic.MessageParam[]> = new Map();
 
 let client: Anthropic | null = null;
 let profileContext = "";
+let aiMode: "api" | "cli" = "api";
+
+// CLI mode settings
+const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
+const PROJECT_DIR = process.env.PROJECT_DIR || "";
 
 export function initAI(): void {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error("ANTHROPIC_API_KEY not set! AI responses will not work.");
-    return;
+
+  if (apiKey) {
+    client = new Anthropic({ apiKey });
+    aiMode = "api";
+    console.log(`AI initialized: mode=API, model=${MODEL}`);
+  } else {
+    aiMode = "cli";
+    console.log(`AI initialized: mode=CLI (using Claude subscription via "${CLAUDE_PATH}")`);
+    console.log("  Note: CLI mode doesn't support tool_use — skills won't be available.");
+    console.log("  Set ANTHROPIC_API_KEY in .env for full tool support.");
   }
-  client = new Anthropic({ apiKey });
-  console.log(`AI initialized: model=${MODEL}`);
 }
 
 // Load profile on startup
@@ -93,8 +105,23 @@ export async function callAI(
   userMessage: string,
   options: AICallOptions
 ): Promise<string> {
+  if (aiMode === "cli") {
+    return callCLI(userMessage, options);
+  }
+
+  return callAPI(userMessage, options);
+}
+
+// ============================================================
+// MODE 1: Direct Anthropic API (with tool_use)
+// ============================================================
+
+async function callAPI(
+  userMessage: string,
+  options: AICallOptions
+): Promise<string> {
   if (!client) {
-    return "AI is not configured. Set ANTHROPIC_API_KEY in .env.";
+    return "AI is not configured. Set ANTHROPIC_API_KEY in .env, or install Claude CLI to use your subscription.";
   }
 
   const {
@@ -195,12 +222,85 @@ export async function callAI(
 
     return finalText;
   } catch (err) {
-    console.error("AI call failed:", err);
+    console.error("AI API call failed:", err);
     // Remove the user message we added on failure
     history.pop();
     return `Error: ${err instanceof Error ? err.message : "AI request failed"}`;
   }
 }
+
+// ============================================================
+// MODE 2: Claude CLI (uses your Claude subscription)
+// ============================================================
+
+// Session tracking for CLI mode
+interface CLISession {
+  sessionId: string | null;
+  lastActivity: string;
+}
+const cliSessions: Map<string, CLISession> = new Map();
+
+async function callCLI(
+  userMessage: string,
+  options: AICallOptions
+): Promise<string> {
+  const {
+    userId,
+    userName = "",
+    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+    memoryContext = "",
+    relevantContext = "",
+  } = options;
+
+  // Build an enriched prompt (since CLI doesn't support system prompt separately)
+  const systemPrompt = buildSystemPrompt(userName, timezone, memoryContext, relevantContext);
+  const fullPrompt = `${systemPrompt}\n\nUser: ${userMessage}`;
+
+  const args = [CLAUDE_PATH, "-p", fullPrompt, "--output-format", "text"];
+
+  // Resume session if available
+  const session = cliSessions.get(userId) || { sessionId: null, lastActivity: new Date().toISOString() };
+  if (session.sessionId) {
+    args.push("--resume", session.sessionId);
+  }
+
+  console.log(`CLI call for ${userId}: ${userMessage.substring(0, 50)}...`);
+
+  try {
+    const proc = spawn(args, {
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: PROJECT_DIR || undefined,
+      env: { ...process.env },
+    });
+
+    const output = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+
+    if (exitCode !== 0) {
+      console.error("Claude CLI error:", stderr);
+      return `Error: ${stderr || "Claude exited with code " + exitCode}`;
+    }
+
+    // Extract session ID for resume
+    const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
+    if (sessionMatch) {
+      session.sessionId = sessionMatch[1];
+      session.lastActivity = new Date().toISOString();
+      cliSessions.set(userId, session);
+    }
+
+    return output.trim();
+  } catch (error) {
+    console.error("CLI spawn error:", error);
+    return "Error: Could not run Claude CLI. Make sure it's installed (npm install -g @anthropic-ai/claude-code).";
+  }
+}
+
+// ============================================================
+// SHARED
+// ============================================================
 
 function getHistory(userId: string): Anthropic.MessageParam[] {
   if (!conversationHistory.has(userId)) {
@@ -213,12 +313,9 @@ function trimHistory(userId: string): void {
   const history = conversationHistory.get(userId);
   if (!history) return;
 
-  // Keep last N message pairs (user + assistant = 2 entries each)
-  // Also account for tool_use entries which add extra messages
   while (history.length > MAX_HISTORY_PER_USER * 2) {
     history.shift();
   }
-  // Ensure history starts with a user message
   while (history.length > 0 && history[0].role !== "user") {
     history.shift();
   }
@@ -226,4 +323,9 @@ function trimHistory(userId: string): void {
 
 export function clearHistory(userId: string): void {
   conversationHistory.delete(userId);
+  cliSessions.delete(userId);
+}
+
+export function getAIMode(): string {
+  return aiMode;
 }

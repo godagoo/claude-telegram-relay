@@ -13,7 +13,7 @@ import { join, dirname } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
 import { processMemoryIntents, getMemoryContext, getRelevantContext, saveMessage } from "./memory.ts";
-import { initAI, loadProfile, callAI, clearHistory } from "./ai.ts";
+import { initAI, loadProfile, callAI, clearHistory, getAIMode } from "./ai.ts";
 import { isAuthorized, isOwner, addUser, removeUser, listUsers, shouldRespondInGroup, checkRateLimit } from "./auth.ts";
 import { backupEnv, restoreEnv, listBackups } from "./env-guard.ts";
 import { initScheduler, stopScheduler, addCronJob, listCronJobs, deleteCronJob, toggleCronJob, getCronHistory } from "./scheduler.ts";
@@ -55,6 +55,11 @@ if (!OWNER_ID) {
   console.log("\nMessage @userinfobot on Telegram to get your user ID.");
   console.log("Add it to .env as TELEGRAM_OWNER_ID=your_id");
   process.exit(1);
+}
+
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.log("\nNo ANTHROPIC_API_KEY found — using Claude CLI mode (your subscription).");
+  console.log("Skills/tools won't be available. Set ANTHROPIC_API_KEY for full features.\n");
 }
 
 // Create directories
@@ -668,6 +673,7 @@ async function schedulerSendMessage(userId: string, text: string): Promise<void>
 // ============================================================
 
 console.log("Starting Gentech Bot...");
+console.log(`AI Mode: ${getAIMode() === "api" ? "Anthropic API (Haiku 4.5)" : "Claude CLI (subscription)"}`);
 console.log(`Owner: ${OWNER_ID}`);
 console.log(`Supabase: ${supabase ? "connected" : "not configured"}`);
 console.log(`Voice: ${process.env.VOICE_PROVIDER || "not configured"}`);
