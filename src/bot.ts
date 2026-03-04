@@ -14,7 +14,7 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
 import { processMemoryIntents, getMemoryContext, getRelevantContext, saveMessage } from "./memory.ts";
 import { initAI, loadProfile, callAI, clearHistory, getAIMode } from "./ai.ts";
-import { isAuthorized, isOwner, addUser, removeUser, listUsers, shouldRespondInGroup, checkRateLimit } from "./auth.ts";
+import { isAuthorized, isOwner, addUser, removeUser, listUsers, checkRateLimit } from "./auth.ts";
 import { backupEnv, restoreEnv, listBackups } from "./env-guard.ts";
 import { initScheduler, stopScheduler, addCronJob, listCronJobs, deleteCronJob, toggleCronJob, getCronHistory } from "./scheduler.ts";
 import { describeTelegramVideo } from "./skills/video.ts";
@@ -33,6 +33,7 @@ const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
 const USER_NAME = process.env.USER_NAME || "";
 const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+const GENTECH_GROUP_ID = process.env.GENTECH_GROUP_ID || "";
 const LOCK_FILE = join(RELAY_DIR, "bot.lock");
 
 // ============================================================
@@ -136,15 +137,6 @@ let botUsername = "";
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id.toString();
   if (!userId) return;
-
-  // In groups: only respond to @mentions, replies, or /commands
-  const isGroup = ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
-  if (isGroup && ctx.message?.text) {
-    const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
-    if (!shouldRespondInGroup(ctx.message.text, botUsername, isReplyToBot)) {
-      return; // Silently ignore
-    }
-  }
 
   // Auth check
   if (!(await isAuthorized(supabase, userId))) {
@@ -622,7 +614,7 @@ console.log(`Brave Search: ${process.env.BRAVE_API_KEY ? "configured" : "not con
 
 // Initialize scheduler if Supabase is available
 if (supabase) {
-  await initScheduler(supabase, schedulerExecute, schedulerSendMessage, USER_TIMEZONE);
+  await initScheduler(supabase, schedulerExecute, schedulerSendMessage, USER_TIMEZONE, GENTECH_GROUP_ID);
 }
 
 bot.start({

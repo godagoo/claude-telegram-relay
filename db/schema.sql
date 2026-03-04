@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
 ALTER TABLE cron_jobs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow all for service role" ON cron_jobs FOR ALL USING (true);
 
+-- Add target_type column if it doesn't exist (for group posting)
+ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS target_type TEXT DEFAULT 'user';
+
 -- ============================================================
 -- CRON EXECUTION AUDIT LOG
 -- ============================================================

@@ -22,6 +22,7 @@ let _supabase: SupabaseClient | null = null;
 let _onExecute: ((userId: string, action: string) => Promise<string>) | null = null;
 let _sendMessage: ((userId: string, text: string) => Promise<void>) | null = null;
 let _timezone: string = "";
+let _groupId: string = "";
 
 interface CronJob {
   id: string;
@@ -33,6 +34,7 @@ interface CronJob {
   last_run: string | null;
   next_run: string | null;
   run_count: number;
+  target_type?: "user" | "group";
 }
 
 // In-memory job cache
@@ -42,18 +44,22 @@ let jobs: CronJob[] = [];
  * Initialize the scheduler.
  * @param supabase - Supabase client for persistence
  * @param onExecute - Callback to execute a job action (sends to AI)
- * @param sendMessage - Callback to send result message to user
+ * @param sendMessage - Callback to send result message to user/group
+ * @param timezone - Timezone for cron calculations (e.g., "America/New_York")
+ * @param groupId - Telegram group ID for posting scheduled reports
  */
 export async function initScheduler(
   supabase: SupabaseClient,
   onExecute: (userId: string, action: string) => Promise<string>,
   sendMessage: (userId: string, text: string) => Promise<void>,
-  timezone?: string
+  timezone?: string,
+  groupId?: string
 ): Promise<void> {
   _supabase = supabase;
   _onExecute = onExecute;
   _sendMessage = sendMessage;
   _timezone = timezone || "";
+  _groupId = groupId || "";
 
   // Load all enabled jobs
   await refreshJobs();
@@ -171,11 +177,19 @@ async function executeJob(job: CronJob): Promise<void> {
       result = await _onExecute(job.user_id, job.action);
     }
 
-    // Send result to user
-    await _sendMessage(
-      job.user_id,
-      `[Scheduled: ${job.name}]\n\n${result}`
-    );
+    // Determine target: group or user
+    const targetType = job.target_type || "user";
+    const targetId = targetType === "group" ? _groupId : job.user_id;
+
+    // Send result to target
+    if (targetId) {
+      await _sendMessage(
+        targetId,
+        `[Scheduled: ${job.name}]\n\n${result}`
+      );
+    } else if (targetType === "group" && !_groupId) {
+      console.warn(`Scheduler: Job "${job.name}" targets group but GENTECH_GROUP_ID not set`);
+    }
   } catch (err) {
     status = "error";
     result = err instanceof Error ? err.message : String(err);
