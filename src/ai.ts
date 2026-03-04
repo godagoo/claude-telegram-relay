@@ -277,7 +277,7 @@ async function callCLI(
       stdout: "pipe",
       stderr: "pipe",
       cwd: PROJECT_DIR || undefined,
-      env: { ...process.env },
+      env: { ...process.env, CLAUDECODE: undefined },
     });
 
     const output = await new Response(proc.stdout).text();
