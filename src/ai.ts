@@ -12,6 +12,7 @@ import { spawn } from "bun";
 import { readFile } from "fs/promises";
 import { join, dirname } from "path";
 import { getAllTools, executeTool } from "./skills/index.ts";
+import { preprocessForCLI } from "./cli-skills.ts";
 import { formatTime } from "./utils.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -41,8 +42,7 @@ export function initAI(): void {
   } else {
     aiMode = "cli";
     console.log(`AI initialized: mode=CLI (using Claude subscription via "${CLAUDE_PATH}")`);
-    console.log("  Note: CLI mode doesn't support tool_use — skills won't be available.");
-    console.log("  Set ANTHROPIC_API_KEY in .env for full tool support.");
+    console.log("  Skills available via pre-processing: web search, DeFi, YouTube, smart contracts.");
   }
 }
 
@@ -70,8 +70,8 @@ Core traits:
 - You're a decision-maker: assess situations, weigh options, recommend the best path.
 - You protect the user's time and attention — only interrupt when it matters.
 
-You have access to tools for web search, email, calendar, spreadsheets, DeFi data,
-travel planning, smart contract analysis, and video analysis. Use them proactively when relevant.`,
+You have access to web search, DeFi/crypto data, YouTube video analysis, and smart contract analysis.
+When real-time data is provided below, use it to inform your response — don't say you can't access live data.`,
   ];
 
   if (userName) parts.push(`You are speaking with ${userName}.`);
@@ -252,9 +252,12 @@ async function callCLI(
     relevantContext = "",
   } = options;
 
+  // Pre-process: detect skill intents and fetch real-time data
+  const skillContext = await preprocessForCLI(userMessage);
+
   // Build an enriched prompt (since CLI doesn't support system prompt separately)
   const systemPrompt = buildSystemPrompt(userName, timezone, memoryContext, relevantContext);
-  const fullPrompt = `${systemPrompt}\n\nUser: ${userMessage}`;
+  const fullPrompt = `${systemPrompt}${skillContext}\n\nUser: ${userMessage}`;
 
   const args = [CLAUDE_PATH, "-p", fullPrompt, "--output-format", "text"];
 
@@ -264,6 +267,9 @@ async function callCLI(
     args.push("--resume", session.sessionId);
   }
 
+  if (skillContext) {
+    console.log(`CLI pre-processing enriched prompt with real-time data`);
+  }
   console.log(`CLI call for ${userId}: ${userMessage.substring(0, 50)}...`);
 
   try {

@@ -17,9 +17,6 @@ import { initAI, loadProfile, callAI, clearHistory, getAIMode } from "./ai.ts";
 import { isAuthorized, isOwner, addUser, removeUser, listUsers, shouldRespondInGroup, checkRateLimit } from "./auth.ts";
 import { backupEnv, restoreEnv, listBackups } from "./env-guard.ts";
 import { initScheduler, stopScheduler, addCronJob, listCronJobs, deleteCronJob, toggleCronJob, getCronHistory } from "./scheduler.ts";
-import { registerIntegrationTools } from "./skills/index.ts";
-import { getIntegrationTools, setIntegrationContext, executeIntegrationTool } from "./integrations/index.ts";
-import { getAuthUrl, exchangeCode, SETUP_GUIDE } from "./integrations/google-auth.ts";
 import { describeTelegramVideo } from "./skills/video.ts";
 import { sendResponse, sendToChat, log } from "./utils.ts";
 
@@ -59,7 +56,7 @@ if (!OWNER_ID) {
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.log("\nNo ANTHROPIC_API_KEY found — using Claude CLI mode (your subscription).");
-  console.log("Skills/tools won't be available. Set ANTHROPIC_API_KEY for full features.\n");
+  console.log("Skills available via pre-processing: web search, DeFi, YouTube, smart contracts.\n");
 }
 
 // Create directories
@@ -128,15 +125,9 @@ await backupEnv(supabase);
 initAI();
 await loadProfile();
 
-// Register integration tools with skill registry
-registerIntegrationTools(getIntegrationTools(), executeIntegrationTool);
-
 // Telegram bot
 const bot = new Bot(BOT_TOKEN);
 let botUsername = "";
-
-// State for Google OAuth flow
-const pendingOAuthUsers = new Set<string>();
 
 // ============================================================
 // AUTH MIDDLEWARE
@@ -179,8 +170,8 @@ bot.command("start", async (ctx) => {
   const name = ctx.from?.first_name || "there";
   await ctx.reply(
     `Hey ${name}! I'm Gentech — your personal AI agent.\n\n` +
-    `I can search the web, manage your email & calendar, track DeFi, ` +
-    `analyze smart contracts, plan travel, watch YouTube videos, and more.\n\n` +
+    `I can search the web, track crypto & DeFi, analyze smart contracts, ` +
+    `summarize YouTube videos, and remember everything.\n\n` +
     `Just talk to me naturally. Type /help to see all commands.`
   );
 });
@@ -206,12 +197,16 @@ bot.command("help", async (ctx) => {
     "/cron pause <name> — Pause a job\n" +
     "/cron resume <name> — Resume a job\n" +
     "/cron history <name> — View execution history\n" +
-    "/google connect — Connect Google (Gmail, Calendar, Sheets)\n" +
-    "/google setup — Google Cloud setup guide\n" +
     "/memory — View stored facts & goals\n" +
     "/clear — Clear conversation history" +
     ownerCmds +
-    "\n\nOr just send a message — I'll figure out what you need."
+    "\n\nSkills (auto-detected):\n" +
+    "- Web search (ask me to search/look up anything)\n" +
+    "- Crypto prices & DeFi data (ask about any token)\n" +
+    "- YouTube summaries (send a YouTube link)\n" +
+    "- Smart contract analysis (send contract code)\n" +
+    "- Voice messages (send a voice note)\n\n" +
+    "Or just send a message — I'll figure out what you need."
   );
 });
 
@@ -353,37 +348,6 @@ bot.command("env", async (ctx) => {
   }
 });
 
-// ---- Google OAuth ----
-
-bot.command("google", async (ctx) => {
-  const userId = ctx.from?.id.toString() || "";
-  const text = ctx.message?.text || "";
-  const args = text.replace(/^\/google\s*/, "").trim();
-
-  if (args === "setup") {
-    await ctx.reply(SETUP_GUIDE);
-    return;
-  }
-
-  if (args === "connect") {
-    const url = getAuthUrl();
-    if (!url) {
-      await ctx.reply("Google OAuth not configured. Run /google setup first, then set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.");
-      return;
-    }
-
-    pendingOAuthUsers.add(userId);
-    await ctx.reply(
-      "Open this link to connect your Google account:\n\n" +
-      url +
-      "\n\nAfter authorizing, copy the code and send it here."
-    );
-    return;
-  }
-
-  await ctx.reply("Usage: /google connect | /google setup");
-});
-
 // ---- Memory ----
 
 bot.command("memory", async (ctx) => {
@@ -409,28 +373,10 @@ bot.on("message:text", async (ctx) => {
   const userId = ctx.from?.id.toString() || "";
   const text = ctx.message.text;
 
-  // Check if this is a Google OAuth code
-  if (pendingOAuthUsers.has(userId) && supabase) {
-    const code = text.trim();
-    // OAuth codes are typically 50-100 chars
-    if (code.length > 20 && code.length < 200 && !code.includes(" ")) {
-      pendingOAuthUsers.delete(userId);
-      const success = await exchangeCode(supabase, userId, code);
-      await ctx.reply(success
-        ? "Google connected successfully! I can now access your Gmail, Calendar, and Sheets."
-        : "Failed to connect Google. The code may have expired — try /google connect again."
-      );
-      return;
-    }
-  }
-
   log("info", "message_received", { userId, type: "text", length: text.length });
   await ctx.replyWithChatAction("typing");
 
   await saveMessage(supabase, "user", text, userId);
-
-  // Set integration context for this user
-  setIntegrationContext(supabase, userId);
 
   const [relevantContext, memoryContext] = await Promise.all([
     getRelevantContext(supabase, text, userId),
@@ -475,7 +421,6 @@ bot.on("message:voice", async (ctx) => {
     }
 
     await saveMessage(supabase, "user", `[Voice ${voice.duration}s]: ${transcription}`, userId);
-    setIntegrationContext(supabase, userId);
 
     const [relevantContext, memoryContext] = await Promise.all([
       getRelevantContext(supabase, transcription, userId),
@@ -518,7 +463,6 @@ bot.on("message:photo", async (ctx) => {
 
     const caption = ctx.message.caption || "Analyze this image.";
     await saveMessage(supabase, "user", `[Image]: ${caption}`, userId);
-    setIntegrationContext(supabase, userId);
 
     const [relevantContext, memoryContext] = await Promise.all([
       getRelevantContext(supabase, caption, userId),
@@ -560,7 +504,6 @@ bot.on(["message:video", "message:video_note"], async (ctx) => {
   );
 
   await saveMessage(supabase, "user", `[Video]: ${caption}`, userId);
-  setIntegrationContext(supabase, userId);
 
   const [relevantContext, memoryContext] = await Promise.all([
     getRelevantContext(supabase, caption, userId),
@@ -621,7 +564,6 @@ bot.on("message:document", async (ctx) => {
     }
 
     await saveMessage(supabase, "user", `[Document: ${doc.file_name}]: ${caption}`, userId);
-    setIntegrationContext(supabase, userId);
 
     const prompt = fileContent
       ? `[File: ${fileName}]\n\n${fileContent}\n\n${caption}`
@@ -649,7 +591,6 @@ bot.on("message:document", async (ctx) => {
 // ============================================================
 
 async function schedulerExecute(userId: string, action: string): Promise<string> {
-  setIntegrationContext(supabase, userId);
   const memoryContext = await getMemoryContext(supabase, userId);
 
   return callAI(action, {
@@ -677,7 +618,6 @@ console.log(`AI Mode: ${getAIMode() === "api" ? "Anthropic API (Haiku 4.5)" : "C
 console.log(`Owner: ${OWNER_ID}`);
 console.log(`Supabase: ${supabase ? "connected" : "not configured"}`);
 console.log(`Voice: ${process.env.VOICE_PROVIDER || "not configured"}`);
-console.log(`Google: ${process.env.GOOGLE_CLIENT_ID ? "configured" : "not configured"}`);
 console.log(`Brave Search: ${process.env.BRAVE_API_KEY ? "configured" : "not configured"}`);
 
 // Initialize scheduler if Supabase is available

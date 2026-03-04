@@ -3,18 +3,17 @@
  *
  * Each skill exports tool definitions and handlers.
  * This module aggregates them into a single registry.
+ *
+ * Note: In CLI mode, these tools aren't used directly — see cli-skills.ts
+ * for the pre-processing layer that calls skill handlers before Claude CLI.
  */
 
 import type Anthropic from "@anthropic-ai/sdk";
 
 import * as webSearch from "./web-search.ts";
-import * as travel from "./travel.ts";
 import * as defi from "./defi.ts";
 import * as smartContract from "./smart-contract.ts";
 import * as video from "./video.ts";
-
-// Integration tools are registered separately via integrations/index.ts
-// and merged in ai.ts
 
 // Skills with single tool definition
 const singleTools: Array<{ definition: Anthropic.Tool; handler: (input: Record<string, unknown>) => Promise<string> }> = [
@@ -26,23 +25,10 @@ const multiTools: Array<{
   definitions: Anthropic.Tool[];
   handler: (toolName: string, input: Record<string, unknown>) => Promise<string>;
 }> = [
-  { definitions: travel.definitions, handler: travel.handler },
   { definitions: defi.definitions, handler: defi.handler },
   { definitions: smartContract.definitions, handler: smartContract.handler },
   { definitions: video.definitions, handler: video.handler },
 ];
-
-// Integration tools added dynamically
-let integrationTools: Anthropic.Tool[] = [];
-let integrationHandler: ((toolName: string, input: Record<string, unknown>) => Promise<string>) | null = null;
-
-export function registerIntegrationTools(
-  tools: Anthropic.Tool[],
-  handler: (toolName: string, input: Record<string, unknown>) => Promise<string>
-): void {
-  integrationTools = tools;
-  integrationHandler = handler;
-}
 
 /**
  * Get all tool definitions for the Anthropic API.
@@ -57,8 +43,6 @@ export function getAllTools(): Anthropic.Tool[] {
   for (const { definitions } of multiTools) {
     tools.push(...definitions);
   }
-
-  tools.push(...integrationTools);
 
   return tools;
 }
@@ -82,14 +66,6 @@ export async function executeTool(
     const match = toolGroup.definitions.find((d) => d.name === name);
     if (match) {
       return toolGroup.handler(name, input);
-    }
-  }
-
-  // Check integration tools
-  if (integrationHandler) {
-    const match = integrationTools.find((t) => t.name === name);
-    if (match) {
-      return integrationHandler(name, input);
     }
   }
 
