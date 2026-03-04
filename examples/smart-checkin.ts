@@ -16,7 +16,7 @@ import { readFile, writeFile } from "fs/promises";
 import { join } from "path";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
+const CHAT_ID = process.env.TELEGRAM_OWNER_ID || process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const STATE_FILE =
   process.env.CHECKIN_STATE_FILE || "/tmp/checkin-state.json";
@@ -172,7 +172,7 @@ async function main() {
   console.log("Running smart check-in...");
 
   if (!BOT_TOKEN || !CHAT_ID) {
-    console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID");
+    console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_OWNER_ID");
     process.exit(1);
   }
 

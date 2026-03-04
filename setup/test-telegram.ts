@@ -45,7 +45,7 @@ async function main() {
 
   const env = await loadEnv();
   const token = env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "";
-  const userId = env.TELEGRAM_USER_ID || process.env.TELEGRAM_USER_ID || "";
+  const userId = env.TELEGRAM_OWNER_ID || env.TELEGRAM_USER_ID || process.env.TELEGRAM_OWNER_ID || process.env.TELEGRAM_USER_ID || "";
 
   // Check token exists
   if (!token || token === "your_bot_token_from_botfather") {
@@ -57,7 +57,7 @@ async function main() {
 
   // Check user ID exists
   if (!userId || userId === "your_telegram_user_id") {
-    console.log(`  ${FAIL} TELEGRAM_USER_ID not set in .env`);
+    console.log(`  ${FAIL} TELEGRAM_OWNER_ID not set in .env`);
     console.log(`      ${dim("Get yours from @userinfobot on Telegram")}`);
     process.exit(1);
   }

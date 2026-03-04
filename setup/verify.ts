@@ -65,7 +65,7 @@ async function main() {
   // 2. Telegram
   console.log(`\n${bold("  Telegram")}`);
   const token = env.TELEGRAM_BOT_TOKEN || "";
-  const userId = env.TELEGRAM_USER_ID || "";
+  const userId = env.TELEGRAM_OWNER_ID || env.TELEGRAM_USER_ID || "";
 
   if (!token || token.includes("your_")) {
     fail("TELEGRAM_BOT_TOKEN not set");
@@ -80,7 +80,7 @@ async function main() {
   }
 
   if (!userId || userId.includes("your_")) {
-    fail("TELEGRAM_USER_ID not set");
+    fail("TELEGRAM_OWNER_ID not set");
   } else {
     pass(`User ID: ${userId}`);
   }

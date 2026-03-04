@@ -121,6 +121,25 @@ function setupEnv(): boolean {
   return false;
 }
 
+function setupProfile(): void {
+  const profilePath = join(PROJECT_ROOT, "config", "profile.md");
+  const examplePath = join(PROJECT_ROOT, "config", "profile.example.md");
+
+  if (existsSync(profilePath)) {
+    console.log(`  ${PASS} config/profile.md ${dim("(exists)")}`);
+    return;
+  }
+
+  if (!existsSync(examplePath)) {
+    console.log(`  ${WARN} config/profile.example.md not found`);
+    return;
+  }
+
+  copyFileSync(examplePath, profilePath);
+  console.log(`  ${WARN} config/profile.md created from example`);
+  console.log(`      ${yellow(">>> Edit config/profile.md with your details <<<")}`);
+}
+
 // --- Main ---
 
 async function main() {
@@ -131,7 +150,7 @@ async function main() {
   console.log(dim(`  ${platform} • ${process.arch}`));
 
   // 1. Prerequisites
-  console.log(`\n${cyan("  [1/4] Prerequisites")}`);
+  console.log(`\n${cyan("  [1/5] Prerequisites")}`);
   const bunOk = await checkBun();
   if (!bunOk) {
     console.log(`\n  ${red("Bun is required. Install it first.")}`);
@@ -140,17 +159,21 @@ async function main() {
   await checkClaude();
 
   // 2. Dependencies
-  console.log(`\n${cyan("  [2/4] Dependencies")}`);
+  console.log(`\n${cyan("  [2/5] Dependencies")}`);
   const depsOk = await installDeps();
   if (!depsOk) process.exit(1);
 
   // 3. Directories
-  console.log(`\n${cyan("  [3/4] Directories")}`);
+  console.log(`\n${cyan("  [3/5] Directories")}`);
   createDirs();
 
   // 4. Environment
-  console.log(`\n${cyan("  [4/4] Environment")}`);
+  console.log(`\n${cyan("  [4/5] Environment")}`);
   const envReady = setupEnv();
+
+  // 5. Profile
+  console.log(`\n${cyan("  [5/5] Profile")}`);
+  setupProfile();
 
   // Summary
   console.log(`\n${bold("  Next steps:")}`);

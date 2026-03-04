@@ -17,6 +17,7 @@ let checkTimer: ReturnType<typeof setInterval> | null = null;
 let _supabase: SupabaseClient | null = null;
 let _onExecute: ((userId: string, action: string) => Promise<string>) | null = null;
 let _sendMessage: ((userId: string, text: string) => Promise<void>) | null = null;
+let _timezone: string = "";
 
 interface CronJob {
   id: string;
@@ -42,11 +43,13 @@ let jobs: CronJob[] = [];
 export async function initScheduler(
   supabase: SupabaseClient,
   onExecute: (userId: string, action: string) => Promise<string>,
-  sendMessage: (userId: string, text: string) => Promise<void>
+  sendMessage: (userId: string, text: string) => Promise<void>,
+  timezone?: string
 ): Promise<void> {
   _supabase = supabase;
   _onExecute = onExecute;
   _sendMessage = sendMessage;
+  _timezone = timezone || "";
 
   // Load all enabled jobs
   await refreshJobs();
@@ -206,9 +209,10 @@ async function executeJob(job: CronJob): Promise<void> {
  */
 function calculateNextRun(schedule: string, afterTime: string | null): string {
   try {
-    const options = {
+    const options: Record<string, unknown> = {
       currentDate: afterTime ? new Date(afterTime) : new Date(),
     };
+    if (_timezone) options.tz = _timezone;
     const interval = parseExpression(schedule, options);
     return interval.next().toISOString();
   } catch (err) {
@@ -231,7 +235,7 @@ export async function addCronJob(
 ): Promise<string> {
   // Validate cron expression
   try {
-    parseExpression(schedule);
+    parseExpression(schedule, _timezone ? { tz: _timezone } : undefined);
   } catch {
     return `Invalid cron schedule: "${schedule}"\n\nExamples:\n  "0 9 * * *" = every day at 9 AM\n  "*/30 * * * *" = every 30 minutes\n  "0 9 * * 1-5" = weekdays at 9 AM`;
   }
@@ -275,10 +279,12 @@ export async function listCronJobs(
   if (error) return `Failed to list jobs: ${error.message}`;
   if (!data || data.length === 0) return "No scheduled jobs.";
 
+  const tzOpts = _timezone ? { timeZone: _timezone } : undefined;
+
   return data.map((j, i) => {
     const status = j.enabled ? "ACTIVE" : "PAUSED";
-    const nextRun = j.next_run ? new Date(j.next_run).toLocaleString() : "N/A";
-    const lastRun = j.last_run ? new Date(j.last_run).toLocaleString() : "Never";
+    const nextRun = j.next_run ? new Date(j.next_run).toLocaleString(undefined, tzOpts) : "N/A";
+    const lastRun = j.last_run ? new Date(j.last_run).toLocaleString(undefined, tzOpts) : "Never";
 
     return [
       `${i + 1}. ${j.name} [${status}]`,
@@ -366,9 +372,11 @@ export async function getCronHistory(
   if (error) return `Failed to fetch history: ${error.message}`;
   if (!data || data.length === 0) return `No execution history for "${name}".`;
 
+  const tzOpts = _timezone ? { timeZone: _timezone } : undefined;
+
   return `Last ${data.length} executions of "${name}":\n\n` +
     data.map((e, i) => {
-      const time = new Date(e.executed_at).toLocaleString();
+      const time = new Date(e.executed_at).toLocaleString(undefined, tzOpts);
       const dur = e.duration_ms ? `${e.duration_ms}ms` : "N/A";
       return `${i + 1}. [${e.status}] ${time} (${dur})\n   ${(e.result || "").substring(0, 100)}`;
     }).join("\n\n");

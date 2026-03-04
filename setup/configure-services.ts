@@ -43,7 +43,7 @@ interface ServiceDef {
 const SERVICES: Record<string, ServiceDef> = {
   relay: {
     name: "claude-telegram-relay",
-    script: "src/relay.ts",
+    script: "src/bot.ts",
     description: "Main bot (always running)",
   },
   checkin: {

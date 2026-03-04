@@ -8,7 +8,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-const OWNER_ID = process.env.TELEGRAM_OWNER_ID || "";
+const OWNER_ID = process.env.TELEGRAM_OWNER_ID || process.env.TELEGRAM_USER_ID || "";
 
 // In-memory cache of authorized users (refreshed periodically)
 let authorizedCache: Map<string, string> = new Map(); // telegram_id → role

@@ -27,7 +27,7 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 // ============================================================
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const OWNER_ID = process.env.TELEGRAM_OWNER_ID || "";
+const OWNER_ID = process.env.TELEGRAM_OWNER_ID || process.env.TELEGRAM_USER_ID || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
@@ -622,7 +622,7 @@ console.log(`Brave Search: ${process.env.BRAVE_API_KEY ? "configured" : "not con
 
 // Initialize scheduler if Supabase is available
 if (supabase) {
-  await initScheduler(supabase, schedulerExecute, schedulerSendMessage);
+  await initScheduler(supabase, schedulerExecute, schedulerSendMessage, USER_TIMEZONE);
 }
 
 bot.start({

@@ -26,7 +26,7 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 // ============================================================
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
+const ALLOWED_USER_ID = process.env.TELEGRAM_OWNER_ID || process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
