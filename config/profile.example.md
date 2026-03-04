@@ -1,7 +1,7 @@
 # Your Profile
 
 > Copy this file to config/profile.md and fill in your details.
-> Your bot loads this on every message to personalize responses.
+> Gentech loads this on every message to personalize responses.
 
 ## About You
 
@@ -27,3 +27,9 @@
 - How you prefer responses (brief/detailed, casual/formal)
 - Any pet peeves about AI responses
 - Preferred language
+
+## Interests
+
+- DeFi / crypto interests (chains, protocols, etc.)
+- Travel preferences (budget/luxury, adventure/relaxation)
+- Work tools (which spreadsheets, email patterns)

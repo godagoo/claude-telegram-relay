@@ -74,11 +74,101 @@ CREATE POLICY "Allow all for service role" ON memory FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON logs FOR ALL USING (true);
 
 -- ============================================================
+-- MULTI-USER: Add user_id to messages and memory
+-- ============================================================
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE memory ADD COLUMN IF NOT EXISTS user_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id);
+CREATE INDEX IF NOT EXISTS idx_memory_user_id ON memory(user_id);
+
+-- ============================================================
+-- AUTHORIZED USERS (owner + approved)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS authorized_users (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  telegram_id TEXT UNIQUE NOT NULL,
+  username TEXT,
+  role TEXT CHECK (role IN ('owner', 'user')) DEFAULT 'user',
+  added_by TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE authorized_users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow all for service role" ON authorized_users FOR ALL USING (true);
+
+-- ============================================================
+-- CRON JOBS (managed from Telegram)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS cron_jobs (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  schedule TEXT NOT NULL,
+  action TEXT NOT NULL,
+  enabled BOOLEAN DEFAULT true,
+  last_run TIMESTAMPTZ,
+  next_run TIMESTAMPTZ,
+  run_count INTEGER DEFAULT 0,
+  last_result TEXT,
+  execution_lock TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, name)
+);
+
+ALTER TABLE cron_jobs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow all for service role" ON cron_jobs FOR ALL USING (true);
+
+-- ============================================================
+-- CRON EXECUTION AUDIT LOG
+-- ============================================================
+CREATE TABLE IF NOT EXISTS cron_executions (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  job_id UUID REFERENCES cron_jobs(id) ON DELETE CASCADE,
+  executed_at TIMESTAMPTZ DEFAULT NOW(),
+  execution_id TEXT UNIQUE NOT NULL,
+  result TEXT,
+  duration_ms INTEGER,
+  status TEXT CHECK (status IN ('success', 'error', 'skipped'))
+);
+
+ALTER TABLE cron_executions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow all for service role" ON cron_executions FOR ALL USING (true);
+
+-- ============================================================
+-- ENV BACKUPS
+-- ============================================================
+CREATE TABLE IF NOT EXISTS env_backups (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  source TEXT DEFAULT 'auto'
+);
+
+ALTER TABLE env_backups ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow all for service role" ON env_backups FOR ALL USING (true);
+
+-- ============================================================
+-- GOOGLE OAUTH TOKENS
+-- ============================================================
+CREATE TABLE IF NOT EXISTS google_tokens (
+  user_id TEXT PRIMARY KEY,
+  access_token TEXT,
+  refresh_token TEXT,
+  expiry TIMESTAMPTZ,
+  scopes TEXT[],
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE google_tokens ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow all for service role" ON google_tokens FOR ALL USING (true);
+
+-- ============================================================
 -- HELPER FUNCTIONS
 -- ============================================================
 
--- Get recent messages for context
-CREATE OR REPLACE FUNCTION get_recent_messages(limit_count INTEGER DEFAULT 20)
+-- Get recent messages for context (scoped by user_id)
+CREATE OR REPLACE FUNCTION get_recent_messages(p_user_id TEXT DEFAULT NULL, limit_count INTEGER DEFAULT 20)
 RETURNS TABLE (
   id UUID,
   created_at TIMESTAMPTZ,
@@ -89,13 +179,14 @@ BEGIN
   RETURN QUERY
   SELECT m.id, m.created_at, m.role, m.content
   FROM messages m
+  WHERE (p_user_id IS NULL OR m.user_id = p_user_id)
   ORDER BY m.created_at DESC
   LIMIT limit_count;
 END;
 $$ LANGUAGE plpgsql;
 
--- Get active goals
-CREATE OR REPLACE FUNCTION get_active_goals()
+-- Get active goals (scoped by user_id)
+CREATE OR REPLACE FUNCTION get_active_goals(p_user_id TEXT DEFAULT NULL)
 RETURNS TABLE (
   id UUID,
   content TEXT,
@@ -107,12 +198,13 @@ BEGIN
   SELECT m.id, m.content, m.deadline, m.priority
   FROM memory m
   WHERE m.type = 'goal'
+    AND (p_user_id IS NULL OR m.user_id = p_user_id)
   ORDER BY m.priority DESC, m.created_at DESC;
 END;
 $$ LANGUAGE plpgsql;
 
--- Get all facts
-CREATE OR REPLACE FUNCTION get_facts()
+-- Get all facts (scoped by user_id)
+CREATE OR REPLACE FUNCTION get_facts(p_user_id TEXT DEFAULT NULL)
 RETURNS TABLE (
   id UUID,
   content TEXT
@@ -122,6 +214,7 @@ BEGIN
   SELECT m.id, m.content
   FROM memory m
   WHERE m.type = 'fact'
+    AND (p_user_id IS NULL OR m.user_id = p_user_id)
   ORDER BY m.created_at DESC;
 END;
 $$ LANGUAGE plpgsql;
