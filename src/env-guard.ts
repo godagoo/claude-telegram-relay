@@ -13,6 +13,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 const ENV_PATH = join(PROJECT_ROOT, ".env");
+const PERSISTENT_BACKUP = join(process.env.HOME || "/root", ".gentech-env");
 const MAX_LOCAL_BACKUPS = 10;
 
 export async function backupEnv(supabase: SupabaseClient | null, source = "auto"): Promise<string | null> {
@@ -45,6 +46,9 @@ export async function backupEnv(supabase: SupabaseClient | null, source = "auto"
       console.warn("env-guard: Supabase backup failed:", err);
     }
   }
+
+  // Persistent backup (survives reboots)
+  await persistEnv();
 
   // Rotate old local backups
   await rotateLocalBackups();
@@ -136,5 +140,49 @@ async function rotateLocalBackups(): Promise<void> {
   }
   if (toDelete.length > 0) {
     console.log(`env-guard: Rotated ${toDelete.length} old backup(s)`);
+  }
+}
+
+/**
+ * Save .env to a persistent location outside the repo (~/.gentech-env).
+ * Only saves if .env contains a real bot token (not empty placeholders).
+ */
+export async function persistEnv(): Promise<boolean> {
+  try {
+    const content = await readFile(ENV_PATH, "utf-8");
+    const hasToken = content.match(/^TELEGRAM_BOT_TOKEN=.+$/m);
+    if (!hasToken) return false;
+
+    await writeFile(PERSISTENT_BACKUP, content);
+    console.log(`env-guard: Persistent backup saved → ${PERSISTENT_BACKUP}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Auto-restore .env from persistent backup if current .env is missing or empty.
+ * Called before startup checks so the bot can self-heal after a reboot.
+ */
+export async function autoRestore(): Promise<boolean> {
+  try {
+    // Check if .env exists and has a real token
+    try {
+      const current = await readFile(ENV_PATH, "utf-8");
+      if (current.match(/^TELEGRAM_BOT_TOKEN=.+$/m)) return false; // .env is fine
+    } catch {
+      // .env doesn't exist, try to restore
+    }
+
+    // Try persistent backup
+    const backup = await readFile(PERSISTENT_BACKUP, "utf-8");
+    if (!backup.match(/^TELEGRAM_BOT_TOKEN=.+$/m)) return false; // backup is also empty
+
+    await writeFile(ENV_PATH, backup);
+    console.log(`env-guard: .env restored from persistent backup ${PERSISTENT_BACKUP}`);
+    return true;
+  } catch {
+    return false; // no persistent backup exists
   }
 }

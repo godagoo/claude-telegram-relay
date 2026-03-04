@@ -15,7 +15,7 @@ import { transcribe } from "./transcribe.ts";
 import { processMemoryIntents, getMemoryContext, getRelevantContext, saveMessage } from "./memory.ts";
 import { initAI, loadProfile, callAI, clearHistory, getAIMode } from "./ai.ts";
 import { isAuthorized, isOwner, addUser, removeUser, listUsers, checkRateLimit } from "./auth.ts";
-import { backupEnv, restoreEnv, listBackups } from "./env-guard.ts";
+import { backupEnv, restoreEnv, listBackups, autoRestore, persistEnv } from "./env-guard.ts";
 import { initScheduler, stopScheduler, addCronJob, listCronJobs, deleteCronJob, toggleCronJob, getCronHistory } from "./scheduler.ts";
 import { describeTelegramVideo } from "./skills/video.ts";
 import { sendResponse, sendToChat, log } from "./utils.ts";
@@ -40,7 +40,13 @@ const LOCK_FILE = join(RELAY_DIR, "bot.lock");
 // STARTUP CHECKS
 // ============================================================
 
+// Auto-restore .env if wiped (e.g., after server reboot)
 if (!BOT_TOKEN) {
+  const restored = await autoRestore();
+  if (restored) {
+    console.log("env-guard: .env restored from persistent backup, restarting...");
+    process.exit(0); // PM2 will restart with restored .env
+  }
   console.error("TELEGRAM_BOT_TOKEN not set!");
   console.log("\n1. Message @BotFather on Telegram");
   console.log("2. Create a new bot with /newbot");
