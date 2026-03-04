@@ -13,7 +13,7 @@ import { join, dirname } from "path";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
 import { processMemoryIntents, getMemoryContext, getRelevantContext, saveMessage } from "./memory.ts";
-import { initAI, loadProfile, callAI, clearHistory, getAIMode } from "./ai.ts";
+import { initAI, loadProfile, callAI, clearHistory, getAIMode, hydrateHistory } from "./ai.ts";
 import { isAuthorized, isOwner, addUser, removeUser, listUsers, checkRateLimit } from "./auth.ts";
 import { backupEnv, restoreEnv, listBackups, autoRestore, persistEnv } from "./env-guard.ts";
 import { initScheduler, stopScheduler, addCronJob, listCronJobs, deleteCronJob, toggleCronJob, getCronHistory } from "./scheduler.ts";
@@ -374,6 +374,7 @@ bot.on("message:text", async (ctx) => {
   log("info", "message_received", { userId, type: "text", length: text.length });
   await ctx.replyWithChatAction("typing");
 
+  await hydrateHistory(supabase, userId);
   await saveMessage(supabase, "user", text, userId);
 
   const [relevantContext, memoryContext] = await Promise.all([
@@ -400,6 +401,7 @@ bot.on("message:voice", async (ctx) => {
   const voice = ctx.message.voice;
   log("info", "message_received", { userId, type: "voice", duration: voice.duration });
   await ctx.replyWithChatAction("typing");
+  await hydrateHistory(supabase, userId);
 
   if (!process.env.VOICE_PROVIDER) {
     await ctx.reply("Voice transcription not set up. Set VOICE_PROVIDER=groq and GROQ_API_KEY in .env.");
@@ -447,6 +449,7 @@ bot.on("message:photo", async (ctx) => {
   const userId = ctx.from?.id.toString() || "";
   log("info", "message_received", { userId, type: "photo" });
   await ctx.replyWithChatAction("typing");
+  await hydrateHistory(supabase, userId);
 
   try {
     const photos = ctx.message.photo;
@@ -491,6 +494,7 @@ bot.on(["message:video", "message:video_note"], async (ctx) => {
   const video = ctx.message.video || ctx.message.video_note;
   log("info", "message_received", { userId, type: "video", duration: video?.duration });
   await ctx.replyWithChatAction("typing");
+  await hydrateHistory(supabase, userId);
 
   const caption = ctx.message.caption || "I sent you a video.";
   const videoDesc = describeTelegramVideo(
@@ -530,6 +534,7 @@ bot.on("message:document", async (ctx) => {
   const doc = ctx.message.document;
   log("info", "message_received", { userId, type: "document", name: doc.file_name });
   await ctx.replyWithChatAction("typing");
+  await hydrateHistory(supabase, userId);
 
   try {
     const file = await ctx.getFile();

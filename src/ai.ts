@@ -8,6 +8,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { spawn } from "bun";
 import { readFile } from "fs/promises";
 import { join, dirname } from "path";
@@ -23,6 +24,7 @@ const MAX_TOOL_ROUNDS = 10;
 // Per-user conversation history (in-memory, last N messages)
 const MAX_HISTORY_PER_USER = 20;
 const conversationHistory: Map<string, Anthropic.MessageParam[]> = new Map();
+const hydratedUsers: Set<string> = new Set();
 
 let client: Anthropic | null = null;
 let profileContext = "";
@@ -307,6 +309,49 @@ async function callCLI(
 // ============================================================
 // SHARED
 // ============================================================
+
+/**
+ * Hydrate conversation history from Supabase on first interaction after restart.
+ * Only runs once per user per process lifetime.
+ */
+export async function hydrateHistory(supabase: SupabaseClient | null, userId: string): Promise<void> {
+  if (!supabase || hydratedUsers.has(userId)) return;
+  hydratedUsers.add(userId);
+
+  try {
+    const { data, error } = await supabase.rpc("get_recent_messages", {
+      p_user_id: userId,
+      limit_count: MAX_HISTORY_PER_USER,
+    });
+
+    if (error || !data?.length) return;
+
+    // Data comes back newest-first, reverse to chronological order
+    const messages: Array<{ role: string; content: string }> = [...data].reverse();
+
+    const history: Anthropic.MessageParam[] = [];
+    for (const msg of messages) {
+      const role = msg.role === "user" ? "user" : "assistant";
+      // Ensure alternating roles (required by Anthropic API)
+      if (history.length > 0 && history[history.length - 1].role === role) {
+        continue;
+      }
+      history.push({ role, content: msg.content });
+    }
+
+    // Ensure history starts with a user message
+    while (history.length > 0 && history[0].role !== "user") {
+      history.shift();
+    }
+
+    if (history.length > 0) {
+      conversationHistory.set(userId, history);
+      console.log(`Hydrated ${history.length} messages from Supabase for user ${userId}`);
+    }
+  } catch (err) {
+    console.error("History hydration error:", err);
+  }
+}
 
 function getHistory(userId: string): Anthropic.MessageParam[] {
   if (!conversationHistory.has(userId)) {

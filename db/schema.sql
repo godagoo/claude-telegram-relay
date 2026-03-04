@@ -232,7 +232,8 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION match_messages(
   query_embedding VECTOR(1536),
   match_threshold FLOAT DEFAULT 0.7,
-  match_count INT DEFAULT 10
+  match_count INT DEFAULT 10,
+  p_user_id TEXT DEFAULT NULL
 )
 RETURNS TABLE (
   id UUID,
@@ -252,6 +253,7 @@ BEGIN
   FROM messages m
   WHERE m.embedding IS NOT NULL
     AND 1 - (m.embedding <=> query_embedding) > match_threshold
+    AND (p_user_id IS NULL OR m.user_id = p_user_id)
   ORDER BY m.embedding <=> query_embedding
   LIMIT match_count;
 END;
@@ -261,7 +263,8 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION match_memory(
   query_embedding VECTOR(1536),
   match_threshold FLOAT DEFAULT 0.7,
-  match_count INT DEFAULT 10
+  match_count INT DEFAULT 10,
+  p_user_id TEXT DEFAULT NULL
 )
 RETURNS TABLE (
   id UUID,
@@ -281,6 +284,7 @@ BEGIN
   FROM memory m
   WHERE m.embedding IS NOT NULL
     AND 1 - (m.embedding <=> query_embedding) > match_threshold
+    AND (p_user_id IS NULL OR m.user_id = p_user_id)
   ORDER BY m.embedding <=> query_embedding
   LIMIT match_count;
 END;
