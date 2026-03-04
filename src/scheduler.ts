@@ -11,6 +11,10 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { parseExpression } from "cron-parser";
+import { spawn } from "bun";
+import { dirname } from "path";
+
+const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const CHECK_INTERVAL_MS = 30_000; // Check every 30 seconds
 let checkTimer: ReturnType<typeof setInterval> | null = null;
@@ -161,7 +165,11 @@ async function executeJob(job: CronJob): Promise<void> {
 
   try {
     console.log(`Scheduler: Executing job "${job.name}" for user ${job.user_id}`);
-    result = await _onExecute(job.user_id, job.action);
+    if (job.action.startsWith("EXEC:")) {
+      result = await runScript(job.action.slice(5).trim());
+    } else {
+      result = await _onExecute(job.user_id, job.action);
+    }
 
     // Send result to user
     await _sendMessage(
@@ -202,6 +210,25 @@ async function executeJob(job: CronJob): Promise<void> {
   job.last_run = new Date().toISOString();
   job.next_run = newNextRun;
   job.run_count += 1;
+}
+
+/**
+ * Run a shell command and return its stdout.
+ * Used when cron action starts with "EXEC:".
+ */
+async function runScript(cmd: string): Promise<string> {
+  const parts = cmd.split(/\s+/);
+  const proc = spawn(parts, {
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: PROJECT_ROOT,
+    env: { ...process.env },
+  });
+  const out = await new Response(proc.stdout).text();
+  const err = await new Response(proc.stderr).text();
+  const code = await proc.exited;
+  if (code !== 0) throw new Error(err.trim() || `Script exited with code ${code}`);
+  return out.trim();
 }
 
 /**
