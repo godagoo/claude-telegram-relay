@@ -1,6 +1,7 @@
 # Environment
 .env
 .env.local
+.env.backup.*
 
 # Dependencies
 node_modules/
