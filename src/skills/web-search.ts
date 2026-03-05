@@ -51,7 +51,8 @@ export async function handler(input: Record<string, unknown>): Promise<string> {
   });
 
   if (!response.ok) {
-    return `Search failed: ${response.status} ${response.statusText}`;
+    const body = await response.text().catch(() => "");
+    return `Search failed (${response.status}): ${response.statusText}${body ? ` — ${body.slice(0, 200)}` : ""}`;
   }
 
   const data = await response.json();

@@ -232,7 +232,7 @@ async function executeJob(job: CronJob): Promise<void> {
  */
 async function runScript(cmd: string): Promise<string> {
   const parts = cmd.split(/\s+/);
-  const proc = spawn(parts, {
+  const proc = spawn(parts[0], parts.slice(1), {
     stdout: "pipe",
     stderr: "pipe",
     cwd: PROJECT_ROOT,
