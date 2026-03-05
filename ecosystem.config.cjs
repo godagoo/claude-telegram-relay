@@ -11,7 +11,7 @@ module.exports = {
     {
       name: "claude-telegram-relay",
       script: "./start-bot.sh",
-      cwd: "/home/user/claude-telegram-relay",
+      cwd: "/root/claude-telegram-relay/claude-telegram-relay",
       out_file: "./logs/claude-telegram-relay.log",
       error_file: "./logs/claude-telegram-relay.error.log",
       restart_delay: 5000,

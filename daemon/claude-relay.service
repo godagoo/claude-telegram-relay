@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/claude-telegram-relay
+WorkingDirectory=/root/claude-telegram-relay/claude-telegram-relay
 ExecStart=/root/.bun/bin/bun run src/bot.ts
 Restart=always
 RestartSec=10
@@ -12,7 +12,7 @@ RestartSec=10
 # Environment
 Environment=HOME=/root
 Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=/root/claude-telegram-relay/.env
+EnvironmentFile=/root/claude-telegram-relay/claude-telegram-relay/.env
 
 # Logging
 StandardOutput=journal
