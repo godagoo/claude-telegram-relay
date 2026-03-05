@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.backup.*
+.env.backup-template
 
 # Dependencies
 node_modules/
