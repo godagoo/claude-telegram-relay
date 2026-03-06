@@ -172,6 +172,7 @@ REASON: [Why you decided this]
     const proc = spawn([CLAUDE_PATH, "-p", prompt, "--output-format", "text"], {
       stdout: "pipe",
       stderr: "pipe",
+      env: { ...process.env, CLAUDECODE: undefined },
     });
 
     const output = await new Response(proc.stdout).text();
@@ -232,34 +233,14 @@ main();
 // ============================================================
 // SCHEDULING
 // ============================================================
-/*
-Run every 30 minutes:
-
-CRON (Linux):
-*/30 * * * * cd /path/to/relay && bun run examples/smart-checkin.ts
-
-LAUNCHD (macOS) - save as ~/Library/LaunchAgents/com.claude.smart-checkin.plist:
-
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "...">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude.smart-checkin</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/YOU/.bun/bin/bun</string>
-        <string>run</string>
-        <string>examples/smart-checkin.ts</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>/path/to/relay</string>
-    <key>StartInterval</key>
-    <integer>1800</integer>  <!-- 30 minutes in seconds -->
-</dict>
-</plist>
-
-WINDOWS Task Scheduler:
-- Create task with "Daily" trigger
-- Set to repeat every 30 minutes
-*/
+// ============================================================
+// SCHEDULING
+// ============================================================
+//
+// Run every 30 minutes:
+//
+// CRON (Linux):
+//   */30 7-22 * * * cd /path/to/relay && bun run examples/smart-checkin.ts
+//
+// Or use the installer:
+//   bash setup/install-cron.sh

@@ -45,7 +45,11 @@ CLAUDE_PATH=${CLAUDE_PATH:-claude}
 # === End Claude Telegram Relay ==="
 
 # Remove old relay cron entries if any, then append new ones
-(crontab -l 2>/dev/null | sed '/=== Claude Telegram Relay/,/=== End Claude Telegram Relay ===/d'; echo "$CRON_BLOCK") | crontab -
+# Also clean stale entries (e.g. crypto-report.ts from older branches)
+(crontab -l 2>/dev/null \
+  | sed '/=== Claude Telegram Relay/,/=== End Claude Telegram Relay ===/d' \
+  | grep -v 'crypto-report\.ts' \
+; echo "$CRON_BLOCK") | crontab -
 
 echo ""
 echo "Cron jobs installed:"
