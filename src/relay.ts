@@ -185,29 +185,67 @@ bot.use(async (ctx, next) => {
 
 async function callClaude(
   prompt: string,
-  options?: { resume?: boolean; imagePath?: string }
+  options?: { resume?: boolean; imageBase64?: string; mediaType?: string }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
-
-  // Resume previous session if available and requested
-  if (options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
-  }
-
-  args.push("--output-format", "text");
-
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
 
   try {
-    const proc = spawn(args, {
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: PROJECT_DIR || undefined,
-      env: {
-        ...process.env,
-        // Pass through any env vars Claude might need
-      },
-    });
+    let proc;
+
+    if (options?.imageBase64 && options?.mediaType) {
+      // Image mode: use stream-json input to pass multimodal content
+      const args = [CLAUDE_PATH, "-p", "--input-format", "stream-json", "--output-format", "text", "--model", "claude-haiku-4-5-20251001"];
+
+      if (options?.resume && session.sessionId) {
+        args.push("--resume", session.sessionId);
+      }
+
+      // Build stream-json message with image + text
+      const streamMessage = JSON.stringify({
+        type: "user_message",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: options.mediaType,
+              data: options.imageBase64,
+            },
+          },
+          {
+            type: "text",
+            text: prompt,
+          },
+        ],
+      });
+
+      proc = spawn(args, {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "pipe",
+        cwd: PROJECT_DIR || undefined,
+        env: { ...process.env },
+      });
+
+      // Write the stream-json message to stdin then close
+      const writer = proc.stdin.getWriter();
+      await writer.write(new TextEncoder().encode(streamMessage + "\n"));
+      await writer.close();
+    } else {
+      // Text-only mode: standard -p invocation
+      const args = [CLAUDE_PATH, "-p", prompt, "--output-format", "text", "--model", "claude-haiku-4-5-20251001"];
+
+      if (options?.resume && session.sessionId) {
+        args.push("--resume", session.sessionId);
+      }
+
+      proc = spawn(args, {
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: PROJECT_DIR || undefined,
+        env: { ...process.env },
+      });
+    }
 
     const output = await new Response(proc.stdout).text();
     const stderr = await new Response(proc.stderr).text();
@@ -323,26 +361,32 @@ bot.on("message:photo", async (ctx) => {
     const photo = photos[photos.length - 1];
     const file = await ctx.api.getFile(photo.file_id);
 
-    // Download the image
-    const timestamp = Date.now();
-    const filePath = join(UPLOADS_DIR, `image_${timestamp}.jpg`);
-
+    // Download the image as buffer
     const response = await fetch(
       `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
     );
-    const buffer = await response.arrayBuffer();
-    await writeFile(filePath, Buffer.from(buffer));
+    const buffer = Buffer.from(await response.arrayBuffer());
 
-    // Claude Code can see images via file path
+    // Convert to base64 for Claude CLI stream-json input
+    const imageBase64 = buffer.toString("base64");
+    const mediaType = "image/jpeg";
+
     const caption = ctx.message.caption || "Analyze this image.";
-    const prompt = `[Image: ${filePath}]\n\n${caption}`;
 
     await saveMessage("user", `[Image]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    // Gather context
+    const [relevantContext, memoryContext] = await Promise.all([
+      getRelevantContext(supabase, caption),
+      getMemoryContext(supabase),
+    ]);
 
-    // Cleanup after processing
-    await unlink(filePath).catch(() => {});
+    const enrichedPrompt = buildPrompt(caption, relevantContext, memoryContext);
+    const claudeResponse = await callClaude(enrichedPrompt, {
+      resume: true,
+      imageBase64,
+      mediaType,
+    });
 
     const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
     await saveMessage("assistant", cleanResponse);
@@ -479,15 +523,49 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 }
 
 // ============================================================
-// START
+// ERROR HANDLING
+// ============================================================
+
+bot.catch((err) => {
+  console.error("Bot error:", err.message || err);
+});
+
+// ============================================================
+// START (with 409 retry for PM2 restarts)
 // ============================================================
 
 console.log("Starting Claude Telegram Relay...");
 console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+console.log(`Model: claude-haiku-4-5-20251001`);
 
-bot.start({
-  onStart: () => {
-    console.log("Bot is running!");
-  },
-});
+async function startWithRetry(maxRetries = 3): Promise<void> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await bot.start({
+        onStart: () => {
+          console.log("Bot is running!");
+        },
+      });
+      return;
+    } catch (error: any) {
+      const is409 =
+        error?.message?.includes("409") ||
+        error?.error_code === 409 ||
+        error?.description?.includes("Conflict");
+
+      if (is409 && attempt < maxRetries) {
+        const delay = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+        console.log(
+          `409 Conflict (another polling session). Retrying in ${delay / 1000}s... (attempt ${attempt + 1}/${maxRetries})`
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        console.error(`Failed to start bot:`, error);
+        process.exit(1);
+      }
+    }
+  }
+}
+
+startWithRetry();

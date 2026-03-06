@@ -49,14 +49,20 @@ const SERVICES: Record<string, ServiceDef> = {
   checkin: {
     name: "claude-smart-checkin",
     script: "examples/smart-checkin.ts",
-    cron: "*/30 9-18 * * *",
-    description: "Smart check-ins (every 30 min, 9am-6pm)",
+    cron: "*/30 7-22 * * *",
+    description: "Smart check-ins (every 30 min, 7am-11pm)",
   },
   briefing: {
     name: "claude-morning-briefing",
     script: "examples/morning-briefing.ts",
-    cron: "0 9 * * *",
-    description: "Morning briefing (daily at 9am)",
+    cron: "0 7 * * *",
+    description: "Morning briefing (daily at 7am)",
+  },
+  crypto: {
+    name: "claude-crypto-update",
+    script: "examples/crypto-price-update.ts",
+    cron: "0 7-22 * * *",
+    description: "Crypto price report (hourly, 7am-11pm)",
   },
 };
 
