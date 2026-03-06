@@ -11,15 +11,46 @@
  * Run: bun run examples/smart-checkin.ts
  */
 
-import { spawn } from "bun";
+import { spawn, spawnSync } from "bun";
 import { readFile, writeFile } from "fs/promises";
+import { existsSync } from "fs";
 import { join } from "path";
+import { homedir } from "os";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
-const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const STATE_FILE =
   process.env.CHECKIN_STATE_FILE || "/tmp/checkin-state.json";
+
+// Resolve claude binary — handles cron's minimal PATH
+function resolveClaude(): string {
+  // 1. Explicit env var (set by crontab header or .env)
+  const envPath = process.env.CLAUDE_PATH;
+  if (envPath && envPath !== "claude" && existsSync(envPath)) {
+    return envPath;
+  }
+  // 2. Common install locations
+  const home = homedir();
+  const candidates = [
+    join(home, ".npm-global", "bin", "claude"),
+    join(home, ".local", "bin", "claude"),
+    "/usr/local/bin/claude",
+    join(home, ".bun", "bin", "claude"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  // 3. Try which
+  try {
+    const result = spawnSync(["which", "claude"]);
+    const path = new TextDecoder().decode(result.stdout).trim();
+    if (path && existsSync(path)) return path;
+  } catch {}
+  // 4. Fallback to bare name (relies on PATH)
+  return process.env.CLAUDE_PATH || "claude";
+}
+
+const CLAUDE_PATH = resolveClaude();
 
 // ============================================================
 // STATE MANAGEMENT
