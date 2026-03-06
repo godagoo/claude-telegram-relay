@@ -1,12 +1,15 @@
-#!/usr/bin/env -S env -i HOME=/root PATH=/root/.bun/bin:/opt/node22/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash
-# Clean startup — env -i strips ALL inherited env vars (including proxy)
-# Only HOME and PATH are set via the shebang line above.
+#!/bin/bash
+# Clean startup — strips inherited env vars, then sources .env
+# Used by systemd/PM2 for a predictable environment
 
-cd /home/user/claude-telegram-relay
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUN_PATH="$(which bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
+
+cd "$SCRIPT_DIR"
 
 # Source .env into the environment
 set -a
 source .env
 set +a
 
-exec /root/.bun/bin/bun run src/bot.ts
+exec "$BUN_PATH" run src/bot.ts

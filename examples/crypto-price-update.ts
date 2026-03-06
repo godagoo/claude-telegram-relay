@@ -13,7 +13,7 @@
  */
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
+const CHAT_ID = process.env.TELEGRAM_OWNER_ID || process.env.TELEGRAM_USER_ID || "";
 const CMC_API_KEY = process.env.CMC_API_KEY || "";
 const USER_TIMEZONE = process.env.USER_TIMEZONE || "America/New_York";
 
