@@ -1,5 +1,5 @@
 /**
- * Memory Module
+ * Memory Module — Enhanced with per-user scoping
  *
  * Persistent facts, goals, and preferences stored in Supabase.
  * Claude manages memory automatically via intent tags in its responses:
@@ -7,7 +7,7 @@
  *   [GOAL: text | DEADLINE: date]
  *   [DONE: search text]
  *
- * The relay parses these tags, saves to Supabase, and strips them
+ * The bot parses these tags, saves to Supabase, and strips them
  * from the response before sending to the user.
  */
 
@@ -19,7 +19,8 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  */
 export async function processMemoryIntents(
   supabase: SupabaseClient | null,
-  response: string
+  response: string,
+  userId?: string
 ): Promise<string> {
   if (!supabase) return response;
 
@@ -30,6 +31,7 @@ export async function processMemoryIntents(
     await supabase.from("memory").insert({
       type: "fact",
       content: match[1],
+      user_id: userId || null,
     });
     clean = clean.replace(match[0], "");
   }
@@ -42,6 +44,7 @@ export async function processMemoryIntents(
       type: "goal",
       content: match[1],
       deadline: match[2] || null,
+      user_id: userId || null,
     });
     clean = clean.replace(match[0], "");
   }
@@ -71,17 +74,18 @@ export async function processMemoryIntents(
 }
 
 /**
- * Get all facts and active goals for prompt context.
+ * Get all facts and active goals for prompt context (scoped by user).
  */
 export async function getMemoryContext(
-  supabase: SupabaseClient | null
+  supabase: SupabaseClient | null,
+  userId?: string
 ): Promise<string> {
   if (!supabase) return "";
 
   try {
     const [factsResult, goalsResult] = await Promise.all([
-      supabase.rpc("get_facts"),
-      supabase.rpc("get_active_goals"),
+      supabase.rpc("get_facts", { p_user_id: userId || null }),
+      supabase.rpc("get_active_goals", { p_user_id: userId || null }),
     ]);
 
     const parts: string[] = [];
@@ -89,7 +93,7 @@ export async function getMemoryContext(
     if (factsResult.data?.length) {
       parts.push(
         "FACTS:\n" +
-          factsResult.data.map((f: any) => `- ${f.content}`).join("\n")
+          factsResult.data.map((f: { content: string }) => `- ${f.content}`).join("\n")
       );
     }
 
@@ -97,7 +101,7 @@ export async function getMemoryContext(
       parts.push(
         "GOALS:\n" +
           goalsResult.data
-            .map((g: any) => {
+            .map((g: { content: string; deadline: string | null }) => {
               const deadline = g.deadline
                 ? ` (by ${new Date(g.deadline).toLocaleDateString()})`
                 : "";
@@ -116,17 +120,18 @@ export async function getMemoryContext(
 
 /**
  * Semantic search for relevant past messages via the search Edge Function.
- * The Edge Function handles embedding generation (OpenAI key stays in Supabase).
+ * Scoped by user_id.
  */
 export async function getRelevantContext(
   supabase: SupabaseClient | null,
-  query: string
+  query: string,
+  userId?: string
 ): Promise<string> {
   if (!supabase) return "";
 
   try {
     const { data, error } = await supabase.functions.invoke("search", {
-      body: { query, match_count: 5, table: "messages" },
+      body: { query, match_count: 5, table: "messages", user_id: userId },
     });
 
     if (error || !data?.length) return "";
@@ -134,11 +139,35 @@ export async function getRelevantContext(
     return (
       "RELEVANT PAST MESSAGES:\n" +
       data
-        .map((m: any) => `[${m.role}]: ${m.content}`)
+        .map((m: { role: string; content: string }) => `[${m.role}]: ${m.content}`)
         .join("\n")
     );
   } catch {
-    // Search not available yet (Edge Functions not deployed) — that's fine
+    // Search not available yet (Edge Functions not deployed)
     return "";
+  }
+}
+
+/**
+ * Save a message to Supabase with user_id.
+ */
+export async function saveMessage(
+  supabase: SupabaseClient | null,
+  role: string,
+  content: string,
+  userId?: string,
+  metadata?: Record<string, unknown>
+): Promise<void> {
+  if (!supabase) return;
+  try {
+    await supabase.from("messages").insert({
+      role,
+      content,
+      channel: "telegram",
+      user_id: userId || null,
+      metadata: metadata || {},
+    });
+  } catch (error) {
+    console.error("Message save error:", error);
   }
 }

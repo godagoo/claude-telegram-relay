@@ -20,6 +20,7 @@ Deno.serve(async (req) => {
       table = "messages",
       match_count = 10,
       match_threshold = 0.7,
+      user_id,
     } = await req.json();
 
     if (!query) {
@@ -67,6 +68,7 @@ Deno.serve(async (req) => {
       query_embedding: embedding,
       match_threshold,
       match_count,
+      p_user_id: user_id || null,
     });
 
     if (error) {

@@ -13,7 +13,7 @@
  */
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
+const CHAT_ID = process.env.TELEGRAM_OWNER_ID || process.env.TELEGRAM_USER_ID || "";
 
 // ============================================================
 // TELEGRAM HELPER
@@ -162,7 +162,7 @@ async function main() {
   console.log("Building morning briefing...");
 
   if (!BOT_TOKEN || !CHAT_ID) {
-    console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID");
+    console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_OWNER_ID");
     process.exit(1);
   }
 

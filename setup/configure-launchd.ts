@@ -127,7 +127,7 @@ interface ServiceConfig {
 const SERVICES: Record<string, ServiceConfig> = {
   relay: {
     label: "com.claude.telegram-relay",
-    script: "src/relay.ts",
+    script: "src/bot.ts",
     keepAlive: true,
     description: "Main bot (always running, restarts on crash)",
   },
