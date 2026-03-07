@@ -627,10 +627,47 @@ console.log(`Supabase: ${supabase ? "connected" : "not configured"}`);
 console.log(`Voice: ${process.env.VOICE_PROVIDER || "not configured"}`);
 console.log(`Brave Search: ${process.env.BRAVE_API_KEY ? "configured" : "not configured"}`);
 
+// Validate Supabase key before initializing scheduler
+async function validateSupabaseKey(): Promise<boolean> {
+  if (!supabase) return false;
+
+  try {
+    // Quick test: try to fetch one row from messages table
+    const { error } = await supabase
+      .from("messages")
+      .select("*")
+      .limit(1);
+
+    if (error) {
+      const msg = error.message || String(error);
+      if (msg.includes("Invalid API key") || msg.includes("401") || msg.includes("403")) {
+        console.error("Supabase: ANON KEY INVALID OR EXPIRED");
+        console.error(`  Error: ${msg}`);
+        console.error("  Fix: Update SUPABASE_ANON_KEY in .env (get from Supabase > Project Settings > API)");
+        return false;
+      }
+      console.warn(`Supabase: Query failed: ${msg}`);
+      return true; // Might be a temporary issue
+    }
+    console.log("Supabase: Key validated ✓");
+    return true;
+  } catch (err: any) {
+    console.error(`Supabase validation error: ${err.message}`);
+    return false;
+  }
+}
+
 // Initialize scheduler if Supabase is available (non-blocking — bot starts even if scheduler fails)
 if (supabase) {
-  initScheduler(supabase, schedulerExecute, schedulerSendMessage, USER_TIMEZONE, GENTECH_GROUP_ID)
-    .catch(err => console.error("Scheduler init failed (will retry on next cycle):", err));
+  // Validate key first
+  const keyValid = await validateSupabaseKey();
+
+  if (keyValid) {
+    initScheduler(supabase, schedulerExecute, schedulerSendMessage, USER_TIMEZONE, GENTECH_GROUP_ID)
+      .catch(err => console.error("Scheduler init failed (will retry on next cycle):", err));
+  } else {
+    console.warn("Scheduler: Disabled due to invalid Supabase key. Fix key and restart bot.");
+  }
 }
 
 bot.start({

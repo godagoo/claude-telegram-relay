@@ -95,12 +95,24 @@ async function refreshJobs(): Promise<void> {
     .eq("enabled", true);
 
   if (error) {
-    console.error(`Scheduler: Failed to load jobs: ${error.message}`);
+    const msg = error.message || String(error);
+
+    // Diagnose common issues
+    if (msg.includes("Invalid API key") || msg.includes("401") || msg.includes("403")) {
+      console.error(`Scheduler: SUPABASE AUTH FAILED - ${msg}`);
+      console.error(`  Issue: SUPABASE_ANON_KEY is invalid, expired, or lacks RLS permissions`);
+      console.error(`  Fix: Update SUPABASE_ANON_KEY in .env and restart bot`);
+    } else {
+      console.error(`Scheduler: Failed to load jobs: ${msg}`);
+    }
+
     if (!_initialized && _initRetries < MAX_INIT_RETRIES) {
       _initRetries++;
       const delayMs = Math.min(1000 * Math.pow(2, _initRetries), 60_000);
       console.log(`Scheduler: Retrying in ${delayMs / 1000}s (attempt ${_initRetries}/${MAX_INIT_RETRIES})`);
       setTimeout(() => refreshJobs(), delayMs);
+    } else if (!_initialized) {
+      console.error(`Scheduler: Gave up after ${MAX_INIT_RETRIES} retries. Scheduler will not run.`);
     }
     return;
   }

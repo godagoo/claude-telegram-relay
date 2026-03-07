@@ -68,10 +68,26 @@ ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memory ENABLE ROW LEVEL SECURITY;
 ALTER TABLE logs ENABLE ROW LEVEL SECURITY;
 
--- Allow all for service role (your bot uses service key)
+-- Allow all for service role (backend)
 CREATE POLICY "Allow all for service role" ON messages FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON memory FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON logs FOR ALL USING (true);
+
+-- Allow anon key (bot) read/write access
+CREATE POLICY "Allow anon read" ON messages FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON messages FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON messages FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON messages FOR DELETE USING (true);
+
+CREATE POLICY "Allow anon read" ON memory FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON memory FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON memory FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON memory FOR DELETE USING (true);
+
+CREATE POLICY "Allow anon read" ON logs FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON logs FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON logs FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON logs FOR DELETE USING (true);
 
 -- ============================================================
 -- MULTI-USER: Add user_id to messages and memory
@@ -96,6 +112,10 @@ CREATE TABLE IF NOT EXISTS authorized_users (
 
 ALTER TABLE authorized_users ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow all for service role" ON authorized_users FOR ALL USING (true);
+CREATE POLICY "Allow anon read" ON authorized_users FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON authorized_users FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON authorized_users FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON authorized_users FOR DELETE USING (true);
 
 -- ============================================================
 -- CRON JOBS (managed from Telegram)
@@ -118,6 +138,10 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
 
 ALTER TABLE cron_jobs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow all for service role" ON cron_jobs FOR ALL USING (true);
+CREATE POLICY "Allow anon read" ON cron_jobs FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON cron_jobs FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON cron_jobs FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON cron_jobs FOR DELETE USING (true);
 
 -- Add target_type column if it doesn't exist (for group posting)
 ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS target_type TEXT DEFAULT 'user';
@@ -137,6 +161,10 @@ CREATE TABLE IF NOT EXISTS cron_executions (
 
 ALTER TABLE cron_executions ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow all for service role" ON cron_executions FOR ALL USING (true);
+CREATE POLICY "Allow anon read" ON cron_executions FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON cron_executions FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON cron_executions FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON cron_executions FOR DELETE USING (true);
 
 -- ============================================================
 -- ENV BACKUPS
@@ -150,6 +178,10 @@ CREATE TABLE IF NOT EXISTS env_backups (
 
 ALTER TABLE env_backups ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow all for service role" ON env_backups FOR ALL USING (true);
+CREATE POLICY "Allow anon read" ON env_backups FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON env_backups FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON env_backups FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON env_backups FOR DELETE USING (true);
 
 -- ============================================================
 -- GOOGLE OAUTH TOKENS
@@ -165,6 +197,10 @@ CREATE TABLE IF NOT EXISTS google_tokens (
 
 ALTER TABLE google_tokens ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow all for service role" ON google_tokens FOR ALL USING (true);
+CREATE POLICY "Allow anon read" ON google_tokens FOR SELECT USING (true);
+CREATE POLICY "Allow anon insert" ON google_tokens FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anon update" ON google_tokens FOR UPDATE USING (true);
+CREATE POLICY "Allow anon delete" ON google_tokens FOR DELETE USING (true);
 
 -- ============================================================
 -- HELPER FUNCTIONS
