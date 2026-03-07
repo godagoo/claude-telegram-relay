@@ -10,7 +10,7 @@
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { CronExpressionParser } from "cron-parser";
+import { parseExpression } from "cron-parser";
 import { spawn } from "bun";
 import { dirname } from "path";
 import { parseSchedule } from "./parse-schedule.ts";
@@ -278,8 +278,8 @@ function calculateNextRun(schedule: string, afterTime: string | null): string {
       currentDate: afterTime ? new Date(afterTime) : new Date(),
     };
     if (_timezone) options.tz = _timezone;
-    const expr = CronExpressionParser.parse(schedule, options);
-    return expr.next().toDate().toISOString();
+    const interval = parseExpression(schedule, options);
+    return interval.next().toISOString();
   } catch (err) {
     console.error(`Invalid cron expression "${schedule}":`, err);
     // Fallback: 1 hour from now
@@ -317,7 +317,7 @@ export async function addCronJob(
 
   // Validate the resulting cron expression
   try {
-    CronExpressionParser.parse(cronExpression, _timezone ? { tz: _timezone } : undefined);
+    parseExpression(cronExpression, _timezone ? { tz: _timezone } : undefined);
   } catch {
     return `Invalid schedule: "${schedule}" (parsed as "${cronExpression}")`;
   }
