@@ -69,6 +69,12 @@ ALTER TABLE memory ENABLE ROW LEVEL SECURITY;
 ALTER TABLE logs ENABLE ROW LEVEL SECURITY;
 
 -- Allow all for service role (your bot uses service key)
+-- Drop existing policies first (idempotent)
+DROP POLICY IF EXISTS "Allow all for service role" ON messages;
+DROP POLICY IF EXISTS "Allow all for service role" ON memory;
+DROP POLICY IF EXISTS "Allow all for service role" ON logs;
+
+-- Create fresh policies
 CREATE POLICY "Allow all for service role" ON messages FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON memory FOR ALL USING (true);
 CREATE POLICY "Allow all for service role" ON logs FOR ALL USING (true);
