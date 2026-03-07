@@ -110,6 +110,9 @@ async function getYouTubeTranscript(input: Record<string, unknown>): Promise<str
     let captionTracks: Array<{ baseUrl: string; languageCode: string; name: { simpleText: string } }>;
     try {
       captionTracks = JSON.parse(captionMatch[1]);
+      if (!Array.isArray(captionTracks)) {
+        return "Could not parse caption data from YouTube.";
+      }
     } catch {
       return "Could not parse caption data from YouTube.";
     }

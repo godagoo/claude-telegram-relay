@@ -248,10 +248,12 @@ async function main() {
 
   // Current time in user's timezone
   const now = new Date();
-  const hour = parseInt(
-    new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", hour12: false }).format(now),
-    10
-  );
+  const hourStr = new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", hour12: false }).format(now);
+  const hour = parseInt(hourStr, 10);
+  if (isNaN(hour)) {
+    process.stderr.write(`Failed to parse hour from timezone "${TZ}": "${hourStr}"\n`);
+    process.exit(1);
+  }
   const dateStr = new Intl.DateTimeFormat("en-US", {
     timeZone: TZ,
     weekday: "short", month: "short", day: "numeric",

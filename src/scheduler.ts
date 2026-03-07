@@ -125,6 +125,16 @@ async function refreshJobs(): Promise<void> {
   for (const job of jobs) {
     if (!job.next_run) {
       job.next_run = calculateNextRun(job.schedule, job.last_run);
+      if (!job.next_run) {
+        // Invalid schedule — disable job to prevent infinite reschedule loop
+        console.error(`Scheduler: Disabling job "${job.name}" — invalid schedule "${job.schedule}"`);
+        job.enabled = false;
+        await _supabase
+          .from("cron_jobs")
+          .update({ enabled: false, last_result: `Disabled: invalid schedule "${job.schedule}"` })
+          .eq("id", job.id);
+        continue;
+      }
       await _supabase
         .from("cron_jobs")
         .update({ next_run: job.next_run })
@@ -293,9 +303,11 @@ function calculateNextRun(schedule: string, afterTime: string | null): string {
     const interval = parseExpression(schedule, options);
     return interval.next().toISOString();
   } catch (err) {
-    console.error(`Invalid cron expression "${schedule}":`, err);
-    // Fallback: 1 hour from now
-    return new Date(Date.now() + 3_600_000).toISOString();
+    console.error(`Invalid cron expression "${schedule}": ${err}`);
+    console.error(`  This job has a malformed schedule and will not run correctly.`);
+    console.error(`  Fix it with: /cron delete <name> then /cron add <name> "<valid schedule>" "<action>"`);
+    // Return empty string to signal invalid schedule — caller should disable job
+    return "";
   }
 }
 
