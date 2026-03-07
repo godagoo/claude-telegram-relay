@@ -12,14 +12,28 @@
  */
 
 import { spawn } from "bun";
-import { readFile, writeFile } from "fs/promises";
-import { join } from "path";
+import { readFile, writeFile, mkdir } from "fs/promises";
+import { existsSync } from "fs";
+import { join, dirname } from "path";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
+const PROJECT_ROOT = dirname(import.meta.dir);
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
+
+const DATA_DIR = join(PROJECT_ROOT, "data");
 const STATE_FILE =
-  process.env.CHECKIN_STATE_FILE || "/tmp/checkin-state.json";
+  process.env.CHECKIN_STATE_FILE || join(DATA_DIR, "checkin-state.json");
+
+// ============================================================
+// SUPABASE (optional — only if configured)
+// ============================================================
+
+const supabase: SupabaseClient | null =
+  process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+    : null;
 
 // ============================================================
 // STATE MANAGEMENT
@@ -45,6 +59,7 @@ async function loadState(): Promise<CheckinState> {
 }
 
 async function saveState(state: CheckinState): Promise<void> {
+  if (!existsSync(DATA_DIR)) await mkdir(DATA_DIR, { recursive: true });
   await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
@@ -53,14 +68,39 @@ async function saveState(state: CheckinState): Promise<void> {
 // ============================================================
 
 async function getGoals(): Promise<string[]> {
-  // Load from your persistence layer
-  // Example: Supabase, JSON file, etc.
-  return ["Finish video edit by 5pm", "Review PR"];
+  if (supabase) {
+    try {
+      const { data } = await supabase.rpc("get_active_goals");
+      if (data?.length) {
+        return data.map((g: any) => {
+          const deadline = g.deadline
+            ? ` (by ${new Date(g.deadline).toLocaleDateString()})`
+            : "";
+          return `${g.content}${deadline}`;
+        });
+      }
+    } catch (e) {
+      console.error("Supabase goals fetch failed:", e);
+    }
+  }
+  return [];
 }
 
 async function getCalendarContext(): Promise<string> {
-  // What's coming up today?
-  return "Next event: Team call in 2 hours";
+  if (supabase) {
+    try {
+      const { data } = await supabase.rpc("get_facts");
+      if (data?.length) {
+        return data
+          .slice(0, 3)
+          .map((f: any) => f.content)
+          .join("; ");
+      }
+    } catch (e) {
+      console.error("Supabase facts fetch failed:", e);
+    }
+  }
+  return "No recent context";
 }
 
 async function getLastActivity(): Promise<string> {
@@ -173,6 +213,7 @@ async function main() {
 
   if (!BOT_TOKEN || !CHAT_ID) {
     console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID");
+    console.error(`Expected .env at: ${join(PROJECT_ROOT, ".env")}`);
     process.exit(1);
   }
 

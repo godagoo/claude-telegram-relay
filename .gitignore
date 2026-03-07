@@ -16,6 +16,7 @@ config/schedule.json
 *.lock
 *.log
 logs/
+data/
 temp/
 uploads/
 session.json

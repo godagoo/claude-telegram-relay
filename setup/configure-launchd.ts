@@ -50,8 +50,9 @@ function generatePlist(opts: {
   script: string;
   keepAlive: boolean;
   calendarIntervals?: { Hour: number; Minute: number }[];
+  bunPath: string;
 }): string {
-  const bunPath = findBunSync;
+  const bunPath = opts.bunPath;
 
   let scheduling = "";
   if (opts.calendarIntervals) {
@@ -154,11 +155,11 @@ const SERVICES: Record<string, ServiceConfig> = {
   },
 };
 
-async function installService(name: string, config: ServiceConfig): Promise<boolean> {
+async function installService(name: string, config: ServiceConfig, bunPath: string): Promise<boolean> {
   const plistPath = join(LAUNCH_AGENTS, `${config.label}.plist`);
 
   // Generate plist
-  const content = generatePlist(config);
+  const content = generatePlist({ ...config, bunPath });
   await writeFile(plistPath, content);
   console.log(`  ${PASS} Generated ${config.label}.plist`);
 
@@ -201,9 +202,10 @@ async function main() {
   const serviceArg = serviceIdx !== -1 ? args[serviceIdx + 1] : "relay";
 
   const toInstall = serviceArg === "all" ? Object.keys(SERVICES) : [serviceArg];
+  const shouldUnload = args.includes("--unload");
 
   console.log("");
-  console.log(bold("  Configure launchd Services"));
+  console.log(bold(shouldUnload ? "  Remove launchd Services" : "  Configure launchd Services"));
   console.log(dim(`  Bun: ${findBunSync}`));
   console.log(dim(`  Project: ${PROJECT_ROOT}`));
   console.log("");
@@ -223,17 +225,30 @@ async function main() {
       allOk = false;
       continue;
     }
-    const ok = await installService(name, config);
-    if (!ok) allOk = false;
+    if (shouldUnload) {
+      const plistPath = join(LAUNCH_AGENTS, `${config.label}.plist`);
+      const unload = Bun.spawn(["launchctl", "unload", plistPath], { stdout: "pipe", stderr: "pipe" });
+      await unload.exited;
+      if (existsSync(plistPath)) {
+        const { unlinkSync } = await import("fs");
+        unlinkSync(plistPath);
+      }
+      console.log(`  ${PASS} Removed ${config.label}`);
+    } else {
+      const ok = await installService(name, config, findBunSync);
+      if (!ok) allOk = false;
+    }
   }
 
   console.log("");
-  if (allOk) {
+  if (!shouldUnload && allOk) {
     console.log(`  ${green("Done!")} Services are running.`);
     console.log("");
     console.log(`  ${dim("Check status:")}  launchctl list | grep com.claude`);
     console.log(`  ${dim("View logs:")}     tail -f ${LOGS_DIR}/com.claude.telegram-relay.log`);
     console.log(`  ${dim("Stop all:")}      bun run setup/configure-launchd.ts --unload`);
+  } else if (shouldUnload) {
+    console.log(`  ${green("Done!")} Services removed.`);
   }
   console.log("");
 }

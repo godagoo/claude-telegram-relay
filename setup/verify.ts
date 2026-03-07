@@ -108,13 +108,39 @@ async function main() {
     }
   }
 
-  // 4. Services (macOS only)
+  // 4. Services
   if (process.platform === "darwin") {
     console.log(`\n${bold("  Services (launchd)")}`);
     for (const label of ["com.claude.telegram-relay", "com.claude.smart-checkin", "com.claude.morning-briefing"]) {
       const proc = Bun.spawn(["launchctl", "list", label], { stdout: "pipe", stderr: "pipe" });
       const code = await proc.exited;
       code === 0 ? pass(`${label} loaded`) : warn(`${label} not loaded`);
+    }
+  } else {
+    console.log(`\n${bold("  Services (PM2 + Cron)")}`);
+
+    // Check PM2 for relay
+    try {
+      const pm2Proc = Bun.spawn(["npx", "pm2", "jlist"], { stdout: "pipe", stderr: "pipe" });
+      const pm2Out = await new Response(pm2Proc.stdout).text();
+      pm2Out.includes("claude-telegram-relay")
+        ? pass("claude-telegram-relay running (PM2)")
+        : warn("claude-telegram-relay not in PM2 — run: bun run setup:services");
+    } catch {
+      warn("PM2 not available");
+    }
+
+    // Check crontab for scheduled services
+    try {
+      const cronProc = Bun.spawn(["crontab", "-l"], { stdout: "pipe", stderr: "pipe" });
+      const crontab = await new Response(cronProc.stdout).text();
+      for (const name of ["claude-smart-checkin", "claude-morning-briefing"]) {
+        crontab.includes(`claude-telegram-relay: ${name}`)
+          ? pass(`${name} scheduled (cron)`)
+          : warn(`${name} not in crontab — run: bun run setup:cron`);
+      }
+    } catch {
+      warn("Could not read crontab");
     }
   }
 

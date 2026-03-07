@@ -1,9 +1,9 @@
 /**
  * Claude Telegram Relay — Configure Services (Windows/Linux)
  *
- * Sets up PM2 for process management on non-macOS systems.
+ * Sets up PM2 for always-on services and crontab for scheduled tasks.
  *
- * Usage: bun run setup/configure-services.ts [--service relay|checkin|briefing|all]
+ * Usage: bun run setup/configure-services.ts [--service relay|checkin|briefing|all] [--unload]
  */
 
 import { existsSync, mkdirSync } from "fs";
@@ -11,6 +11,7 @@ import { join, dirname } from "path";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 const LOGS_DIR = join(PROJECT_ROOT, "logs");
+const CRON_MARKER = "claude-telegram-relay";
 
 // Colors
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
@@ -32,6 +33,77 @@ async function run(cmd: string[]): Promise<{ ok: boolean; stdout: string; stderr
     return { ok: false, stdout: "", stderr: "Command not found" };
   }
 }
+
+// ============================================================
+// CRONTAB HELPERS
+// ============================================================
+
+async function readCrontab(): Promise<string> {
+  const result = await run(["crontab", "-l"]);
+  if (result.ok) return result.stdout;
+  // "no crontab for user" is normal
+  return "";
+}
+
+async function writeCrontab(content: string): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(["crontab", "-"], {
+      cwd: PROJECT_ROOT,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    proc.stdin.write(content);
+    proc.stdin.end();
+    const code = await proc.exited;
+    return code === 0;
+  } catch {
+    return false;
+  }
+}
+
+function removeCronBlock(crontab: string, serviceName: string): string {
+  const beginMarker = `# BEGIN ${CRON_MARKER}: ${serviceName}`;
+  const endMarker = `# END ${CRON_MARKER}: ${serviceName}`;
+  const lines = crontab.split("\n");
+  const result: string[] = [];
+  let inside = false;
+
+  for (const line of lines) {
+    if (line.trim() === beginMarker) {
+      inside = true;
+      continue;
+    }
+    if (line.trim() === endMarker) {
+      inside = false;
+      continue;
+    }
+    if (!inside) result.push(line);
+  }
+
+  return result.join("\n");
+}
+
+function addCronBlock(crontab: string, serviceName: string, cronLine: string): string {
+  // Remove existing block first (idempotent)
+  let cleaned = removeCronBlock(crontab, serviceName);
+
+  // Remove trailing empty lines then add one
+  cleaned = cleaned.replace(/\n+$/, "");
+  if (cleaned) cleaned += "\n";
+
+  const block = [
+    `# BEGIN ${CRON_MARKER}: ${serviceName}`,
+    cronLine,
+    `# END ${CRON_MARKER}: ${serviceName}`,
+  ].join("\n");
+
+  return cleaned + block + "\n";
+}
+
+// ============================================================
+// SERVICE DEFINITIONS
+// ============================================================
 
 interface ServiceDef {
   name: string;
@@ -60,6 +132,10 @@ const SERVICES: Record<string, ServiceDef> = {
   },
 };
 
+// ============================================================
+// INSTALL / UNLOAD
+// ============================================================
+
 async function checkPm2(): Promise<boolean> {
   const result = await run(["npx", "pm2", "--version"]);
   if (result.ok) {
@@ -71,12 +147,35 @@ async function checkPm2(): Promise<boolean> {
   return false;
 }
 
+async function findBun(): Promise<string> {
+  const candidates = [
+    join(process.env.HOME || "", ".bun", "bin", "bun"),
+    "/usr/local/bin/bun",
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  const result = await run(["which", "bun"]);
+  return result.ok ? result.stdout : "bun";
+}
+
 async function installService(config: ServiceDef): Promise<boolean> {
   if (config.cron) {
-    // Scheduled service — show cron instructions
-    console.log(`  ${PASS} ${config.name}: add to crontab manually`);
-    console.log(`      ${dim(`${config.cron} cd ${PROJECT_ROOT} && bun run ${config.script}`)}`);
-    return true;
+    // Scheduled service — write to crontab automatically
+    const bunPath = await findBun();
+    const cronCmd = `${config.cron} cd ${PROJECT_ROOT} && ${bunPath} run ${config.script} >> ${LOGS_DIR}/${config.name}.log 2>&1`;
+
+    const existing = await readCrontab();
+    const updated = addCronBlock(existing, config.name, cronCmd);
+    const ok = await writeCrontab(updated);
+
+    if (ok) {
+      console.log(`  ${PASS} ${config.name} — ${config.description}`);
+      console.log(`      ${dim(config.cron)}`);
+      return true;
+    }
+    console.log(`  ${FAIL} Failed to write crontab for ${config.name}`);
+    return false;
   }
 
   // Always-on service — use PM2
@@ -100,6 +199,32 @@ async function installService(config: ServiceDef): Promise<boolean> {
   return false;
 }
 
+async function unloadService(config: ServiceDef): Promise<boolean> {
+  if (config.cron) {
+    const existing = await readCrontab();
+    const updated = removeCronBlock(existing, config.name);
+    const ok = await writeCrontab(updated);
+    if (ok) {
+      console.log(`  ${PASS} Removed ${config.name} from crontab`);
+      return true;
+    }
+    console.log(`  ${FAIL} Failed to update crontab`);
+    return false;
+  }
+
+  const result = await run(["npx", "pm2", "delete", config.name]);
+  if (result.ok) {
+    console.log(`  ${PASS} Stopped ${config.name} (PM2)`);
+    return true;
+  }
+  console.log(`  ${FAIL} Failed to stop ${config.name}: ${result.stderr}`);
+  return false;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
 async function main() {
   if (process.platform === "darwin") {
     console.log(`\n  You're on macOS. Use launchd instead:`);
@@ -107,18 +232,21 @@ async function main() {
     process.exit(0);
   }
 
-  // Parse --service flag
+  // Parse flags
   const args = process.argv.slice(2);
   const serviceIdx = args.indexOf("--service");
   const serviceArg = serviceIdx !== -1 ? args[serviceIdx + 1] : "relay";
   const toInstall = serviceArg === "all" ? Object.keys(SERVICES) : [serviceArg];
+  const shouldUnload = args.includes("--unload");
 
   console.log("");
-  console.log(bold("  Configure Services (PM2)"));
+  console.log(bold(shouldUnload ? "  Remove Services" : "  Configure Services (PM2 + Cron)"));
   console.log("");
 
-  const pm2Ok = await checkPm2();
-  if (!pm2Ok) process.exit(1);
+  if (!shouldUnload) {
+    const pm2Ok = await checkPm2();
+    if (!pm2Ok) process.exit(1);
+  }
 
   if (!existsSync(LOGS_DIR)) mkdirSync(LOGS_DIR, { recursive: true });
 
@@ -127,17 +255,25 @@ async function main() {
     const config = SERVICES[name];
     if (!config) {
       console.log(`  ${FAIL} Unknown service: ${name}`);
+      console.log(`      ${dim("Available: relay, checkin, briefing, all")}`);
       continue;
     }
-    await installService(config);
+    if (shouldUnload) {
+      await unloadService(config);
+    } else {
+      await installService(config);
+    }
   }
 
-  // Save PM2 config for auto-restart on reboot
-  await run(["npx", "pm2", "save"]);
-  console.log("");
-  console.log(`  ${dim("Auto-start on boot:")} npx pm2 startup`);
-  console.log(`  ${dim("Check status:")}        npx pm2 status`);
-  console.log(`  ${dim("View logs:")}           npx pm2 logs`);
+  if (!shouldUnload) {
+    // Save PM2 config for auto-restart on reboot
+    await run(["npx", "pm2", "save"]);
+    console.log("");
+    console.log(`  ${dim("Auto-start on boot:")} npx pm2 startup`);
+    console.log(`  ${dim("Check status:")}        npx pm2 status`);
+    console.log(`  ${dim("View cron:")}           crontab -l`);
+    console.log(`  ${dim("View logs:")}           npx pm2 logs`);
+  }
   console.log("");
 }
 

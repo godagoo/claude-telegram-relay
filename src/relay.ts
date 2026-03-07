@@ -68,19 +68,34 @@ let session = await loadSession();
 
 const LOCK_FILE = join(RELAY_DIR, "bot.lock");
 
+async function isRelayProcess(pid: number): Promise<boolean> {
+  try {
+    // Check if PID is alive
+    process.kill(pid, 0);
+    // On Linux, verify it's actually a relay process
+    if (process.platform === "linux") {
+      const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf-8").catch(() => "");
+      return cmdline.includes("relay");
+    }
+    return true; // On other platforms, trust the PID check
+  } catch {
+    return false; // Process doesn't exist
+  }
+}
+
 async function acquireLock(): Promise<boolean> {
   try {
     const existingLock = await readFile(LOCK_FILE, "utf-8").catch(() => null);
 
     if (existingLock) {
       const pid = parseInt(existingLock);
-      try {
-        process.kill(pid, 0); // Check if process exists
-        console.log(`Another instance running (PID: ${pid})`);
+      if (await isRelayProcess(pid)) {
+        console.error(`Another relay instance is running (PID: ${pid})`);
+        console.error(`Kill it with: kill ${pid}`);
+        console.error(`Or remove stale lock: rm ${LOCK_FILE}`);
         return false;
-      } catch {
-        console.log("Stale lock found, taking over...");
       }
+      console.log("Stale lock found, taking over...");
     }
 
     await writeFile(LOCK_FILE, process.pid.toString());

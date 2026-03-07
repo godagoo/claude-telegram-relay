@@ -12,8 +12,21 @@
  * Run manually: bun run examples/morning-briefing.ts
  */
 
+import { dirname, join } from "path";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+
+const PROJECT_ROOT = dirname(import.meta.dir);
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_USER_ID || "";
+
+// ============================================================
+// SUPABASE (optional — only if configured)
+// ============================================================
+
+const supabase: SupabaseClient | null =
+  process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+    : null;
 
 // ============================================================
 // TELEGRAM HELPER
@@ -46,41 +59,46 @@ async function sendTelegram(message: string): Promise<boolean> {
 // ============================================================
 
 async function getUnreadEmails(): Promise<string> {
-  // Example: Use Gmail API, IMAP, or MCP tool
+  // Customize: Use Gmail API, IMAP, or MCP tool
   // Return a summary of unread emails
-
-  // Placeholder - replace with your implementation
-  return "- 3 unread emails (1 urgent from client)";
+  return "";
 }
 
 async function getCalendarEvents(): Promise<string> {
-  // Example: Use Google Calendar API or MCP tool
+  // Customize: Use Google Calendar API or MCP tool
   // Return today's events
-
-  // Placeholder
-  return "- 10:00 Team standup\n- 14:00 Client call";
+  return "";
 }
 
 async function getActiveGoals(): Promise<string> {
-  // Load from your persistence layer (Supabase, JSON file, etc.)
-
-  // Placeholder
-  return "- Finish video edit\n- Review PR";
+  if (supabase) {
+    try {
+      const { data } = await supabase.rpc("get_active_goals");
+      if (data?.length) {
+        return data
+          .map((g: any) => {
+            const deadline = g.deadline
+              ? ` (by ${new Date(g.deadline).toLocaleDateString()})`
+              : "";
+            return `- ${g.content}${deadline}`;
+          })
+          .join("\n");
+      }
+    } catch (e) {
+      console.error("Supabase goals fetch failed:", e);
+    }
+  }
+  return "";
 }
 
 async function getWeather(): Promise<string> {
-  // Optional: Weather API
-
-  // Placeholder
-  return "Sunny, 22°C";
+  // Customize: Weather API
+  return "";
 }
 
 async function getAINews(): Promise<string> {
-  // Optional: Pull from X/Twitter, RSS, or news API
-  // Use Grok, Perplexity, or web search
-
-  // Placeholder
-  return "- OpenAI released GPT-5\n- Anthropic launches new feature";
+  // Customize: Pull from X/Twitter, RSS, or news API
+  return "";
 }
 
 // ============================================================
@@ -103,7 +121,9 @@ async function buildBriefing(): Promise<string> {
   // Weather (optional)
   try {
     const weather = await getWeather();
-    sections.push(`☀️ **Weather**\n${weather}\n`);
+    if (weather) {
+      sections.push(`☀️ **Weather**\n${weather}\n`);
+    }
   } catch (e) {
     console.error("Weather fetch failed:", e);
   }
@@ -163,6 +183,7 @@ async function main() {
 
   if (!BOT_TOKEN || !CHAT_ID) {
     console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID");
+    console.error(`Expected .env at: ${join(PROJECT_ROOT, ".env")}`);
     process.exit(1);
   }
 
