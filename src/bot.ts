@@ -189,7 +189,7 @@ bot.command("help", async (ctx) => {
   await ctx.reply(
     "Commands:\n\n" +
     "/help — This message\n" +
-    "/cron add \"name\" \"schedule\" \"action\" — Schedule a recurring task\n" +
+    "/cron add \"name\" \"schedule\" \"action\" — Schedule a task (supports natural language)\n" +
     "/cron list — List scheduled jobs\n" +
     "/cron delete <name> — Delete a job\n" +
     "/cron pause <name> — Pause a job\n" +
@@ -224,16 +224,20 @@ bot.command("cron", async (ctx) => {
     await ctx.reply(
       "Cron commands:\n\n" +
       '/cron add "name" "schedule" "action"\n' +
-      "  Example: /cron add \"morning\" \"0 9 * * *\" \"Give me a morning briefing\"\n\n" +
+      "  Example: /cron add \"morning\" \"daily at 9am\" \"Give me a morning briefing\"\n\n" +
       "/cron list — Show all jobs\n" +
       "/cron delete <name> — Remove a job\n" +
       "/cron pause <name> — Pause a job\n" +
       "/cron resume <name> — Resume a paused job\n" +
       "/cron history <name> — Last 10 executions\n\n" +
-      "Schedule format (cron): minute hour day month weekday\n" +
-      "  0 9 * * * = daily at 9 AM\n" +
-      "  */30 * * * * = every 30 minutes\n" +
-      "  0 9 * * 1-5 = weekdays at 9 AM"
+      "Schedule formats:\n" +
+      "  Human-friendly:\n" +
+      "    \"every 30 minutes\" | \"hourly\" | \"daily at 9am\"\n" +
+      "    \"weekdays at 9:30am\" | \"weekends at 10am\"\n" +
+      "    \"weekly on monday at 10am\"\n" +
+      "  Raw cron: minute hour day month weekday\n" +
+      "    0 9 * * * = daily at 9 AM\n" +
+      "    */30 * * * * = every 30 minutes"
     );
     return;
   }
@@ -243,7 +247,7 @@ bot.command("cron", async (ctx) => {
     // Parse: add "name" "schedule" "action"
     const match = args.match(/^add\s+"([^"]+)"\s+"([^"]+)"\s+"([^"]+)"$/);
     if (!match) {
-      await ctx.reply('Usage: /cron add "name" "schedule" "action"\nExample: /cron add "daily-check" "0 9 * * *" "Check my calendar and emails"');
+      await ctx.reply('Usage: /cron add "name" "schedule" "action"\nExample: /cron add "daily-check" "daily at 9am" "Check my calendar and emails"');
       return;
     }
     const result = await addCronJob(supabase, userId, match[1], match[2], match[3]);
@@ -623,9 +627,10 @@ console.log(`Supabase: ${supabase ? "connected" : "not configured"}`);
 console.log(`Voice: ${process.env.VOICE_PROVIDER || "not configured"}`);
 console.log(`Brave Search: ${process.env.BRAVE_API_KEY ? "configured" : "not configured"}`);
 
-// Initialize scheduler if Supabase is available
+// Initialize scheduler if Supabase is available (non-blocking — bot starts even if scheduler fails)
 if (supabase) {
-  await initScheduler(supabase, schedulerExecute, schedulerSendMessage, USER_TIMEZONE, GENTECH_GROUP_ID);
+  initScheduler(supabase, schedulerExecute, schedulerSendMessage, USER_TIMEZONE, GENTECH_GROUP_ID)
+    .catch(err => console.error("Scheduler init failed (will retry on next cycle):", err));
 }
 
 bot.start({

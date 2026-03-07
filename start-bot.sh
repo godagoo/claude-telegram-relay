@@ -7,9 +7,11 @@ BUN_PATH="$(which bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
 
 cd "$SCRIPT_DIR"
 
-# Load .env safely — handles unquoted JWTs and special characters
-while IFS='=' read -r key value; do
-  [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+# Load .env safely — splits only on the first '=' to preserve JWTs with base64 padding
+while IFS= read -r line; do
+  [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+  key="${line%%=*}"
+  value="${line#*=}"
   export "$key=$value"
 done < .env
 

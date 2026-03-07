@@ -13,16 +13,23 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { parseExpression } from "cron-parser";
 import { spawn } from "bun";
 import { dirname } from "path";
+import { parseSchedule } from "./parse-schedule.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const CHECK_INTERVAL_MS = 30_000; // Check every 30 seconds
+const REFRESH_EVERY_N_CHECKS = 10; // Refresh jobs from DB every 10 cycles (~5 min)
+const MAX_INIT_RETRIES = 5;
+
 let checkTimer: ReturnType<typeof setInterval> | null = null;
 let _supabase: SupabaseClient | null = null;
 let _onExecute: ((userId: string, action: string) => Promise<string>) | null = null;
 let _sendMessage: ((userId: string, text: string) => Promise<void>) | null = null;
 let _timezone: string = "";
 let _groupId: string = "";
+let _initialized = false;
+let _initRetries = 0;
+let _checkCount = 0;
 
 interface CronJob {
   id: string;
@@ -88,10 +95,18 @@ async function refreshJobs(): Promise<void> {
     .eq("enabled", true);
 
   if (error) {
-    console.error("Scheduler: Failed to load jobs:", error);
+    console.error(`Scheduler: Failed to load jobs: ${error.message}`);
+    if (!_initialized && _initRetries < MAX_INIT_RETRIES) {
+      _initRetries++;
+      const delayMs = Math.min(1000 * Math.pow(2, _initRetries), 60_000);
+      console.log(`Scheduler: Retrying in ${delayMs / 1000}s (attempt ${_initRetries}/${MAX_INIT_RETRIES})`);
+      setTimeout(() => refreshJobs(), delayMs);
+    }
     return;
   }
 
+  _initialized = true;
+  _initRetries = 0;
   jobs = data || [];
 
   // Calculate next_run for any jobs that don't have it
@@ -112,6 +127,12 @@ async function refreshJobs(): Promise<void> {
 async function checkAndExecuteJobs(): Promise<void> {
   if (!_supabase || !_onExecute || !_sendMessage) return;
 
+  // Periodically refresh jobs from DB to pick up changes and recover from failures
+  _checkCount++;
+  if (_checkCount % REFRESH_EVERY_N_CHECKS === 0) {
+    await refreshJobs();
+  }
+
   const now = new Date();
 
   for (const job of jobs) {
@@ -120,8 +141,11 @@ async function checkAndExecuteJobs(): Promise<void> {
     const nextRun = new Date(job.next_run);
     if (nextRun > now) continue;
 
-    // Time to execute this job
-    await executeJob(job);
+    try {
+      await executeJob(job);
+    } catch (err) {
+      console.error(`Scheduler: Unexpected error executing job "${job.name}":`, err);
+    }
   }
 }
 
@@ -274,20 +298,37 @@ export async function addCronJob(
   schedule: string,
   action: string
 ): Promise<string> {
-  // Validate cron expression
+  // Parse human-friendly schedule into cron expression
+  let cronExpression: string;
   try {
-    parseExpression(schedule, _timezone ? { tz: _timezone } : undefined);
+    cronExpression = parseSchedule(schedule);
   } catch {
-    return `Invalid cron schedule: "${schedule}"\n\nExamples:\n  "0 9 * * *" = every day at 9 AM\n  "*/30 * * * *" = every 30 minutes\n  "0 9 * * 1-5" = weekdays at 9 AM`;
+    return (
+      `Could not understand schedule: "${schedule}"\n\n` +
+      "Examples:\n" +
+      '  "every 30 minutes"\n' +
+      '  "daily at 9am"\n' +
+      '  "weekdays at 9:30am"\n' +
+      '  "weekly on monday at 10am"\n' +
+      '  "hourly"\n' +
+      '  "0 9 * * *" (raw cron)'
+    );
   }
 
-  const nextRun = calculateNextRun(schedule, null);
+  // Validate the resulting cron expression
+  try {
+    parseExpression(cronExpression, _timezone ? { tz: _timezone } : undefined);
+  } catch {
+    return `Invalid schedule: "${schedule}" (parsed as "${cronExpression}")`;
+  }
+
+  const nextRun = calculateNextRun(cronExpression, null);
 
   const { error } = await supabase.from("cron_jobs").upsert(
     {
       user_id: userId,
       name,
-      schedule,
+      schedule: cronExpression,
       action,
       enabled: true,
       next_run: nextRun,
@@ -304,7 +345,12 @@ export async function addCronJob(
   // Refresh in-memory cache
   await refreshJobs();
 
-  return `Job "${name}" created.\nSchedule: ${schedule}\nAction: ${action}\nNext run: ${new Date(nextRun).toLocaleString()}`;
+  // Show both human input and cron expression if they differ
+  const scheduleInfo = cronExpression !== schedule
+    ? `Schedule: ${schedule} (${cronExpression})`
+    : `Schedule: ${cronExpression}`;
+
+  return `Job "${name}" created.\n${scheduleInfo}\nAction: ${action}\nNext run: ${new Date(nextRun).toLocaleString()}`;
 }
 
 export async function listCronJobs(

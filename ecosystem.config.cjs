@@ -10,7 +10,8 @@ module.exports = {
   apps: [
     {
       name: "claude-telegram-relay",
-      script: "./start-bot.sh",
+      script: "src/bot.ts",
+      interpreter: "bun",
       cwd: __dirname,
       out_file: "./logs/claude-telegram-relay.log",
       error_file: "./logs/claude-telegram-relay.error.log",
