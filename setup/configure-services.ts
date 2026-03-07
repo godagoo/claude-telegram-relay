@@ -182,9 +182,11 @@ async function installService(config: ServiceDef): Promise<boolean> {
   // Stop existing first
   await run(["npx", "pm2", "delete", config.name]);
 
+  // Use "bun run <script>" as a shell command instead of --interpreter bun,
+  // because PM2's bun fork container doesn't support async modules.
+  const bunPath = await findBun();
   const result = await run([
-    "npx", "pm2", "start", config.script,
-    "--interpreter", "bun",
+    "npx", "pm2", "start", `${bunPath} run ${config.script}`,
     "--name", config.name,
     "--cwd", PROJECT_ROOT,
     "-o", join(LOGS_DIR, `${config.name}.log`),
