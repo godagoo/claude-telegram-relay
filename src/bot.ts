@@ -18,6 +18,7 @@ import { isAuthorized, isOwner, addUser, removeUser, listUsers, checkRateLimit }
 import { backupEnv, restoreEnv, listBackups, autoRestore, persistEnv } from "./env-guard.ts";
 import { initScheduler, stopScheduler, addCronJob, listCronJobs, deleteCronJob, toggleCronJob, getCronHistory } from "./scheduler.ts";
 import { describeTelegramVideo } from "./skills/video.ts";
+import { handleIntent } from "./intent-handler.ts";
 import { sendResponse, sendToChat, log } from "./utils.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -198,6 +199,9 @@ bot.command("help", async (ctx) => {
     "/memory — View stored facts & goals\n" +
     "/clear — Clear conversation history" +
     ownerCmds +
+    "\n\nNatural Language:\n" +
+    "- \"Track my agenda: 4pm gym, 6pm shopping\" — saves & sets reminders\n" +
+    "- \"Remind me at 3pm to call mom\" — sets a one-time reminder\n" +
     "\n\nSkills (auto-detected):\n" +
     "- Web search (ask me to search/look up anything)\n" +
     "- Crypto prices & DeFi data (ask about any token)\n" +
@@ -379,6 +383,18 @@ bot.on("message:text", async (ctx) => {
   await ctx.replyWithChatAction("typing");
 
   await hydrateHistory(supabase, userId);
+
+  // Try intent handler first (agenda tracking, reminders) — no AI call needed
+  if (supabase) {
+    const intentResult = await handleIntent(text, supabase, userId, USER_TIMEZONE, addCronJob);
+    if (intentResult.handled) {
+      await saveMessage(supabase, "user", text, userId);
+      await saveMessage(supabase, "assistant", intentResult.response!, userId);
+      await sendResponse(ctx, intentResult.response!);
+      return;
+    }
+  }
+
   await saveMessage(supabase, "user", text, userId);
 
   const [relevantContext, memoryContext] = await Promise.all([
