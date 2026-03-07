@@ -17,7 +17,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@supabase/supabase-js": "^2.45.0",
-    "cron-parser": "^4.9.0",
+    "cron-parser": "4.9.0",
     "grammy": "^1.21.1",
     "groq-sdk": "^0.8.0"
   },
