@@ -15,6 +15,10 @@ const should_fire = [
   "It should be with miller",
   "Yes, it’s an anesthesia textbook",
   "Anesthesia textbook",
+  "Keep searching",
+  "Keep looking",
+  "Keep going",
+  "Keep trying",
 ];
 
 const should_not_fire = [
@@ -23,6 +27,7 @@ const should_not_fire = [
   "set a timer for 10 minutes",
   "what's the weather like",
   "translate this to french",
+  "I keep my notes in obsidian",
 ];
 
 test("triggers on referential messages", () => {

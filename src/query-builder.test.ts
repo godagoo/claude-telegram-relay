@@ -31,6 +31,12 @@ test("uses recent user turns when current retrieval command is too thin", () => 
   );
 });
 
+test("recovers anchor from recent turns for bare continuation commands", () => {
+  expect(buildSearchQuery("Keep searching", recentTextbookTurns)).toBe(
+    '"miller" "textbooks"',
+  );
+});
+
 test("keeps strong textbook anchors from current message", () => {
   expect(buildSearchQuery("Anesthesia textbook", recentTextbookTurns)).toBe(
     '"anesthesia" "textbook"',

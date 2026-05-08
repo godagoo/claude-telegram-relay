@@ -21,7 +21,7 @@ const PATTERNS: RegExp[] = [
   /\b[A-Z][a-z]+(['']s)? (PEI|plan|email|note|case|appointment|message|reply)\b/,
 
   // Continuation cues
-  /\b(continue|finish|update|status of|progress on|where (are|did) we|pick up|follow up|resume)\b/i,
+  /\b(continue|finish|update|status of|progress on|where (are|did) we|pick up|follow up|resume|keep (going|searching|looking|trying))\b/i,
 
   // Question forms about past state
   /\bwhat (did|was|were) (we|you|i)\b/i,
