@@ -48,3 +48,62 @@ test("does not intercept extracted textbook content", () => {
 
   expect(response).toBeNull();
 });
+
+const skippedBarashHit = hit(
+  `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/Miller_Barash/Barash 9.pdf`,
+  "Indexed file path match. extraction_status=skipped; chunk_count=0",
+);
+
+test("fires for 'Keep searching' continuation with skipped textbook hits", () => {
+  const response = buildSkippedTextbookResponse(
+    "Keep searching",
+    [skippedBarashHit],
+    { referentialFired: true, contentTokenCount: 0 },
+  );
+
+  expect(response).toContain("I found the textbook files");
+  expect(response).toContain("Barash 9.pdf");
+});
+
+test("does not fire for 'I keep my notes in Obsidian' even with skipped textbook hits", () => {
+  const response = buildSkippedTextbookResponse(
+    "I keep my notes in Obsidian",
+    [skippedBarashHit],
+    { referentialFired: true, contentTokenCount: 0 },
+  );
+
+  expect(response).toBeNull();
+});
+
+test("does not fire for continuation when trigger did not fire", () => {
+  const response = buildSkippedTextbookResponse(
+    "Keep searching",
+    [skippedBarashHit],
+    { referentialFired: false, contentTokenCount: 0 },
+  );
+
+  expect(response).toBeNull();
+});
+
+test("does not fire for continuation when message still has content anchors", () => {
+  const response = buildSkippedTextbookResponse(
+    "Keep searching for the appeal",
+    [skippedBarashHit],
+    { referentialFired: true, contentTokenCount: 2 },
+  );
+
+  expect(response).toBeNull();
+});
+
+test("does not fire for continuation when hits include non-skipped-textbook entries", () => {
+  const response = buildSkippedTextbookResponse(
+    "Keep searching",
+    [
+      skippedBarashHit,
+      hit(`${process.env.HOME}/Notes/random.md`, "Some unrelated note content"),
+    ],
+    { referentialFired: true, contentTokenCount: 0 },
+  );
+
+  expect(response).toBeNull();
+});

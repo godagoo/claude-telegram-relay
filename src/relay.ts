@@ -470,7 +470,10 @@ bot.on("message:text", async (ctx) => {
     let assistantText = "";
     let stripped = 0;
     let errorMsg: string | undefined;
-    const deterministicTextbookResponse = buildSkippedTextbookResponse(text, ftsHits);
+    const deterministicTextbookResponse = buildSkippedTextbookResponse(text, ftsHits, {
+      referentialFired: referential,
+      contentTokenCount: queryContentTokens,
+    });
     if (deterministicTextbookResponse) {
       assistantText = deterministicTextbookResponse;
     } else {

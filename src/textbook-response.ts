@@ -3,6 +3,15 @@ import type { Hit } from "./retrieval";
 const TEXTBOOK_REQUEST =
   /\b(barash|miller|textbooks?|anesthesia\s+textbooks?|anesthesia\s+book)\b/i;
 
+// Narrow follow-up form: only the three phrases the user specified. Bare
+// `keep` (e.g. "I keep my notes in Obsidian") must not match.
+const CONTINUATION_FOLLOWUP = /\bkeep (going|searching|looking)\b/i;
+
+export interface BuildContext {
+  referentialFired: boolean;
+  contentTokenCount: number;
+}
+
 function isSkippedTextbookPath(hit: Hit): boolean {
   return (
     hit.file_path.includes("/Desktop/Exam_Prep/Textbooks/") &&
@@ -18,8 +27,21 @@ function displayPath(path: string): string {
 export function buildSkippedTextbookResponse(
   message: string,
   hits: Hit[],
+  context?: BuildContext,
 ): string | null {
-  if (!TEXTBOOK_REQUEST.test(message)) return null;
+  const matchesOriginal = TEXTBOOK_REQUEST.test(message);
+  // Continuation path: caller must have observed a referential trigger and
+  // zero new content anchors, and every hit must be a skipped textbook path.
+  // Without all five conditions we fall through and let Claude handle it.
+  const matchesContinuation =
+    !!context &&
+    context.referentialFired &&
+    context.contentTokenCount === 0 &&
+    CONTINUATION_FOLLOWUP.test(message) &&
+    hits.length > 0 &&
+    hits.every(isSkippedTextbookPath);
+
+  if (!matchesOriginal && !matchesContinuation) return null;
 
   const skippedHits = hits.filter(isSkippedTextbookPath).slice(0, 3);
   if (skippedHits.length === 0) return null;
