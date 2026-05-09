@@ -35,3 +35,25 @@
 - Retiring the official Telegram plugin means disabling its token file, not just
   killing the bridge process. Cursor can respawn the bridge while the token file
   remains in `~/.claude/channels/telegram/.env`.
+
+## 2026-05-08 - Path-fallback prefix scoping
+
+- Path-fallback GLOB patterns with a leading wildcard (`Textbooks/*Barash*`)
+  cannot use any path index. On a populated indexer DB this triggers the 8s
+  FTS worker timeout (`fts_timeout_8000ms`). When path fallback errors out,
+  the deterministic skipped-textbook guard sees zero hits and falls through
+  to Claude, which then runs for the full 5-minute timeout. Fix: AND each
+  GLOB with an indexable prefix (`f.path LIKE 'root/%'`) so SQLite scopes
+  the scan to the textbook directory before evaluating the GLOB.
+  EXPLAIN QUERY PLAN confirms the new shape uses
+  `SEARCH f USING COVERING INDEX idx_files_path` instead of `SCAN f`.
+- Long-form Miller/Barash phrasings ("What does miller say about the
+  indications for intubation?") must be covered by explicit unit tests, not
+  just `"What does Barash say?"`-style probes. The exact phrasings from
+  `~/.claude-relay/logs/decisions-YYYY-MM-DD.jsonl` are the source of truth
+  — backport the live failure into the test suite the moment the bug is
+  reproduced.
+- A path-fallback failure can silently mask the deterministic skipped-textbook
+  guard. When diagnosing skipped-textbook timeouts, always check
+  `[retrieval] path fallback failed:` lines in `relay.err.log` before
+  assuming the guard itself is broken.

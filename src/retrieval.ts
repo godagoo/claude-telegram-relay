@@ -333,14 +333,28 @@ export async function search(query: string, k = 8): Promise<Hit[]> {
   return combined;
 }
 
-async function searchPathAnchors(query: string, k: number): Promise<Hit[]> {
-  const tokens = pathTokensFromQuery(query);
-  if (tokens.length === 0) return [];
+function buildPathAnchorSql(tokens: string[]): {
+  sql: string;
+  orderedParams: unknown[];
+  expectedRoots: number;
+} {
+  // Per root: (f.path LIKE ? AND (f.path GLOB ? OR f.path GLOB ? ...))
+  // The LIKE has no leading wildcard, so SQLite can use a path index to
+  // scope the scan to the textbook directory before evaluating the GLOBs.
+  const rootClauses: string[] = [];
+  const orderedParams: unknown[] = [];
 
-  const pathPatterns = PATH_FALLBACK_ROOTS.flatMap((root) =>
-    tokens.map((token) => `${root}/*${caseTolerantGlobToken(token)}*`)
-  );
-  const pathClause = pathPatterns.map(() => "f.path GLOB ?").join(" OR ");
+  for (const root of PATH_FALLBACK_ROOTS) {
+    const rootGlobs = tokens.map(
+      (token) => `${root}/*${caseTolerantGlobToken(token)}*`,
+    );
+    const globClause = rootGlobs.map(() => "f.path GLOB ?").join(" OR ");
+    rootClauses.push(`(f.path LIKE ? AND (${globClause}))`);
+
+    orderedParams.push(`${root}/%`);
+    orderedParams.push(...rootGlobs);
+  }
+
   const sql = `
 SELECT -f.id AS id,
        'Indexed file path match. extraction_status=' || COALESCE(f.extraction_status, 'unknown') ||
@@ -349,17 +363,27 @@ SELECT -f.id AS id,
        0 AS chunk_index,
        -1.0 AS rank_score
   FROM files f
- WHERE (${pathClause})
+ WHERE (${rootClauses.join(" OR ")})
    AND ${DENY_CLAUSE}
  ORDER BY f.path
  LIMIT ?
 `;
 
-  const params = [
-    ...pathPatterns,
-    ...DENY_PATTERNS,
-    k,
-  ];
+  return {
+    sql,
+    orderedParams,
+    expectedRoots: PATH_FALLBACK_ROOTS.length,
+  };
+}
+
+export const __test__buildPathAnchorSql = buildPathAnchorSql;
+
+async function searchPathAnchors(query: string, k: number): Promise<Hit[]> {
+  const tokens = pathTokensFromQuery(query);
+  if (tokens.length === 0) return [];
+
+  const { sql, orderedParams } = buildPathAnchorSql(tokens);
+  const params = [...orderedParams, ...DENY_PATTERNS, k];
   const { rows } = await runFtsInWorker(sql, params);
   return (rows as RetrievedRow[]).map(toHit);
 }

@@ -107,3 +107,43 @@ test("does not fire for continuation when hits include non-skipped-textbook entr
 
   expect(response).toBeNull();
 });
+
+test("fires for live phrasing 'What does barash say about the indications for intubation?'", () => {
+  const response = buildSkippedTextbookResponse(
+    "What does barash say about the indications for intubation?",
+    [skippedBarashHit],
+  );
+
+  expect(response).toContain("I found the textbook files");
+  expect(response).toContain("Barash 9.pdf");
+});
+
+test("fires for live phrasing 'What does miller say about the indications for intubation?'", () => {
+  const response = buildSkippedTextbookResponse(
+    "What does miller say about the indications for intubation?",
+    [
+      hit(
+        `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/Miller_Barash/Miller.pdf`,
+        "Indexed file path match. extraction_status=skipped; chunk_count=0",
+      ),
+    ],
+  );
+
+  expect(response).toContain("I found the textbook files");
+  expect(response).toContain("Miller.pdf");
+});
+
+test("fires when at least one of several hits is a skipped textbook path", () => {
+  const response = buildSkippedTextbookResponse(
+    "What does Barash say about indications for intubation?",
+    [
+      hit(
+        `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/Miller_Barash/Barash 9.pdf`,
+        "Some extracted chapter content about intubation",
+      ),
+      skippedBarashHit,
+    ],
+  );
+
+  expect(response).toContain("I found the textbook files");
+});
