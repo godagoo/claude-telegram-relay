@@ -52,3 +52,50 @@ test("drops conversational say/says/said words from textbook questions", () => {
 test("still skips broad single-token searches without context", () => {
   expect(buildSearchQuery("Search through your index", [])).toBe("");
 });
+
+const millerArterialAnchor: Turn[] = [
+  {
+    role: "user",
+    content: "What does miller say are the indications for an arterial line?",
+    ts: "2026-05-09T03:00:00.000Z",
+  },
+  {
+    role: "assistant",
+    content: "Indications include hemodynamic monitoring, frequent ABGs, ...",
+    ts: "2026-05-09T03:00:01.000Z",
+  },
+];
+
+// Live decision-log evidence (decisions-2026-05-09.jsonl entry 3): user
+// followed a Miller arterial-line question with a source/format redirection
+// containing only source-control vocabulary. Prior FTS query was
+// `"instead" "relevant" "markdown" "converted" "today"` -> 0 hits.
+test("topic-pivot source-redirection recovers prior clinical anchor", () => {
+  expect(
+    buildSearchQuery(
+      "No, I want you to instead search through their relevant markdown files that I converted today",
+      millerArterialAnchor,
+    ),
+  ).toBe('"miller" "indications" "arterial" "line"');
+});
+
+test("topic-pivot with new clinical content does not pull in prior anchor", () => {
+  // "actually" is a pivot signal but the message still has its own clinical
+  // anchor (chestnut + anesthesia). Source-control words ("actually") drop,
+  // and the prior miller anchor is *not* merged in.
+  expect(
+    buildSearchQuery(
+      "actually, what about chestnut anesthesia",
+      millerArterialAnchor,
+    ),
+  ).toBe('"chestnut" "anesthesia"');
+});
+
+test("source-redirection without prior context still returns no query", () => {
+  expect(
+    buildSearchQuery(
+      "No, I want you to instead look at the converted markdown files",
+      [],
+    ),
+  ).toBe("");
+});

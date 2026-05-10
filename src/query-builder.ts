@@ -15,6 +15,35 @@ const MAX_QUERY_CHARS = 256;
 
 const FTS5_RESERVED = new Set(["AND", "OR", "NOT", "NEAR"]);
 
+// Source/format-redirection vocabulary. These words describe *how* the user
+// wants the bot to search (use the markdown, look in the converted files),
+// not *what* they want searched. Applied only when a topic-pivot signal is
+// detected, so legitimate occurrences ("relevant trials", "converted units")
+// outside a pivot context still survive.
+const SOURCE_CONTROL_STOPWORDS = new Set([
+  "instead",
+  "rather",
+  "actually",
+  "relevant",
+  "markdown",
+  "converted",
+  "today",
+]);
+
+// Topic-pivot / source-redirection signals. When any of these match, the
+// user is correcting the *route* of the previous question, not asking a new
+// clinical question. The query should preserve the prior anchor.
+// Source of truth: live decision log `decisions-2026-05-09.jsonl` entry 3
+// ("No, I want you to instead search through their relevant markdown files
+// that I converted today") with prior anchor "miller arterial line indications".
+const TOPIC_PIVOT_PATTERNS: RegExp[] = [
+  /\b(instead|rather|actually)\b/i,
+  /\bnot (that|the|those|this)\b/i,
+  /\b(use|read|check|search)\s+(the|those|these|my|your)?\s*(markdown|md|notes?|files?|pdf|docs?)\b/i,
+  /\b(relevant|converted|indexed)\s+(markdown|files?|notes?|docs?|pdf|md)\b/i,
+  /^no[,!.]?\s+(i|let|you|search|look|find|use|check|do|don'?t)\b/i,
+];
+
 // English stopwords minus negation words that can carry meaning, plus a small
 // bot-specific overlay. Keep this local to avoid a runtime dependency.
 const STOPWORDS = new Set([
@@ -52,7 +81,7 @@ function quoteToken(token: string): string {
   return `"${token.replace(/"/g, '""')}"`;
 }
 
-function filterContent(raw: string): string[] {
+function filterContent(raw: string, extraStopwords?: Set<string>): string[] {
   return raw
     .toLowerCase()
     .split(/\s+/)
@@ -60,7 +89,12 @@ function filterContent(raw: string): string[] {
     .filter((token) => token.length >= MIN_TOKEN_LEN)
     .filter((token) => !isPureDigits(token))
     .filter((token) => !STOPWORDS.has(token))
+    .filter((token) => !extraStopwords || !extraStopwords.has(token))
     .filter((token) => !isReserved(token));
+}
+
+function isTopicPivot(message: string): boolean {
+  return TOPIC_PIVOT_PATTERNS.some((rx) => rx.test(message));
 }
 
 function uniqueTokens(tokens: string[]): string[] {
@@ -76,7 +110,12 @@ function uniqueTokens(tokens: string[]): string[] {
 }
 
 function chooseTokens(currentMessage: string, recentTurns: Turn[]): string[] {
-  const chosen = uniqueTokens(filterContent(currentMessage));
+  const pivot = isTopicPivot(currentMessage);
+  // On a topic-pivot/source-redirection follow-up, also drop source-control
+  // vocabulary so the FTS query is not "instead/relevant/markdown/converted".
+  const chosen = uniqueTokens(
+    filterContent(currentMessage, pivot ? SOURCE_CONTROL_STOPWORDS : undefined),
+  );
   if (chosen.length >= 2) return chosen;
 
   const seen = new Set(chosen);
@@ -90,7 +129,14 @@ function chooseTokens(currentMessage: string, recentTurns: Turn[]): string[] {
       if (seen.has(token)) continue;
       seen.add(token);
       chosen.push(token);
-      if (chosen.length >= 2) return chosen;
+      // On a pivot, recover the whole prior clinical anchor up to the cap.
+      // Otherwise preserve the historical behavior of returning as soon as
+      // we have two tokens.
+      if (pivot) {
+        if (chosen.length >= MAX_MATCH_TOKENS) return chosen;
+      } else if (chosen.length >= 2) {
+        return chosen;
+      }
     }
   }
 

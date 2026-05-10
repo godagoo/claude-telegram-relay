@@ -112,6 +112,25 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-10 - Topic-pivot source-redirection needs prior anchor recovery
+
+- Long follow-up messages whose tokens are entirely source/format control
+  vocabulary (`instead`, `relevant`, `markdown`, `converted`, `today`) must
+  recover the prior clinical anchor instead of FTS-searching their own
+  words. Live evidence: `decisions-2026-05-09.jsonl` entry 3 produced
+  `"instead" "relevant" "markdown" "converted" "today"` and 0 hits after the
+  user asked "What does miller say are the indications for an arterial line?".
+- `chooseTokens` now detects topic-pivot signals (`instead/rather/actually`,
+  `not that/the`, `use the markdown`, `relevant markdown files`,
+  `^no, (i|let|search|...)`). When a pivot is detected, source-control words
+  are also dropped from the current message. If the cleaned current message
+  has <2 tokens, recovery from prior user turns runs the same way as for
+  bare continuations — but absorbs the *whole* prior clinical anchor
+  (up to MAX_MATCH_TOKENS) so a 4-token anchor stays a 4-token query.
+- Trigger pivot recovery only on explicit source-redirection signals. Don't
+  fire it on any long message — the FTS implicit-AND model would mix prior
+  topic into the new one and break legitimate topic shifts.
+
 ## 2026-05-10 - Trigger coverage must mirror BOOK_PATH_FILTERS
 
 - The retrieval trigger regex in `src/trigger.ts` only listed `barash|miller` as
