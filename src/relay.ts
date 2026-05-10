@@ -24,6 +24,7 @@ import { isReferential } from "./trigger.ts";
 import { buildSearchQuery, countContentTokens, type Turn } from "./query-builder.ts";
 import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
+import { stripMemoryTags, stripWrapperTags } from "./response-sanitize.ts";
 import {
   clearUpdateMarker,
   loadSeenUpdateIds,
@@ -353,18 +354,10 @@ function enqueue<T>(chatId: string, updateId: number, fn: () => Promise<T>): Pro
   return logged;
 }
 
-// Defense-in-depth strip of memory-management tags so they never reach the user.
-// Layer 1 (gate the prompt instruction on `supabase`) is in buildPrompt.
-function stripMemoryTags(text: string): { clean: string; stripped: number } {
-  let stripped = 0;
-  const clean = text
-    .replace(/\[REMEMBER:[^\]]*\]/g, () => { stripped++; return ""; })
-    .replace(/\[GOAL:[^\]]*\]/g,     () => { stripped++; return ""; })
-    .replace(/\[DONE:[^\]]*\]/g,     () => { stripped++; return ""; })
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return { clean, stripped };
-}
+// stripMemoryTags / stripWrapperTags moved to ./response-sanitize.ts so they
+// can be unit-tested without importing the relay module's startup side effects
+// (lock acquisition, bot construction). Layer 1 of the memory-tag leak fix
+// (gating the prompt instruction on `supabase`) is in buildPrompt.
 
 // Plain-text recent-turns renderer (locked v1 decision: no XML in prompts).
 // short-term.ts also exports renderRecentTurns which emits XML; we use this
@@ -485,12 +478,16 @@ bot.on("message:text", async (ctx) => {
         const intentResult = supabase
           ? await processMemoryIntents(supabase, raw)
           : raw;
-        const stripResult = stripMemoryTags(intentResult);
+        const memResult = stripMemoryTags(intentResult);
+        const wrapResult = stripWrapperTags(memResult.clean);
+        if (wrapResult.stripped > 0) {
+          console.log(`[wrapper-tag-strip] removed ${wrapResult.stripped} bare wrapper tag(s)`);
+        }
         assistantText = ensureSendableResponse(
-          stripResult.clean,
-          "I’m sorry, I generated an empty response. Please try again.",
+          wrapResult.clean,
+          "Hmm, I didn't generate a useful reply this time. Could you rephrase or ask a more specific question?",
         );
-        stripped = stripResult.stripped;
+        stripped = memResult.stripped + wrapResult.stripped;
       } catch (err) {
         errorMsg = err instanceof Error ? err.message : String(err);
         if (errorMsg.startsWith("claude_timeout_")) {
@@ -771,6 +768,7 @@ function buildPrompt(
   const parts = [
     "You are a personal AI assistant responding via Telegram.",
     "Default to concise, scannable replies: lead with the answer, prefer short bullets for multi-part responses, and avoid long paragraphs unless the user explicitly asks for depth or nuance. Match the user's tone; this is a conversational chat, not a report.",
+    "Reply in plain text. Never wrap your response in XML or HTML tags such as <response>, </response>, <answer>, or <reply>. If you have nothing useful to say, ask a clarifying question instead of returning an empty or tag-only reply.",
   ];
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);

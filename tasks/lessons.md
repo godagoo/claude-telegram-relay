@@ -112,6 +112,35 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-10 - Strip bare XML wrapper tags from Claude responses
+
+- Live failure 2026-05-10T21:08:25 and again at 21:58:25: Claude emitted the
+  literal string `<response>` as its entire reply to a textbook comparison
+  query. The relay sent the bare tag straight to Telegram. The resumed
+  Claude session then preserved the pattern and repeated it.
+- Symptom on Telegram: a single message containing only `<response>`. User
+  could not tell whether the relay or Claude was at fault.
+- Root cause appears to be Claude occasionally starting a structured-output
+  format and emitting only the opening wrapper before stalling. There is no
+  `<response>` template anywhere in the relay's prompt pipeline — the tag
+  comes from Claude itself.
+- Fix is defense-in-depth, mirroring `stripMemoryTags`:
+  - Extract sanitization into `src/response-sanitize.ts` and add
+    `stripWrapperTags`. Unwrap matched `<response>...</response>` pairs,
+    strip orphan opening/closing tags (and the same for
+    answer/reply/message/output/result). Apply in the text handler between
+    memory-intent processing and `ensureSendableResponse`.
+  - When the strip leaves nothing, the existing empty-response fallback
+    fires — but the fallback message is now friendlier
+    ("Hmm, I didn't generate a useful reply this time. Could you rephrase
+    or ask a more specific question?").
+  - Add a system-prompt directive forbidding XML/HTML wrappers and asking
+    Claude to emit a clarifying question instead of empty/tag-only output.
+- Operational: when poisoned wrapper-tag turns appear in
+  `~/.claude-relay/state/chats/<chat_id>.json`, trim the buffer back to the
+  last good assistant turn. `RECENT CONVERSATION:` is injected verbatim, so
+  poisoned turns reinforce the pattern across calls.
+
 ## 2026-05-10 - Pin book-name anchors over longer clinical adjectives
 
 - Live decision log 2026-05-10T21:08:13Z: "Compare the differences in how
