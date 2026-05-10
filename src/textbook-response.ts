@@ -1,4 +1,4 @@
-import type { Hit } from "./retrieval";
+import { CATALOG_BOOK_LIST, CATALOG_HIT_PATH, type Hit } from "./retrieval";
 
 const TEXTBOOK_REQUEST =
   /\b(barash|miller|textbooks?|anesthesia\s+textbooks?|anesthesia\s+book)\b/i;
@@ -61,5 +61,23 @@ export function buildSkippedTextbookResponse(
     files,
     "",
     "So I can confirm the files exist, but I cannot quote or answer from Barash/Miller content until we fix PDF extraction for those files.",
+  ].join("\n");
+}
+
+// Deterministic short-circuit for broad textbook-inventory questions. When
+// retrieval has already collapsed the query to the synthetic catalog hit
+// (see retrieval.isBroadTextbookInventoryQuery / textbookCatalogHits), there is
+// nothing for Claude to synthesize — the answer is "here are the books".
+// Returning a formatted bullet list directly avoids a 30-150s Claude round
+// trip on a pure inventory prompt.
+export function buildCatalogResponse(hits: Hit[]): string | null {
+  if (hits.length !== 1) return null;
+  if (hits[0].file_path !== CATALOG_HIT_PATH) return null;
+  return [
+    "Your indexed anesthesia textbooks (per-page Markdown):",
+    "",
+    ...CATALOG_BOOK_LIST.map((b) => `• ${b}`),
+    "",
+    "Ask a book/topic question, e.g. \"What does Miller say about arterial line indications?\"",
   ].join("\n");
 }

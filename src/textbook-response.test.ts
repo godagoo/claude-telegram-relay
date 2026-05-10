@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { buildSkippedTextbookResponse } from "./textbook-response";
-import type { Hit } from "./retrieval";
+import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response";
+import { CATALOG_HIT_PATH, type Hit } from "./retrieval";
 
 function hit(path: string, content: string): Hit {
   return {
@@ -161,6 +161,49 @@ test("does not fire for original phrasing when a non-textbook markdown hit exist
   );
 
   expect(response).toBeNull();
+});
+
+test("buildCatalogResponse returns formatted bullet list for the synthetic catalog hit", () => {
+  const response = buildCatalogResponse([
+    hit(
+      CATALOG_HIT_PATH,
+      "Converted anesthesia textbook corpus indexed as per-page Markdown.\nAvailable books: Barash 9, Chestnut 6, Cote Pediatric Anesthesia 6, Fleisher Uncommon Diseases, Miller 10, Stoelting 8.\nFor clinical retrieval, ask a book-specific or topic-specific question such as: What does Miller say about arterial line indications?",
+    ),
+  ]);
+
+  expect(response).not.toBeNull();
+  expect(response).toContain("Your indexed anesthesia textbooks");
+  expect(response).toContain("• Barash 9");
+  expect(response).toContain("• Chestnut 6");
+  expect(response).toContain("• Cote Pediatric Anesthesia 6");
+  expect(response).toContain("• Fleisher Uncommon Diseases");
+  expect(response).toContain("• Miller 10");
+  expect(response).toContain("• Stoelting 8");
+  expect(response).toContain("Ask a book/topic question");
+});
+
+test("buildCatalogResponse returns null for non-catalog hits", () => {
+  expect(
+    buildCatalogResponse([
+      hit(
+        `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/miller10/pages/page_42.md`,
+        "Some real textbook content.",
+      ),
+    ]),
+  ).toBeNull();
+});
+
+test("buildCatalogResponse returns null when catalog is mixed with other hits", () => {
+  expect(
+    buildCatalogResponse([
+      hit(CATALOG_HIT_PATH, "catalog content"),
+      hit(`${process.env.HOME}/ObsidianVault/note.md`, "some note"),
+    ]),
+  ).toBeNull();
+});
+
+test("buildCatalogResponse returns null for empty hits", () => {
+  expect(buildCatalogResponse([])).toBeNull();
 });
 
 test("fires for live phrasing 'What does miller say are the indications for an arterial line?' with only skipped textbook hits", () => {

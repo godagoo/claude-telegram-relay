@@ -23,7 +23,7 @@ import { search as ftsSearch, renderContext as renderFtsContext, preflight as re
 import { isReferential } from "./trigger.ts";
 import { buildSearchQuery, countContentTokens, type Turn } from "./query-builder.ts";
 import { loadTurns, appendTurn } from "./short-term.ts";
-import { buildSkippedTextbookResponse } from "./textbook-response.ts";
+import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
 import {
   clearUpdateMarker,
   loadSeenUpdateIds,
@@ -474,8 +474,11 @@ bot.on("message:text", async (ctx) => {
       referentialFired: referential,
       contentTokenCount: queryContentTokens,
     });
+    const deterministicCatalogResponse = buildCatalogResponse(ftsHits);
     if (deterministicTextbookResponse) {
       assistantText = deterministicTextbookResponse;
+    } else if (deterministicCatalogResponse) {
+      assistantText = deterministicCatalogResponse;
     } else {
       try {
         const raw = await callClaude(enrichedPrompt, { resume: true });

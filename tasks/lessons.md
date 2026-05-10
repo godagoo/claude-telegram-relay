@@ -112,6 +112,21 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-10 - Deterministic catalog response for bare textbook-inventory prompts
+
+- Bare inventory prompts (`anesthesia textbook`, `anesthesia textbooks`,
+  `please continue to look for my anesthesia textbooks`) collapse to the
+  synthetic `_catalog` FTS hit, but the relay still spawned Claude with that
+  hit as context — adding 30s-150s of latency to a question whose answer is
+  literally a static book list.
+- Add `buildCatalogResponse` alongside `buildSkippedTextbookResponse`. When
+  the FTS result is exactly one catalog hit, return a bulleted book list
+  directly and skip the Claude round trip entirely. Share `CATALOG_BOOK_LIST`
+  with retrieval so the list has one source of truth.
+- Don't try to short-circuit Claude for anything more ambitious. Specific
+  book/topic questions still need synthesis. The short-circuit is keyed off
+  the exact synthetic catalog file_path, not heuristics over the message.
+
 ## 2026-05-10 - Topic-pivot source-redirection needs prior anchor recovery
 
 - Long follow-up messages whose tokens are entirely source/format control

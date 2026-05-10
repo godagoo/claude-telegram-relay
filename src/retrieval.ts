@@ -407,6 +407,21 @@ function isBroadTextbookInventoryQuery(query: string): boolean {
   );
 }
 
+// Books available in the converted Markdown corpus. Shared source of truth so
+// textbook-response.ts can render a deterministic catalog reply without
+// re-parsing the FTS hit content.
+const CATALOG_BOOKS = [
+  "Barash 9",
+  "Chestnut 6",
+  "Cote Pediatric Anesthesia 6",
+  "Fleisher Uncommon Diseases",
+  "Miller 10",
+  "Stoelting 8",
+] as const;
+
+export const CATALOG_HIT_PATH = TEXTBOOK_CATALOG_PATH;
+export const CATALOG_BOOK_LIST: readonly string[] = CATALOG_BOOKS;
+
 function textbookCatalogHits(k: number): Hit[] {
   if (k < 1) return [];
 
@@ -415,7 +430,7 @@ function textbookCatalogHits(k: number): Hit[] {
     file_path: TEXTBOOK_CATALOG_PATH,
     content: [
       "Converted anesthesia textbook corpus indexed as per-page Markdown.",
-      "Available books: Barash 9, Chestnut 6, Cote Pediatric Anesthesia 6, Fleisher Uncommon Diseases, Miller 10, Stoelting 8.",
+      `Available books: ${CATALOG_BOOKS.join(", ")}.`,
       "For clinical retrieval, ask a book-specific or topic-specific question such as: What does Miller say about arterial line indications?",
     ].join("\n"),
     chunk_index: 0,
