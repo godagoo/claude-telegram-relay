@@ -8,7 +8,7 @@ const PATTERNS: RegExp[] = [
   // conversational references; they are retrieval commands.
   /\b(search|find|look through|check|query)\b.*\b(my|your|the|custom)?\s*(index|corpus|vault|notes?|files?|textbooks?|books?)\b/i,
   /\b(my|your|the|custom)\s+(index|corpus|vault)\b/i,
-  /\b(textbooks?|anesthesia textbook|barash|miller)\b/i,
+  /\b(textbooks?|anesthesia textbook|barash|miller|cote|chestnut|fleisher|stoelting)\b/i,
   /\b(indexed|index\/corpus)\b/i,
 
   // Explicit memory verbs and time anchors

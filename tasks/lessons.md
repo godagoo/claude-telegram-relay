@@ -112,6 +112,17 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-10 - Trigger coverage must mirror BOOK_PATH_FILTERS
+
+- The retrieval trigger regex in `src/trigger.ts` only listed `barash|miller` as
+  bare book-name tokens even though `BOOK_PATH_FILTERS` in `src/retrieval.ts`
+  already supports `cote`, `chestnut`, `fleisher`, and `stoelting`. Live evidence:
+  `What does cote say about the indications for intubation?` produced
+  `trigger_fired: false, hit_count: 0`. Fix: every book key in
+  `BOOK_PATH_FILTERS` must appear in the trigger regex. If a new book is added
+  to retrieval, add the name (and a regression test) to the trigger in the same
+  change. Backport the failing decision-log phrasing into `trigger.test.ts`.
+
 ## 2026-05-10 - Broad textbook queries need front-matter demotion
 
 - Broad title queries such as `anesthesia textbook` can rank contributor/title
