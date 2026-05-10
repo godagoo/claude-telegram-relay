@@ -30,6 +30,7 @@ const STOPWORDS = new Set([
   "hey", "hi", "hello", "claude", "please", "thanks", "thank",
   "ok", "okay", "yes",
   "remind", "ask", "tell", "show", "get", "find", "search", "look",
+  "say", "says", "said",
   "searching", "looking", "keep", "keeping",
   "continue", "finish", "update", "resume", "follow", "status", "progress",
   "message", "messages", "note", "notes", "file", "files",

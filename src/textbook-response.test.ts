@@ -133,7 +133,7 @@ test("fires for live phrasing 'What does miller say about the indications for in
   expect(response).toContain("Miller.pdf");
 });
 
-test("fires when at least one of several hits is a skipped textbook path", () => {
+test("does not fire for original phrasing when an extractable hit exists alongside skipped textbook", () => {
   const response = buildSkippedTextbookResponse(
     "What does Barash say about indications for intubation?",
     [
@@ -145,5 +145,39 @@ test("fires when at least one of several hits is a skipped textbook path", () =>
     ],
   );
 
+  expect(response).toBeNull();
+});
+
+test("does not fire for original phrasing when a non-textbook markdown hit exists", () => {
+  const response = buildSkippedTextbookResponse(
+    "What does miller say are the indications for an arterial line?",
+    [
+      skippedBarashHit,
+      hit(
+        `${process.env.HOME}/ObsidianVault/Anesthesia/arterial-line-indications.md`,
+        "Indications: hemodynamic instability, frequent ABG sampling, vasoactive drugs",
+      ),
+    ],
+  );
+
+  expect(response).toBeNull();
+});
+
+test("fires for live phrasing 'What does miller say are the indications for an arterial line?' with only skipped textbook hits", () => {
+  const response = buildSkippedTextbookResponse(
+    "What does miller say are the indications for an arterial line?",
+    [
+      hit(
+        `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/Miller_Barash/Miller.pdf`,
+        "Indexed file path match. extraction_status=skipped; chunk_count=0",
+      ),
+      hit(
+        `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/Miller_Barash/Cote Ped Anesthesia 6 copy (optimized).pdf`,
+        "Indexed file path match. extraction_status=skipped; chunk_count=0",
+      ),
+    ],
+  );
+
   expect(response).toContain("I found the textbook files");
+  expect(response).toContain("Miller.pdf");
 });

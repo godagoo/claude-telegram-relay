@@ -43,8 +43,13 @@ export function buildSkippedTextbookResponse(
 
   if (!matchesOriginal && !matchesContinuation) return null;
 
+  // Unified semantics: only fire when EVERY hit is a skipped textbook path.
+  // If the result also contains extractable content (markdown notes, chunks
+  // from extracted PDFs, memory hits), let Claude reason over it instead of
+  // bailing out with the canned "extraction skipped" message.
+  if (hits.length === 0 || !hits.every(isSkippedTextbookPath)) return null;
+
   const skippedHits = hits.filter(isSkippedTextbookPath).slice(0, 3);
-  if (skippedHits.length === 0) return null;
 
   const files = skippedHits
     .map((hit) => `- ${displayPath(hit.file_path)}`)

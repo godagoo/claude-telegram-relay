@@ -57,3 +57,70 @@
   guard. When diagnosing skipped-textbook timeouts, always check
   `[retrieval] path fallback failed:` lines in `relay.err.log` before
   assuming the guard itself is broken.
+
+## 2026-05-09 - Skipped-textbook guard semantics: only-when-every
+
+- The deterministic skipped-textbook guard had divergent semantics between the
+  two phrasing paths: the original-phrasing path fired whenever ANY hit was a
+  skipped textbook path, while the continuation path required EVERY hit to be
+  a skipped textbook path. The "only" semantics described in the original
+  lesson ("If retrieval returns ONLY skipped textbook path hits, answer
+  deterministically") had been lost in the original-phrasing implementation.
+  Live evidence: `decisions-2026-05-09.jsonl` entry 1 (04:10:22Z) — user asked
+  "What does miller say are the indications for an arterial line?", guard
+  fired, user replied "Okay; this response is unacceptable. Please mark it
+  down as a bug we must fix." Fix: unify both paths to require
+  `hits.every(isSkippedTextbookPath)`, so any extractable hit (markdown notes,
+  vault chunks, real PDF chunks) lets Claude reason over real content instead
+  of bailing with the canned message.
+- A test that asserts buggy behavior is worse than no test. The Loop 1
+  regression test "fires when at least one of several hits is a skipped
+  textbook path" encoded the wrong semantics as a positive assertion and
+  prevented the divergence from being noticed at PR time. Live decision-log
+  phrasings are still the source of truth — but the *expected* behavior in
+  the test must match the *intended* behavior, not the *current* behavior.
+
+## 2026-05-09 - Known limitation: anchor recovery on topic-pivot follow-ups (deferred)
+
+- Path fallback title matching must validate the basename, not only the full
+  path. Live evidence: `Miller_Barash/Barash...pdf` matched a `miller` title
+  query because the parent directory contained `Miller_Barash`; that let Barash
+  files outrank Miller files. Keep the SQL root/GLOB prefilter for performance,
+  but pull a bounded candidate pool and filter token matches against the file
+  basename before returning hits.
+- Once converted textbook markdown exists, old path-only PDF hits must be a
+  fallback, not the primary result. Treat book names (`miller`, `barash`,
+  `chestnut`, etc.) as path filters for the converted corpus and search the
+  remaining clinical terms inside that book. Otherwise the skipped-PDF guard
+  hides newly indexed markdown content and the bot still claims it cannot read
+  the textbook.
+- Preserve the "no broad single-token FTS" invariant after transforming a
+  query. `miller anesthesia` looks like two tokens before book filtering, but
+  after `miller` becomes a path filter only `anesthesia` remains; running that
+  broad single-token FTS can still trip this DB's fragile FTS path.
+- `query-builder.ts` `chooseTokens` only pulls anchor tokens from prior turns
+  when the current message has fewer than 2 content tokens. Topic-pivot
+  follow-ups like "No, I want you to instead search through their relevant
+  markdown files that I converted today" (entry 3 of `decisions-2026-05-09`)
+  have 5+ content tokens but still reference the prior subject implicitly
+  ("their"). The FTS query becomes `"instead" "relevant" "markdown"
+  "converted" "today"` — none of the actual content anchor (miller / arterial
+  / indications) survives.
+- Not fixed in this loop because the heuristic needs design work and one data
+  point is thin. Candidate approaches for a future loop: detect topic-pivot
+  signals ("instead", "but actually", "rather", "no, "), and when present
+  always merge the top anchor tokens from the prior user turn alongside the
+  current message's tokens.
+
+## 2026-05-10 - Broad textbook queries need front-matter demotion
+
+- Broad title queries such as `anesthesia textbook` can rank contributor/title
+  pages above clinically useful pages because the semantic-analysis prose repeats
+  "textbook" and "anesthesia" in front matter. Apply a post-FTS demotion for
+  converted textbook hits whose snippets identify front matter, contributors,
+  title pages, tables of contents, or copyright material. Do not apply this to
+  specific content questions, because contributor/front-matter pages may be the
+  correct answer when explicitly requested.
+- Bare inventory prompts such as `anesthesia textbook` are not clinical search
+  questions. Return a fast catalog hit instead of running broad FTS over the
+  whole corpus; keep FTS for book-specific or topic-specific questions.

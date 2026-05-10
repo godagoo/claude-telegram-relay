@@ -43,6 +43,12 @@ test("keeps strong textbook anchors from current message", () => {
   );
 });
 
+test("drops conversational say/says/said words from textbook questions", () => {
+  expect(
+    buildSearchQuery("What does Miller say are the indications for an arterial line?", []),
+  ).toBe('"miller" "indications" "arterial" "line"');
+});
+
 test("still skips broad single-token searches without context", () => {
   expect(buildSearchQuery("Search through your index", [])).toBe("");
 });

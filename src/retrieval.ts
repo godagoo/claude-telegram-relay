@@ -6,7 +6,7 @@
 import { Database } from "bun:sqlite";
 import { accessSync, constants } from "fs";
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 
 const DB_PATH = process.env.INDEXER_DB
   ?? join(homedir(), ".local-search", "metadata.db");
@@ -23,6 +23,10 @@ const PATH_FALLBACK_ROOTS = [
 ];
 
 const FTS_TIMEOUT_MS = Number(process.env.FTS_TIMEOUT_MS ?? "8000");
+const PATH_FALLBACK_CANDIDATE_LIMIT = 200;
+const TEXTBOOK_MARKDOWN_ROOT =
+  join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown") + "/";
+const TEXTBOOK_CATALOG_PATH = TEXTBOOK_MARKDOWN_ROOT + "_catalog";
 
 let _db: Database | null = null;
 
@@ -192,6 +196,17 @@ SELECT c.id AS id,
  LIMIT ?
 `;
 
+const BOOK_PATH_FILTERS: Record<string, string> = {
+  barash: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "barash9") + "/%",
+  chestnut: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "chestnut6") + "/%",
+  cote: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "cote_ped6") + "/%",
+  fleisher: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "fleisher_uncommon") + "/%",
+  miller: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "miller10") + "/%",
+  stoelting: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "stoelting8") + "/%",
+};
+
+const FTS_BOOK_FILTER_TOKENS = new Set(Object.keys(BOOK_PATH_FILTERS));
+
 const PATH_ANCHOR_STOPWORDS = new Set([
   "textbook",
   "textbooks",
@@ -239,6 +254,38 @@ function sanitizeFtsQuery(query: string): string {
   // which FTS5 treats as implicit AND — same semantics as quoted phrases of
   // single tokens. Plan §3c requires `"` in the escape set as belt-and-braces.
   return query.replace(/[+~"*()^:\-]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function queryTokens(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => token.replace(/[^a-z0-9]/g, ""))
+    .filter(Boolean);
+}
+
+function prepareFtsQuery(query: string): {
+  match: string;
+  scopePatterns: string[];
+} {
+  const tokens = queryTokens(query);
+  const bookScopes = [...new Set(
+    tokens
+      .filter((token) => FTS_BOOK_FILTER_TOKENS.has(token))
+      .map((token) => BOOK_PATH_FILTERS[token]),
+  )];
+  const contentTokens = tokens.filter((token) => !FTS_BOOK_FILTER_TOKENS.has(token));
+  const scopePatterns =
+    bookScopes.length > 0
+      ? bookScopes
+      : isBroadTextbookQuery(query)
+        ? [TEXTBOOK_MARKDOWN_ROOT + "%"]
+        : SCOPE_PATTERNS;
+
+  return {
+    match: contentTokens.length >= 2 ? contentTokens.join(" ") : "",
+    scopePatterns,
+  };
 }
 
 function displayScore(rankScore: number): number {
@@ -308,9 +355,18 @@ export async function search(query: string, k = 8): Promise<Hit[]> {
   if (!safe) return [];
 
   const safeK = Math.min(Math.max(1, k | 0), 50);
-  const params = [safe, ...SCOPE_PATTERNS, ...DENY_PATTERNS, safeK];
-  const { rows } = await runFtsInWorker(SEARCH_SQL, params);
-  const ftsHits = (rows as RetrievedRow[]).map(toHit);
+  if (isBroadTextbookInventoryQuery(safe)) {
+    return textbookCatalogHits(safeK);
+  }
+
+  const ftsQuery = prepareFtsQuery(safe);
+  let ftsHits: Hit[] = [];
+  if (ftsQuery.match) {
+    const params = [ftsQuery.match, ...ftsQuery.scopePatterns, ...DENY_PATTERNS, safeK];
+    const sql = SEARCH_SQL.replace(SCOPE_CLAUSE, "(" + ftsQuery.scopePatterns.map(() => "f.path LIKE ?").join(" OR ") + ")");
+    const { rows } = await runFtsInWorker(sql, params);
+    ftsHits = rerankFtsHits(safe, (rows as RetrievedRow[]).map(toHit));
+  }
   let pathHits: Hit[] = [];
   try {
     pathHits = await searchPathAnchors(safe, safeK);
@@ -320,17 +376,97 @@ export async function search(query: string, k = 8): Promise<Hit[]> {
       err instanceof Error ? err.message : String(err),
     );
   }
+  return combineHits(ftsHits, pathHits, safeK);
+}
+
+function combineHits(ftsHits: Hit[], pathHits: Hit[], k: number): Hit[] {
   const combined: Hit[] = [];
   const seen = new Set<number>();
 
-  for (const hit of [...pathHits, ...ftsHits]) {
+  for (const hit of [...ftsHits, ...pathHits]) {
     if (seen.has(hit.chunk_id)) continue;
     seen.add(hit.chunk_id);
     combined.push(hit);
-    if (combined.length >= safeK) break;
+    if (combined.length >= k) break;
   }
 
   return combined;
+}
+
+function isBroadTextbookQuery(query: string): boolean {
+  const tokens = new Set(queryTokens(query));
+  return tokens.has("textbook") || tokens.has("textbooks");
+}
+
+function isBroadTextbookInventoryQuery(query: string): boolean {
+  const tokens = queryTokens(query);
+  const allowed = new Set(["anesthesia", "book", "books", "textbook", "textbooks"]);
+  return (
+    tokens.some((token) => token === "textbook" || token === "textbooks") &&
+    tokens.every((token) => allowed.has(token))
+  );
+}
+
+function textbookCatalogHits(k: number): Hit[] {
+  if (k < 1) return [];
+
+  return [{
+    chunk_id: -1_000_000,
+    file_path: TEXTBOOK_CATALOG_PATH,
+    content: [
+      "Converted anesthesia textbook corpus indexed as per-page Markdown.",
+      "Available books: Barash 9, Chestnut 6, Cote Pediatric Anesthesia 6, Fleisher Uncommon Diseases, Miller 10, Stoelting 8.",
+      "For clinical retrieval, ask a book-specific or topic-specific question such as: What does Miller say about arterial line indications?",
+    ].join("\n"),
+    chunk_index: 0,
+    rank_score: -100,
+    display_score: 100,
+    score: 100,
+  }];
+}
+
+function isConvertedTextbookPath(path: string): boolean {
+  return path.startsWith(TEXTBOOK_MARKDOWN_ROOT);
+}
+
+function textbookFrontMatterPenalty(hit: Hit): number {
+  if (!isConvertedTextbookPath(hit.file_path)) return 0;
+
+  const path = hit.file_path.toLowerCase();
+  const content = hit.content.toLowerCase();
+  let penalty = 0;
+
+  if (path.endsWith("_term_index.md")) penalty += 4;
+  if (
+    content.includes("front matter") ||
+    content.includes("contributor listing") ||
+    content.includes("contributor affiliation") ||
+    content.includes("chapter authors") ||
+    content.includes("title page") ||
+    content.includes("table of contents") ||
+    content.includes("copyright")
+  ) {
+    penalty += 20;
+  }
+
+  return penalty;
+}
+
+function rerankFtsHits(query: string, hits: Hit[]): Hit[] {
+  if (!isBroadTextbookQuery(query)) return hits;
+
+  return hits
+    .map((hit, index) => ({
+      hit,
+      index,
+      penalty: textbookFrontMatterPenalty(hit),
+    }))
+    .sort((a, b) =>
+      a.penalty - b.penalty ||
+      a.hit.rank_score - b.hit.rank_score ||
+      a.index - b.index
+    )
+    .map(({ hit }) => hit);
 }
 
 function buildPathAnchorSql(tokens: string[]): {
@@ -377,16 +513,42 @@ SELECT -f.id AS id,
 }
 
 export const __test__buildPathAnchorSql = buildPathAnchorSql;
+export const __test__combineHits = combineHits;
+export const __test__prepareFtsQuery = prepareFtsQuery;
+export const __test__rerankFtsHits = rerankFtsHits;
+export const __test__isBroadTextbookInventoryQuery = isBroadTextbookInventoryQuery;
 
 async function searchPathAnchors(query: string, k: number): Promise<Hit[]> {
   const tokens = pathTokensFromQuery(query);
   if (tokens.length === 0) return [];
 
   const { sql, orderedParams } = buildPathAnchorSql(tokens);
-  const params = [...orderedParams, ...DENY_PATTERNS, k];
+  // SQL GLOB still runs against the full path for speed, so a token can match a
+  // parent directory such as "Miller_Barash". Pull a bounded candidate pool and
+  // enforce the title match on the basename below before returning hits.
+  const candidateLimit = Math.max(k, PATH_FALLBACK_CANDIDATE_LIMIT);
+  const params = [...orderedParams, ...DENY_PATTERNS, candidateLimit];
   const { rows } = await runFtsInWorker(sql, params);
-  return (rows as RetrievedRow[]).map(toHit);
+  return filterPathAnchorRows(rows as RetrievedRow[], tokens, k);
 }
+
+function pathBasenameMatchesAnyToken(path: string, tokens: string[]): boolean {
+  const base = basename(path).toLowerCase();
+  return tokens.some((token) => base.includes(token));
+}
+
+function filterPathAnchorRows(
+  rows: RetrievedRow[],
+  tokens: string[],
+  k: number,
+): Hit[] {
+  return rows
+    .filter((row) => pathBasenameMatchesAnyToken(row.path, tokens))
+    .slice(0, k)
+    .map(toHit);
+}
+
+export const __test__filterPathAnchorRows = filterPathAnchorRows;
 
 const MAX_HITS_INJECTED = 3;
 const MAX_CHARS_PER_HIT = 900;
