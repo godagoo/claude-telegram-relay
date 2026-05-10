@@ -769,7 +769,8 @@ function buildPrompt(
   });
 
   const parts = [
-    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+    "You are a personal AI assistant responding via Telegram.",
+    "Default to concise, scannable replies: lead with the answer, prefer short bullets for multi-part responses, and avoid long paragraphs unless the user explicitly asks for depth or nuance. Match the user's tone; this is a conversational chat, not a report.",
   ];
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);

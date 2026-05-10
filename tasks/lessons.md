@@ -112,6 +112,20 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-10 - Telegram default reply style: concise, scannable, bulleted
+
+- User feedback (saved in memory `feedback_response_style.md`): bullets over
+  prose, lead with the answer, this is a Telegram reader. The buildPrompt
+  system instruction in `relay.ts` already said "concise and conversational"
+  but didn't explicitly request bullets/scannable form, so long-paragraph
+  replies still leaked through.
+- Updated the instruction to: "Default to concise, scannable replies: lead
+  with the answer, prefer short bullets for multi-part responses, and avoid
+  long paragraphs unless the user explicitly asks for depth or nuance."
+- Kept it as a default rather than a hard rule so clinical nuance can still
+  be requested ("explain in detail", "walk me through"). No meta-commentary,
+  no change to retrieval/memory semantics.
+
 ## 2026-05-10 - Deterministic catalog response for bare textbook-inventory prompts
 
 - Bare inventory prompts (`anesthesia textbook`, `anesthesia textbooks`,
