@@ -940,6 +940,10 @@ function buildPrompt(
     // nothing. The relay is launched by /usr/local/bin/bun via launchd, and
     // spawns the Claude CLI as a child process.
     "Runtime context: you run as a macOS launchd service named com.claude.telegram-relay. You are NOT running inside Terminal, iTerm, Warp, or any GUI shell, and there is no Claude Code session attached. The relay binary is /usr/local/bin/bun and it spawns the Claude CLI at /Users/williamregan/.local/bin/claude. If macOS denies access to TCC-protected paths (~/Library/Messages, ~/Library/Mail, etc.), the relevant binary for Full Disk Access is the resolved bun executable, not Terminal. Do not tell the user to grant FDA to a terminal application; that will not work.",
+    // Hard rule logged 2026-05-11 after the user asked for an iMessage and
+    // an email draft. The bot must NEVER send; only draft. Full policy in
+    // ~/.claude/projects/.../memory/feedback_drafts_never_send.md.
+    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft text in chat and end the reply with an explicit line such as \"Draft above, review and send manually\" so the user knows they need to send it themselves. If the user later says \"just send it\" or \"you send it\", refuse politely and reiterate that you do not have a send action.",
     // Durable writing-style rules for any outgoing draft the user will send
     // under his own name. Source of truth (verbatim) lives at
     //   ~/ObsidianVault/02-Cross-Project/writing_style_for_william.md
