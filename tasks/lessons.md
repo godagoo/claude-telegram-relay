@@ -112,6 +112,25 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-11 - Context-before-drafting + ephemeral context cleanup
+
+- User added two linked rules: (1) before drafting any iMessage or email
+  reply, the bot must first read the last 5 to 10 messages in that thread
+  for context; (2) the fetched context must never be saved to a local file,
+  to keep disk usage from accumulating across drafts.
+- Encoded as two new lines in `relay.ts:buildPrompt`. Rule 1 names
+  `scripts/imessage-thread.sh` as the read helper for iMessage and tells
+  the bot to ask the user to paste the thread for email (no generic email
+  read helper exists yet). Rule 2 bans writing context to `data/` or
+  anywhere else on disk and tells the bot to delete any stale cached
+  context files it encounters.
+- Operational cleanup: deleted the one-off `data/mom-imessages.json`
+  cache from 2026-05-10's manual extraction. The `data/` directory was
+  also removed. Re-extracting on demand via the read helper is fast
+  (~100 ms) and avoids stale personal-message dumps.
+- New memory `feedback_context_before_drafting.md` plus an index pointer
+  in `MEMORY.md` so the rule survives session compaction.
+
 ## 2026-05-11 - iMessage and email draft helpers; FDA scoped to Claude CLI
 
 - User asked for the relay to be able to read iMessage context and drop
