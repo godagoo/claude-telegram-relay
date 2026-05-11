@@ -35,6 +35,13 @@ export interface DecisionRecord {
   imessage_context_status?: "found" | "empty" | "fda_denied" | "error" | "timeout";
   imessage_context_count?: number;
   imessage_context_contact?: string;
+  imessage_draft_status?:
+    | "placed"
+    | "markers_missing"
+    | "empty_body"
+    | "no_recipient"
+    | "helper_failed"
+    | "no_intent";
   memory_tags_stripped?: number;
   wrapper_tags_stripped?: number;
   scaffolding_tags_stripped?: number;

@@ -183,6 +183,38 @@
   binary under `~/.local/share/claude/versions/<latest>`, not the Terminal app
   and not a stale "bun binary is missing FDA" message.
 
+## 2026-05-11 - Deterministic iMessage draft placement (mirror of prefetch)
+
+- Live failure 2026-05-11T15:20:59Z: prefetch worked (10 Peggy messages
+  injected, draft body looked good in Telegram), but the user reported
+  "Draft is good but it is not in the iMessage chatbox". Bot reply said
+  "The script call was blocked for approval. Approve the Bash command and
+  I'll get it onto your clipboard". There is no approval surface on a
+  Telegram-only path; Claude in headless `claude -p` mode has no Bash
+  permission UI to invoke.
+- Root cause was architectural asymmetry: the relay prefetched read context
+  but expected Claude to call `scripts/draft-imessage.sh` for the write side.
+  In `-p` mode that's a dead end; Claude either has no Bash tool or it's
+  gated behind interactive approval that doesn't exist for Telegram.
+- Fix mirrors the prefetch. The relay now detects iMessage placement intent
+  (`directly in the iMessage box`, `iMessage chatbox`, `put it in Messages`,
+  etc.), asks Claude to emit the draft body between
+  `<<<IMESSAGE_DRAFT>>>` / `<<<END_IMESSAGE_DRAFT>>>` markers, then runs
+  `scripts/draft-imessage.sh` itself after Claude returns and replaces the
+  marker block with a confirmation line.
+- The helper's stdout shape is now `{"resolved":"<phone-or-email>",
+  "messages":[...]}` so the relay can reuse the resolved chat identifier
+  for placement without re-running contact resolution.
+- Hard rule preserved: the helper never sends. It pbcopies the body and
+  `open imessage://<recipient>`; the user still pastes and sends manually.
+- Telemetry: new `imessage_draft_status` field in `DecisionRecord` —
+  `placed | markers_missing | empty_body | no_recipient | helper_failed`.
+- Stop telling Claude that `scripts/imessage-thread.sh` and
+  `scripts/draft-imessage.sh` exist. In headless mode any helper line in
+  the prompt is dead weight that produces hallucinated "blocked for
+  approval" output. Keep the email helper line for now; the user has not
+  asked for symmetric email placement yet.
+
 ## 2026-05-11 - Strip Claude Code internal scaffolding tags from relay output
 
 - Live failure 2026-05-11T12:54:45Z: in response to "Okay, please draft an

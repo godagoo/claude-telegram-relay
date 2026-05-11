@@ -5,8 +5,14 @@
 # Usage:
 #   scripts/imessage-thread.sh +16043154583 [LIMIT]
 #
-# Output (stdout, JSON array, one object per row):
-#   [{"id":<int>,"sender":"me"|"them","ts":"<localtime>","text":"<message>"}, ...]
+# Output (stdout, JSON envelope):
+#   {"resolved":"<phone-or-email>","messages":[
+#     {"id":<int>,"sender":"me"|"them","ts":"<localtime>","text":"<message>"},
+#     ...
+#   ]}
+# When the recipient cannot be resolved, "resolved" is the empty string and
+# "messages" is an empty array. The relay reuses the resolved value to address
+# Messages.app deterministically when placing a draft.
 #
 # Requires:
 #   Full Disk Access on the process that ends up running sqlite3. When the
@@ -95,7 +101,7 @@ SQL
 
 RESOLVED_RECIPIENT="$(resolve_recipient "$RECIPIENT")"
 if [[ -z "$RESOLVED_RECIPIENT" ]]; then
-  printf '[]\n'
+  printf '{"resolved":"","messages":[]}\n'
   exit 0
 fi
 
@@ -105,7 +111,7 @@ NAKED="${RESOLVED_RECIPIENT#+}"
 SQL_RECIPIENT="$(sql_string "$RESOLVED_RECIPIENT")"
 SQL_NAKED="$(sql_string "$NAKED")"
 
-sqlite3 -readonly "$DB" <<SQL
+MESSAGES_JSON="$(sqlite3 -readonly "$DB" <<SQL
 .mode json
 SELECT
   m.ROWID AS id,
@@ -121,3 +127,13 @@ WHERE c.chat_identifier IN ('$SQL_RECIPIENT', '+$SQL_NAKED', '$SQL_NAKED', '+1$S
 ORDER BY m.date DESC
 LIMIT $LIMIT;
 SQL
+)"
+
+# sqlite3 .mode json emits nothing for zero rows; coerce to an empty array so
+# the envelope is always valid JSON.
+[[ -z "$MESSAGES_JSON" ]] && MESSAGES_JSON='[]'
+
+# Resolved recipient is always a phone, email, or sanitized chat_identifier
+# (group-chat ids are filtered out upstream), so it never contains characters
+# that would break this raw JSON embedding.
+printf '{"resolved":"%s","messages":%s}\n' "$RESOLVED_RECIPIENT" "$MESSAGES_JSON"

@@ -28,7 +28,33 @@ export interface IMessageContextResult {
   request: IMessageContextRequest;
   status: "found" | "empty" | "fda_denied" | "error" | "timeout";
   messages: IMessageRow[];
+  /**
+   * The phone/email/chat_identifier the helper landed on for this contact.
+   * Always set when status is "found" or "empty"; absent for fda_denied,
+   * error, and timeout. The relay reuses this to address Messages.app
+   * deterministically when placing a draft.
+   */
+  resolvedRecipient?: string;
   error?: string;
+}
+
+/**
+ * Detects whether the user wants the draft *placed* into Messages.app's
+ * compose box (as opposed to just receiving the text in Telegram for manual
+ * copy/paste). When true, the relay runs scripts/draft-imessage.sh after
+ * Claude returns and replaces the marker block with a confirmation line.
+ */
+export function detectIMessageWriteIntent(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    /\b(imessage|message|messages|chat)\s*(box|chatbox)\b/.test(m) ||
+    /\bchat\s*box\b/.test(m) ||
+    /\bnative\s+compose\b/.test(m) ||
+    /\bmessages\s+app\b/.test(m) ||
+    /\b(?:drop|put|place)\s+(?:it\s+)?(?:in|into)\s+(?:the\s+)?messages\b/.test(m) ||
+    /\bopen\s+messages\b/.test(m) ||
+    /\bdirectly\s+in\s+(?:the\s+)?(?:imessage|messages|message)\b/.test(m)
+  );
 }
 
 function isIMessageDraftRequest(message: string): boolean {
@@ -131,12 +157,21 @@ export async function fetchIMessageContext(
       };
     }
 
-    const parsed = JSON.parse(stdout || "[]");
-    const messages = Array.isArray(parsed) ? parsed as IMessageRow[] : [];
+    const parsed = stdout
+      ? JSON.parse(stdout)
+      : { resolved: "", messages: [] };
+    const messages: IMessageRow[] = Array.isArray(parsed?.messages)
+      ? parsed.messages
+      : [];
+    const resolvedRecipient =
+      typeof parsed?.resolved === "string" && parsed.resolved.length > 0
+        ? parsed.resolved
+        : undefined;
     return {
       request,
       status: messages.length > 0 ? "found" : "empty",
       messages,
+      resolvedRecipient,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

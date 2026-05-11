@@ -27,10 +27,19 @@ import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
 import { sanitizeClaudeResponse } from "./response-sanitize.ts";
 import {
+  detectIMessageWriteIntent,
   extractIMessageContextRequest,
   fetchIMessageContext,
   renderIMessageContext,
 } from "./imessage-context.ts";
+import {
+  DRAFT_MARKER_CLOSE,
+  DRAFT_MARKER_OPEN,
+  extractDraftBody,
+  placeIMessageDraft,
+  replaceDraftBlock,
+  type IMessageDraftStatus,
+} from "./imessage-draft.ts";
 import {
   clearUpdateMarker,
   loadSeenUpdateIds,
@@ -586,12 +595,14 @@ bot.on("message:text", async (ctx) => {
     const imessageContextResult = imessageContextRequest
       ? await fetchIMessageContext(PROJECT_ROOT, imessageContextRequest)
       : null;
+    const wantsIMessagePlacement =
+      imessageContextRequest !== null && detectIMessageWriteIntent(text);
     const imessageContext = imessageContextResult
       ? renderIMessageContext(imessageContextResult)
       : "";
     if (imessageContextResult) {
       console.log(
-        `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length}`,
+        `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length} placement=${wantsIMessagePlacement}`,
       );
     }
     const recentBlock = renderRecentTurnsPlain(recentTurns, MAX_RECENT_TURNS_RENDERED, {
@@ -607,7 +618,14 @@ bot.on("message:text", async (ctx) => {
       .filter(Boolean)
       .join("\n\n");
 
-    const enrichedPrompt = capPrompt(buildPrompt(text, combinedRelevant, memoryContext), text);
+    const enrichedPrompt = capPrompt(
+      buildPrompt(text, combinedRelevant, memoryContext, {
+        iMessageDraftContact: wantsIMessagePlacement
+          ? imessageContextRequest?.contact
+          : undefined,
+      }),
+      text,
+    );
 
     const tClaude0 = Date.now();
     let assistantText = "";
@@ -651,6 +669,62 @@ bot.on("message:text", async (ctx) => {
     }
     const claudeMs = Date.now() - tClaude0;
 
+    let imessageDraftStatus: IMessageDraftStatus | undefined;
+    if (wantsIMessagePlacement) {
+      const body = extractDraftBody(assistantText);
+      const resolved = imessageContextResult?.resolvedRecipient;
+      const contactLabel =
+        imessageContextRequest?.contact ?? resolved ?? "this contact";
+
+      if (!body) {
+        imessageDraftStatus = "markers_missing";
+        const stripped = replaceDraftBlock(assistantText, "").trim();
+        assistantText = stripped.length > 0
+          ? `${stripped}\n\n(I couldn't place this in Messages this time — paste it manually for now.)`
+          : "(I couldn't place this in Messages this time — paste it manually for now.)";
+        console.error(
+          `[imessage-draft] markers_missing for ${contactLabel}; resp_chars=${assistantText.length}`,
+        );
+      } else if (!resolved) {
+        imessageDraftStatus = "no_recipient";
+        const hint = imessageContextResult?.status === "fda_denied"
+          ? "Couldn't open Messages — Full Disk Access is missing. See docs/IMESSAGE-SETUP.md."
+          : `Couldn't open Messages — no thread found for ${contactLabel}. Send the phone or email and I'll place it.`;
+        assistantText = replaceDraftBlock(assistantText, `${body}\n\n${hint}`);
+        console.error(
+          `[imessage-draft] no_recipient for ${contactLabel} (context_status=${imessageContextResult?.status})`,
+        );
+      } else {
+        const placement = await placeIMessageDraft(PROJECT_ROOT, resolved, body);
+        if (placement.ok) {
+          imessageDraftStatus = "placed";
+          assistantText = replaceDraftBlock(
+            assistantText,
+            `${body}\n\nDraft is on your clipboard and Messages is open on the thread with ${contactLabel}. Paste with Cmd+V and send when ready.`,
+          );
+          console.log(
+            `[imessage-draft] placed for ${contactLabel} (${resolved})`,
+          );
+        } else {
+          imessageDraftStatus = "helper_failed";
+          assistantText = replaceDraftBlock(
+            assistantText,
+            `${body}\n\n(Couldn't place this in Messages: ${placement.error ?? "unknown error"}. Paste it manually.)`,
+          );
+          console.error(`[imessage-draft] helper failed: ${placement.error}`);
+        }
+      }
+    }
+
+    // Defensive: ensure no raw iMessage-draft markers reach Telegram even if
+    // Claude emitted them outside a placement request or left a second pair.
+    if (
+      assistantText.includes(DRAFT_MARKER_OPEN) ||
+      assistantText.includes(DRAFT_MARKER_CLOSE)
+    ) {
+      assistantText = replaceDraftBlock(assistantText, "").trim();
+    }
+
     await sendResponse(ctx, assistantText);
     await saveMessage("assistant", assistantText);
     await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
@@ -681,6 +755,7 @@ bot.on("message:text", async (ctx) => {
       imessage_context_status: imessageContextResult?.status,
       imessage_context_count: imessageContextResult?.messages.length,
       imessage_context_contact: imessageContextResult?.request.contact,
+      imessage_draft_status: imessageDraftStatus,
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
@@ -976,7 +1051,8 @@ const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolve
 function buildPrompt(
   userMessage: string,
   relevantContext?: string,
-  memoryContext?: string
+  memoryContext?: string,
+  opts?: { iMessageDraftContact?: string },
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -1010,12 +1086,11 @@ function buildPrompt(
     // Hard rule logged 2026-05-11 after the user asked for context-aware
     // drafts. Always read 5 to 10 prior messages before drafting a reply.
     // See feedback_context_before_drafting.md for the durable policy.
-    "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage or email REPLY to someone, you MUST first read the last 5 to 10 messages with that contact for context. Use scripts/imessage-thread.sh for iMessage threads. For email replies, ask the user to paste the most recent thread if you have no read tool wired up. Only after you have the context do you produce the draft. If the read tool returns an FDA error (exit 77), say so explicitly, draft from the user's description, and tell the user to follow docs/IMESSAGE-SETUP.md so future drafts can use real context. Do NOT silently invent prior conversation.",
+    "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage or email REPLY to someone, you MUST work from real prior thread context. For iMessage, the relay automatically fetches the last 5 to 10 messages with that contact and injects them into the relevant-context block before you run; look for an 'IMESSAGE CONTEXT FOR <name>' block and use it. Do not claim you lack iMessage access — the relay handles that path. If no iMessage context is injected, ask the user for the contact's phone or email rather than inventing prior conversation. For email replies, ask the user to paste the most recent thread if no context is supplied.",
     "Context cleanup rule (hard): never save the fetched context to a local file. The read helper streams JSON to stdout; consume it in your working memory only. Do NOT write context to ~/Projects/claude-telegram-relay/data/ or anywhere else on disk. If you find an existing cached context file from a prior session (e.g. data/mom-imessages.json), delete it after use rather than reusing it. The user's machine is the source of truth; re-read fresh from chat.db each time rather than caching.",
-    "Helper scripts available at /Users/williamregan/Projects/claude-telegram-relay/scripts/. You can invoke them through the Bash tool. None of them send messages; they only prepare drafts or read context.",
-    "- scripts/draft-imessage.sh RECIPIENT (body on stdin). Copies the draft to the clipboard and opens Messages.app on the thread with that recipient. Use this when the user asks to draft an iMessage. Example: `printf '%s' \"Hey Peggy ...\" | scripts/draft-imessage.sh +16043154583`. After running, tell the user: \"Draft is on your clipboard and Messages is open on the thread. Paste with Cmd+V and send when ready.\"",
+    "iMessage handling is deterministic in this runtime. The relay reads thread context before you run and places drafts after you run (using the marker pattern described below when relevant). Do NOT attempt to call scripts/imessage-thread.sh or scripts/draft-imessage.sh yourself; in headless mode you have no Bash approval surface and the call will surface as a confusing 'blocked for approval' message to the user. Just respond in text and use the markers when asked to place a draft.",
+    "For email drafts, you may use one helper via Bash:",
     "- scripts/draft-email.sh TO SUBJECT (body on stdin). Opens the user's default mail client with a new draft pre-filled. Example: `printf '%s' \"Body...\" | scripts/draft-email.sh wregan599@gmail.com \"Subject line\"`. After running, tell the user: \"Email draft is open in your mail client. Review and send when ready.\"",
-    "- scripts/imessage-thread.sh RECIPIENT [LIMIT]. Returns the last N messages with that contact as JSON. Use this BEFORE drafting an iMessage if you need real context. If the script exits with status 77, FDA is not granted; explain that the user must follow docs/IMESSAGE-SETUP.md to grant Full Disk Access to /Users/williamregan/.local/share/claude/versions/<latest>, then retry. Do not fall back to inventing context; draft from the user's description and say so explicitly.",
     // Durable writing-style rules for any outgoing draft the user will send
     // under his own name. Source of truth (verbatim) lives at
     //   ~/ObsidianVault/02-Cross-Project/writing_style_for_william.md
@@ -1036,6 +1111,17 @@ function buildPrompt(
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
+
+  if (opts?.iMessageDraftContact) {
+    const contact = opts.iMessageDraftContact;
+    parts.push(
+      `\niMessage placement (this message): the user wants the draft for ${contact} placed directly in Messages.app's compose box. Output the iMessage body — and only the body — between the literal marker lines below, each on its own line:`,
+      DRAFT_MARKER_OPEN,
+      "(the iMessage body)",
+      DRAFT_MARKER_CLOSE,
+      `You may add one short lead sentence before the markers (e.g. "Here's the draft for ${contact}:"). The relay will deterministically pbcopy the body and open Messages on the right thread once you respond. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval — there is no approval surface in this runtime.`,
+    );
+  }
 
   // Layer 1 of memory-tag leak fix: only ask Claude to emit tags when there is
   // a Supabase to store them. Layer 2 (response strip) is in the text handler.

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  detectIMessageWriteIntent,
   extractIMessageContextRequest,
   renderIMessageContext,
   type IMessageContextResult,
@@ -37,6 +38,30 @@ test("renders found context without telling Claude access failed", () => {
   expect(rendered).toContain("me: Can we book a clean?");
   expect(rendered).toContain("them: Sounds good.");
   expect(rendered).toContain("Do not claim you lacked iMessage access");
+});
+
+test("detects write-intent phrasings the user has used", () => {
+  expect(
+    detectIMessageWriteIntent(
+      "draft an iMessage to her (directly in the iMessage box) letting her know...",
+    ),
+  ).toBe(true);
+  expect(
+    detectIMessageWriteIntent("put it in the iMessage chatbox when I have it configured"),
+  ).toBe(true);
+  expect(detectIMessageWriteIntent("drop it into Messages")).toBe(true);
+  expect(detectIMessageWriteIntent("open Messages on her thread")).toBe(true);
+});
+
+test("does not flag plain draft requests with no placement signal", () => {
+  expect(
+    detectIMessageWriteIntent("draft an iMessage to Peggy saying thanks"),
+  ).toBe(false);
+  expect(
+    detectIMessageWriteIntent(
+      "go through my last 5 messages with Peggy and draft a reply",
+    ),
+  ).toBe(false);
 });
 
 test("renders empty lookup as contact mismatch, not FDA failure", () => {
