@@ -27,6 +27,11 @@ import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
 import { sanitizeClaudeResponse } from "./response-sanitize.ts";
 import {
+  extractIMessageContextRequest,
+  fetchIMessageContext,
+  renderIMessageContext,
+} from "./imessage-context.ts";
+import {
   clearUpdateMarker,
   loadSeenUpdateIds,
   logDecision,
@@ -384,9 +389,24 @@ function enqueue<T>(chatId: string, updateId: number, fn: () => Promise<T>): Pro
 // Plain-text recent-turns renderer (locked v1 decision: no XML in prompts).
 // short-term.ts also exports renderRecentTurns which emits XML; we use this
 // plain-text variant instead.
-function renderRecentTurnsPlain(turns: Turn[], cap = MAX_RECENT_TURNS_RENDERED): string {
+function isStaleIMessageAccessFailure(turn: Turn): boolean {
+  return (
+    turn.role === "assistant" &&
+    /cannot read your iMessage history|Full Disk Access for the relay's bun binary|drafting from your description, not from actual prior messages/i.test(turn.content)
+  );
+}
+
+function renderRecentTurnsPlain(
+  turns: Turn[],
+  cap = MAX_RECENT_TURNS_RENDERED,
+  opts?: { suppressStaleIMessageFailures?: boolean },
+): string {
   if (turns.length === 0) return "";
-  const trimmed = turns.slice(-cap);
+  const source = opts?.suppressStaleIMessageFailures
+    ? turns.filter((turn) => !isStaleIMessageAccessFailure(turn))
+    : turns;
+  const trimmed = source.slice(-cap);
+  if (trimmed.length === 0) return "";
   const lines = trimmed.map((t) => `${t.role}: ${t.content}`);
   return `RECENT CONVERSATION:\n${lines.join("\n")}`;
 }
@@ -562,14 +582,28 @@ bot.on("message:text", async (ctx) => {
     // Compose relevant-context block: recent conversation + indexed content
     // + supabase fallback (inert when Supabase is null).
     const indexedContent = renderFtsContext(ftsHits);
-    const recentBlock = renderRecentTurnsPlain(recentTurns);
+    const imessageContextRequest = extractIMessageContextRequest(text);
+    const imessageContextResult = imessageContextRequest
+      ? await fetchIMessageContext(PROJECT_ROOT, imessageContextRequest)
+      : null;
+    const imessageContext = imessageContextResult
+      ? renderIMessageContext(imessageContextResult)
+      : "";
+    if (imessageContextResult) {
+      console.log(
+        `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length}`,
+      );
+    }
+    const recentBlock = renderRecentTurnsPlain(recentTurns, MAX_RECENT_TURNS_RENDERED, {
+      suppressStaleIMessageFailures: Boolean(imessageContextResult),
+    });
     const [supabaseContext, memoryContext] = supabase
       ? await Promise.all([
           getRelevantContext(supabase, text),
           getMemoryContext(supabase),
         ])
       : ["", ""];
-    const combinedRelevant = [recentBlock, indexedContent, supabaseContext]
+    const combinedRelevant = [imessageContext, recentBlock, indexedContent, supabaseContext]
       .filter(Boolean)
       .join("\n\n");
 
@@ -644,6 +678,9 @@ bot.on("message:text", async (ctx) => {
       prompt_chars: enrichedPrompt.length,
       turn_buffer_size_before: turnBufferSizeBefore,
       timeout_kind: timeoutKind,
+      imessage_context_status: imessageContextResult?.status,
+      imessage_context_count: imessageContextResult?.messages.length,
+      imessage_context_contact: imessageContextResult?.request.contact,
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
@@ -960,7 +997,7 @@ function buildPrompt(
     // relay does not run from a terminal; granting Terminal/iTerm FDA does
     // nothing. The relay is launched by /usr/local/bin/bun via launchd, and
     // spawns the Claude CLI as a child process.
-    "Runtime context: you run as a macOS launchd service named com.claude.telegram-relay. You are NOT running inside Terminal, iTerm, Warp, or any GUI shell, and there is no Claude Code session attached. The relay binary is /usr/local/bin/bun and it spawns the Claude CLI at /Users/williamregan/.local/bin/claude. If macOS denies access to TCC-protected paths (~/Library/Messages, ~/Library/Mail, etc.), the relevant binary for Full Disk Access is the resolved bun executable, not Terminal. Do not tell the user to grant FDA to a terminal application; that will not work.",
+    "Runtime context: you run as a macOS launchd service named com.claude.telegram-relay. You are NOT running inside Terminal, iTerm, Warp, or any GUI shell, and there is no Claude Code session attached. The relay binary is /usr/local/bin/bun and it spawns the Claude CLI at /Users/williamregan/.local/bin/claude. If macOS denies access to TCC-protected paths (~/Library/Messages, ~/Library/Mail, etc.), the relevant Full Disk Access entry for Claude Bash helper reads is the resolved Claude CLI binary under /Users/williamregan/.local/share/claude/versions/<latest>, not Terminal. Do not tell the user to grant FDA to a terminal application; that will not work.",
     // Hard rule logged 2026-05-11 after the user asked for an iMessage and
     // an email draft. The bot must NEVER send; only draft. Full policy in
     // ~/.claude/projects/.../memory/feedback_drafts_never_send.md.

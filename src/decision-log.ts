@@ -32,6 +32,9 @@ export interface DecisionRecord {
   prompt_chars?: number;
   turn_buffer_size_before?: number;
   timeout_kind?: "fts" | "claude";
+  imessage_context_status?: "found" | "empty" | "fda_denied" | "error" | "timeout";
+  imessage_context_count?: number;
+  imessage_context_contact?: string;
   memory_tags_stripped?: number;
   wrapper_tags_stripped?: number;
   scaffolding_tags_stripped?: number;

@@ -28,11 +28,8 @@ fi
 RECIPIENT="$1"
 LIMIT="${2:-20}"
 
-# Normalize: strip a leading + so we can match both '+16045555555' and
-# '16045555555' shapes in chat_identifier.
-NAKED="${RECIPIENT#+}"
-
 DB="$HOME/Library/Messages/chat.db"
+CONTACTS_DB="$HOME/Library/Application Support/AddressBook/AddressBook-v22.abcddb"
 
 if [[ ! -r "$DB" ]]; then
   cat <<EOF >&2
@@ -42,6 +39,71 @@ docs/IMESSAGE-SETUP.md for the one-time setup.
 EOF
   exit 77
 fi
+
+sql_string() {
+  # SQLite single-quoted string escaping.
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+is_direct_identifier() {
+  [[ "$1" =~ ^[+0-9][0-9[:space:]().-]{6,}$ || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+}
+
+resolve_recipient() {
+  local input="$1"
+  if is_direct_identifier "$input"; then
+    printf "%s" "$input"
+    return 0
+  fi
+
+  local q
+  q="$(sql_string "$input")"
+
+  if [[ -r "$CONTACTS_DB" ]]; then
+    local contact
+    contact="$(sqlite3 -readonly "$CONTACTS_DB" <<SQL
+SELECT COALESCE(p.ZFULLNUMBER, e.ZADDRESS, '')
+FROM ZABCDRECORD r
+LEFT JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK OR p.Z22_OWNER = r.Z_PK
+LEFT JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK OR e.Z22_OWNER = r.Z_PK
+WHERE lower(COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'') || ' ' || COALESCE(r.ZNICKNAME,'') || ' ' || COALESCE(r.ZORGANIZATION,'')) LIKE '%' || lower('$q') || '%'
+  AND COALESCE(p.ZFULLNUMBER, e.ZADDRESS, '') != ''
+ORDER BY p.ZISPRIMARY DESC, e.ZISPRIMARY DESC, r.ZMODIFICATIONDATE DESC
+LIMIT 1;
+SQL
+)"
+    if [[ -n "$contact" ]]; then
+      printf "%s" "$contact"
+      return 0
+    fi
+  fi
+
+  # Fallback for contacts not saved in AddressBook: find a one-on-one thread
+  # where the name appears in message text, then use that chat identifier.
+  sqlite3 -readonly "$DB" <<SQL
+SELECT c.chat_identifier
+FROM message m
+JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+JOIN chat c ON c.ROWID = cmj.chat_id
+WHERE lower(m.text) LIKE '%' || lower('$q') || '%'
+  AND c.chat_identifier NOT LIKE 'chat%'
+GROUP BY c.ROWID
+ORDER BY MAX(m.date) DESC
+LIMIT 1;
+SQL
+}
+
+RESOLVED_RECIPIENT="$(resolve_recipient "$RECIPIENT")"
+if [[ -z "$RESOLVED_RECIPIENT" ]]; then
+  printf '[]\n'
+  exit 0
+fi
+
+# Normalize: strip a leading + so we can match both '+16045555555' and
+# '16045555555' shapes in chat_identifier.
+NAKED="${RESOLVED_RECIPIENT#+}"
+SQL_RECIPIENT="$(sql_string "$RESOLVED_RECIPIENT")"
+SQL_NAKED="$(sql_string "$NAKED")"
 
 sqlite3 -readonly "$DB" <<SQL
 .mode json
@@ -53,7 +115,7 @@ SELECT
 FROM message m
 JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
 JOIN chat c ON c.ROWID = cmj.chat_id
-WHERE c.chat_identifier IN ('$RECIPIENT', '+$NAKED', '$NAKED', '+1$NAKED')
+WHERE c.chat_identifier IN ('$SQL_RECIPIENT', '+$SQL_NAKED', '$SQL_NAKED', '+1$SQL_NAKED')
   AND m.text IS NOT NULL
   AND m.text != ''
 ORDER BY m.date DESC

@@ -158,6 +158,31 @@
   that runs `sqlite3` is a child of Claude, and macOS TCC permissions
   follow the process tree from the granted executable.
 
+## 2026-05-11 - Deterministic iMessage context prefetch
+
+- Full Disk Access was not the remaining Peggy failure. FDA was granted to
+  `/Users/williamregan/.local/share/claude/versions/2.1.138`, and
+  `scripts/imessage-thread.sh Peggy 2` exited 0. The actual helper returned
+  an empty result because Messages stores one-on-one chats as phone/email
+  identifiers, not contact display names.
+- Do not rely on Claude deciding to call `scripts/imessage-thread.sh` from a
+  prompt. The relay now detects iMessage-context draft requests itself,
+  fetches context before Claude runs, and injects the result into
+  `RELEVANT CONTEXT`.
+- If the user says a name such as "Peggy", resolve through Contacts first.
+  If that fails, fall back to a bounded Messages text search for that name
+  and use the matching one-on-one thread identifier. If no match exists, tell
+  Claude that FDA worked but the contact/thread did not match, and ask for
+  the phone/email instead of claiming a permissions failure.
+- Suppress stale assistant turns that say "I cannot read your iMessage
+  history" when a fresh iMessage context lookup runs. Otherwise the local
+  `RECENT CONVERSATION` buffer can poison the next reply after the underlying
+  permission or contact-resolution issue is fixed.
+- Keep the runtime FDA prompt aligned with `docs/IMESSAGE-SETUP.md`: for
+  Claude Bash helper reads, the relevant FDA entry is the resolved Claude CLI
+  binary under `~/.local/share/claude/versions/<latest>`, not the Terminal app
+  and not a stale "bun binary is missing FDA" message.
+
 ## 2026-05-11 - Strip Claude Code internal scaffolding tags from relay output
 
 - Live failure 2026-05-11T12:54:45Z: in response to "Okay, please draft an
