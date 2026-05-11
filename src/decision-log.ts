@@ -34,6 +34,7 @@ export interface DecisionRecord {
   timeout_kind?: "fts" | "claude";
   memory_tags_stripped?: number;
   wrapper_tags_stripped?: number;
+  scaffolding_tags_stripped?: number;
   prose_dashes_stripped?: number;
   response_chars?: number;
   catalog_response_used?: boolean;

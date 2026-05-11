@@ -64,22 +64,48 @@ export function stripProseDashes(text: string): { clean: string; stripped: numbe
   return { clean, stripped };
 }
 
+// Live failure 2026-05-11T12:54: in response to "Okay, please draft an email
+// to myself" the relay forwarded ~5.4 KB of internal Claude Code scaffolding
+// to Telegram. Three <system-reminder> blocks leaked: a /compact continuation
+// marker, a bash-escaping rule, and a full conversation summary including
+// file paths, technical context, and every prior user message in the thread.
+//
+// These are internal tokens Claude emits when confused about session
+// continuity. They are never appropriate user-facing content and must be
+// stripped before the response reaches Telegram.
+const SCAFFOLDING_TAGS = "system-reminder|command-name|command-message|command-args|local-command-stdout|local-command-stderr|user-prompt-submit-hook|tool-use|tool-result|function_calls|function_results";
+
+export function stripScaffoldingTags(text: string): { clean: string; stripped: number } {
+  let stripped = 0;
+  const unwrap = new RegExp(`<(${SCAFFOLDING_TAGS})>[\\s\\S]*?<\\/\\1>`, "gi");
+  const orphan = new RegExp(`<\\/?\\s*(${SCAFFOLDING_TAGS})\\s*\\/?>`, "gi");
+  const clean = text
+    .replace(unwrap, () => { stripped++; return ""; })
+    .replace(orphan, () => { stripped++; return ""; })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { clean, stripped };
+}
+
 export interface SanitizedClaudeResponse {
   clean: string;
   memoryTagsStripped: number;
   wrapperTagsStripped: number;
+  scaffoldingTagsStripped: number;
   proseDashesStripped: number;
 }
 
 export function sanitizeClaudeResponse(text: string): SanitizedClaudeResponse {
   const memResult = stripMemoryTags(text);
   const wrapResult = stripWrapperTags(memResult.clean);
-  const dashResult = stripProseDashes(wrapResult.clean);
+  const scaffoldResult = stripScaffoldingTags(wrapResult.clean);
+  const dashResult = stripProseDashes(scaffoldResult.clean);
 
   return {
     clean: dashResult.clean,
     memoryTagsStripped: memResult.stripped,
     wrapperTagsStripped: wrapResult.stripped,
+    scaffoldingTagsStripped: scaffoldResult.stripped,
     proseDashesStripped: dashResult.stripped,
   };
 }

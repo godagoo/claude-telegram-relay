@@ -3,6 +3,7 @@ import {
   sanitizeClaudeResponse,
   stripMemoryTags,
   stripProseDashes,
+  stripScaffoldingTags,
   stripWrapperTags,
 } from "./response-sanitize";
 
@@ -69,4 +70,54 @@ test("sanitizes memory tags, wrapper tags, and prose dashes in one pass", () => 
   expect(r.memoryTagsStripped).toBe(1);
   expect(r.wrapperTagsStripped).toBeGreaterThanOrEqual(1);
   expect(r.proseDashesStripped).toBe(1);
+});
+
+// Live failure 2026-05-11T12:54:45: in response to "draft an email to myself"
+// the relay forwarded ~5.4 KB of Claude Code internal scaffolding to Telegram:
+// three <system-reminder> blocks containing a /compact continuation marker, a
+// bash-escaping rule, and a full conversation summary. Strip these aggressively.
+test("strips <system-reminder> blocks with body", () => {
+  const r = stripScaffoldingTags(
+    "Below is your message.\n\n<system-reminder>internal scaffolding leak</system-reminder>",
+  );
+  expect(r.clean).toBe("Below is your message.");
+  expect(r.stripped).toBe(1);
+});
+
+test("strips multiple scaffolding tags in one response", () => {
+  const r = stripScaffoldingTags(
+    "Hello.\n<system-reminder>a</system-reminder>\n<command-name>x</command-name>\n<local-command-stdout>y</local-command-stdout>\nWorld.",
+  );
+  expect(r.clean).toBe("Hello.\n\n\n\nWorld.".replace(/\n{3,}/g, "\n\n"));
+  expect(r.stripped).toBe(3);
+});
+
+test("strips multiline system-reminder containing nested structure", () => {
+  const r = stripScaffoldingTags(
+    "Result:\n<system-reminder>\nThis session is being continued from a previous conversation.\n\nKey context:\n- thing 1\n- thing 2\n</system-reminder>\nClean reply.",
+  );
+  expect(r.clean).toBe("Result:\n\nClean reply.");
+  expect(r.stripped).toBe(1);
+});
+
+test("strips orphan opening scaffolding tag", () => {
+  const r = stripScaffoldingTags("real content <system-reminder>");
+  expect(r.clean).toBe("real content");
+  expect(r.stripped).toBe(1);
+});
+
+test("sanitizeClaudeResponse strips scaffolding and reports the count", () => {
+  const leaked = [
+    "Below is your message.",
+    "",
+    "<system-reminder>internal compact continuation marker</system-reminder>",
+    "",
+    "<system-reminder>",
+    "This session is being continued from a previous conversation.",
+    "Key context: file paths, user details, technical notes.",
+    "</system-reminder>",
+  ].join("\n");
+  const r = sanitizeClaudeResponse(leaked);
+  expect(r.clean).toBe("Below is your message.");
+  expect(r.scaffoldingTagsStripped).toBe(2);
 });

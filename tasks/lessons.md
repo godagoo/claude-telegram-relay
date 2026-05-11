@@ -112,6 +112,32 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-11 - Strip Claude Code internal scaffolding tags from relay output
+
+- Live failure 2026-05-11T12:54:45Z: in response to "Okay, please draft an
+  email to myself ..." the relay forwarded roughly 5.4 KB of Claude Code
+  internal scaffolding to Telegram. Three `<system-reminder>` blocks leaked:
+  a `/compact` continuation marker, a bash-escaping rule about `$(...)`
+  substitutions, and a full conversation summary including file paths,
+  technical context, and every prior user message in the thread.
+- Decision-log evidence: `response_chars: 5381`, all four sanitizer counts
+  zero (wrapper/memory/prose-dash detectors did not match these tags).
+- Root cause: `stripWrapperTags` only handled
+  `<response|answer|reply|message|output|result>`. The scaffolding tags
+  Claude sometimes emits when confused about session continuity
+  (`<system-reminder>`, `<command-name>`, `<local-command-stdout>` and
+  similar) were not in the strip list.
+- Fix: new `stripScaffoldingTags` in `response-sanitize.ts` matches both
+  paired `<tag>...</tag>` blocks and orphan tags for the family
+  `system-reminder|command-name|command-message|command-args|local-command-stdout|local-command-stderr|user-prompt-submit-hook|tool-use|tool-result|function_calls|function_results`.
+  Wired into `sanitizeClaudeResponse` with its own counter and decision-log
+  field `scaffolding_tags_stripped`. The post-Claude pipeline logs
+  `[scaffolding-leak] removed N internal scaffolding tag(s)` as a stderr
+  warning and resets the Claude session if resume is enabled.
+- Operational cleanup: truncated the chat turns buffer to drop the 5381-char
+  poisoned assistant message so it could not feed back into
+  `RECENT CONVERSATION:` on the next turn.
+
 ## 2026-05-11 - Runtime context + actionable timeout fallback
 
 - Telegram screenshot 2026-05-11 showed the bot repeatedly telling the user
