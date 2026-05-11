@@ -414,6 +414,36 @@ function ensureSendableResponse(text: string, fallback: string): string {
   return trimmed.length > 0 ? trimmed : fallback;
 }
 
+// Concrete reframes for the 90s timeout. "Try a narrower request" was flagged
+// as unactionable (see feedback_timeout_message_unhelpful.md). Pick suggestions
+// that match the shape of the user's question so the next attempt has a path.
+function buildTimeoutFallback(userMessage: string): string {
+  const m = userMessage.toLowerCase();
+  const sec = Math.round(CLAUDE_TIMEOUT_MS / 1000);
+  const opener = `That ran past ${sec} seconds so I stopped it.`;
+
+  const suggestions: string[] = [];
+  const looksBroad = /\b(everything|all|whole|optimize|improve|best (way|pathway|approach)|tell me about|explain (your|the))\b/.test(m);
+  const looksMultiPart = / and | plus | also |\?.+\?/.test(userMessage) || userMessage.split("?").length > 2;
+  const looksTextbook = /\b(barash|miller|cote|chestnut|fleisher|stoelting|textbook|anesthesia)\b/.test(m);
+
+  if (looksTextbook) {
+    suggestions.push("Name the book and a single topic, e.g. \"In Miller, what's the indication for an arterial line?\"");
+  }
+  if (looksMultiPart) {
+    suggestions.push("Split the question into two shorter messages.");
+  }
+  if (looksBroad) {
+    suggestions.push("Pick one specific subtopic instead of the whole area.");
+  }
+  if (suggestions.length === 0) {
+    suggestions.push("Try one specific subtopic, name a source, or split it into two messages.");
+  }
+
+  const bullets = suggestions.map((s) => `• ${s}`).join("\n");
+  return `${opener}\n\nTry one of:\n${bullets}`;
+}
+
 interface PostClaudeResult {
   text: string;
   memoryTagsStripped: number;
@@ -554,7 +584,7 @@ bot.on("message:text", async (ctx) => {
         errorMsg = err instanceof Error ? err.message : String(err);
         if (errorMsg.startsWith("claude_timeout_")) {
           timeoutKind = "claude";
-          assistantText = "Sorry, that took too long and I stopped it. Try a narrower request.";
+          assistantText = buildTimeoutFallback(text);
         } else {
           assistantText = "Sorry, something went wrong on my end. Try again.";
         }
@@ -881,6 +911,11 @@ function buildPrompt(
     "You are a personal AI assistant responding via Telegram.",
     "Default to concise, scannable replies: lead with the answer, prefer short bullets for multi-part technical or factual responses, and avoid long paragraphs unless the user explicitly asks for depth or nuance. Match the user's tone; this is a conversational chat, not a report.",
     "Reply in plain text. Never wrap your response in XML or HTML tags such as <response>, </response>, <answer>, or <reply>. If you have nothing useful to say, ask a clarifying question instead of returning an empty or tag-only reply.",
+    // Runtime context so the bot stops giving wrong macOS FDA advice. The
+    // relay does not run from a terminal; granting Terminal/iTerm FDA does
+    // nothing. The relay is launched by /usr/local/bin/bun via launchd, and
+    // spawns the Claude CLI as a child process.
+    "Runtime context: you run as a macOS launchd service named com.claude.telegram-relay. You are NOT running inside Terminal, iTerm, Warp, or any GUI shell, and there is no Claude Code session attached. The relay binary is /usr/local/bin/bun and it spawns the Claude CLI at /Users/williamregan/.local/bin/claude. If macOS denies access to TCC-protected paths (~/Library/Messages, ~/Library/Mail, etc.), the relevant binary for Full Disk Access is the resolved bun executable, not Terminal. Do not tell the user to grant FDA to a terminal application; that will not work.",
     // Durable writing-style rules for any outgoing draft the user will send
     // under his own name. Source of truth (verbatim) lives at
     //   ~/ObsidianVault/02-Cross-Project/writing_style_for_william.md

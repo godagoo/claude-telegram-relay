@@ -112,6 +112,31 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-11 - Runtime context + actionable timeout fallback
+
+- Telegram screenshot 2026-05-11 showed the bot repeatedly telling the user
+  to grant macOS Full Disk Access to "the terminal app you launched Claude
+  Code from". The relay does not run from a terminal at all. It is spawned
+  by launchd as `com.claude.telegram-relay`, and the binaries that would
+  need TCC permissions are `/usr/local/bin/bun` and the Claude CLI at
+  `~/.local/bin/claude`. The user followed the wrong advice, restarted,
+  and was still blocked.
+- Fix: added a Runtime context line to the system prompt in
+  `relay.ts:buildPrompt` stating exactly that. The bot now refuses to
+  recommend granting FDA to a terminal app.
+- Same screenshot showed the existing 90s timeout fallback "Try a narrower
+  request" failed the user (memory `feedback_timeout_message_unhelpful.md`).
+  Replaced the static string with `buildTimeoutFallback(userMessage)` which
+  inspects the message for broad/multi-part/textbook patterns and returns
+  one to three concrete reframes:
+  - textbook signals: "Name the book and a single topic, e.g. ..."
+  - multi-part signals: "Split the question into two shorter messages"
+  - broad signals: "Pick one specific subtopic instead of the whole area"
+  - fallback when none match: a single line covering all three tactics
+- Both changes are scoped to the text handler. Voice, image, and document
+  paths surface the same Claude timeout via their generic catch and could
+  use the same helper if it matters.
+
 ## 2026-05-10 - Writing-style rules baked into the relay system prompt
 
 - Cross-project rule set (`~/ObsidianVault/02-Cross-Project/writing_style_for_william.md`)
