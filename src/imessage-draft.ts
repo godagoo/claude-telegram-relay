@@ -28,6 +28,18 @@ export type IMessageDraftStatus =
 
 export interface PlaceDraftResult {
   ok: boolean;
+  /**
+   * "pasted" → body is in the Messages compose field via the native
+   * sms:&body= URL path.
+   * "clipboard_only" → body is on the clipboard and Messages is open on the
+   * thread, but URL body prefill failed. Both are usable; the relay tells the
+   * user which one happened so it never claims compose-box
+   * placement that didn't occur.
+   */
+  mode?: "pasted" | "clipboard_only";
+  /** Helper's reason string when mode is clipboard_only. Diagnostic only. */
+  reason?: string;
+  /** Hard-failure error message when ok is false. */
   error?: string;
 }
 
@@ -92,8 +104,9 @@ export async function placeIMessageDraft(
   });
 
   try {
-    const [stderr, code] = await Promise.race([
+    const [stdout, stderr, code] = await Promise.race([
       Promise.all([
+        new Response(proc.stdout).text(),
         new Response(proc.stderr).text(),
         proc.exited,
       ]),
@@ -107,7 +120,27 @@ export async function placeIMessageDraft(
         error: stderr.trim() || `draft helper exited ${code}`,
       };
     }
-    return { ok: true };
+
+    let envelope: { ok?: boolean; mode?: string; reason?: string };
+    try {
+      envelope = JSON.parse(stdout.trim() || "{}");
+    } catch {
+      return {
+        ok: false,
+        error: `helper stdout was not JSON: ${stdout.slice(0, 120)}`,
+      };
+    }
+
+    if (envelope.ok && envelope.mode === "pasted") {
+      return { ok: true, mode: "pasted" };
+    }
+    if (envelope.ok && envelope.mode === "clipboard_only") {
+      return { ok: true, mode: "clipboard_only", reason: envelope.reason };
+    }
+    return {
+      ok: false,
+      error: envelope.reason ?? "unknown helper outcome",
+    };
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);
     return {

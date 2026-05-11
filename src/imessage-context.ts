@@ -40,9 +40,8 @@ export interface IMessageContextResult {
 
 /**
  * Detects whether the user wants the draft *placed* into Messages.app's
- * compose box (as opposed to just receiving the text in Telegram for manual
- * copy/paste). When true, the relay runs scripts/draft-imessage.sh after
- * Claude returns and replaces the marker block with a confirmation line.
+ * compose box. Exported for unit tests; the relay reads `wantsPlacement` off
+ * `extractIMessageDraftRequest` instead of calling this directly.
  */
 export function detectIMessageWriteIntent(message: string): boolean {
   const m = message.toLowerCase();
@@ -57,13 +56,28 @@ export function detectIMessageWriteIntent(message: string): boolean {
   );
 }
 
-function isIMessageDraftRequest(message: string): boolean {
+/**
+ * Detects when the user explicitly does NOT want the draft placed in
+ * Messages.app — e.g. "just show me the text", "in Telegram only", "don't
+ * open Messages". Used to opt out of the default placement behavior.
+ */
+function detectPlacementSuppression(message: string): boolean {
   const m = message.toLowerCase();
   return (
-    /\b(imessage|text messages?|texts?|sms)\b/.test(m) &&
-    /\b(draft|write|compose)\b/.test(m) &&
-    /\b(last|recent|previous|prior|context|go through|look through|read)\b/.test(m)
+    /\b(just|only)\s+(?:give|show|return|send)\s+(?:me\s+)?(?:the\s+)?(?:text|draft|body)\b/.test(m) ||
+    /\bin\s+telegram\s+only\b/.test(m) ||
+    /\bdon'?t\s+(?:open|use|launch)\s+messages\b/.test(m) ||
+    /\bno\s+placement\b/.test(m)
   );
+}
+
+const DRAFT_VERB_RE = /\b(draft|write|compose|send|shoot|text|message)\b/;
+const MESSAGE_TYPE_RE = /\b(imessage|imessages|text\s+messages?|texts?|sms|message|messages|chat\s+message)\b/;
+const CONTEXT_SIGNAL_RE = /\b(last|recent|previous|prior|context|history|go\s+through|look\s+through|read\s+(?:my|our|the))\b/;
+
+function hasDraftVerbAndType(message: string): boolean {
+  const m = message.toLowerCase();
+  return DRAFT_VERB_RE.test(m) && MESSAGE_TYPE_RE.test(m);
 }
 
 function parseLimit(message: string): number {
@@ -87,10 +101,35 @@ function cleanContact(raw: string): string {
     .trim();
 }
 
-export function extractIMessageContextRequest(
+/**
+ * Higher-level intent extracted from a user message that asks the bot to
+ * draft an iMessage/text/SMS. Captures three independent intents:
+ *
+ *   - `contact`        — the named recipient (resolved later by the helper).
+ *   - `wantsContext`   — does the user want recent thread history fetched
+ *                        and injected into the prompt? Signals: "last 5",
+ *                        "recent", "context", "go through my messages".
+ *   - `wantsPlacement` — should the body land in Messages.app's compose box
+ *                        after Claude returns? Defaults to TRUE for any
+ *                        explicit message-type draft and only goes false on
+ *                        explicit suppression signals ("just give me the
+ *                        text", "in Telegram only", "don't open Messages").
+ *
+ * Decoupling these lets the relay handle the common case ("draft a message
+ * to William saying hey wuddup") without requiring the user to repeat the
+ * "directly in the iMessage box" phrasing every time.
+ */
+export interface IMessageDraftRequest {
+  contact: string;
+  wantsContext: boolean;
+  contextLimit: number;
+  wantsPlacement: boolean;
+}
+
+export function extractIMessageDraftRequest(
   message: string,
-): IMessageContextRequest | null {
-  if (!isIMessageDraftRequest(message)) return null;
+): IMessageDraftRequest | null {
+  if (!hasDraftVerbAndType(message)) return null;
 
   const explicit = message.match(
     /\b(?:with|to)\s+([+()\-\d\s]{7,}|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/i,
@@ -100,9 +139,15 @@ export function extractIMessageContextRequest(
   const contact = cleanContact(explicit[1]);
   if (!contact) return null;
 
+  const m = message.toLowerCase();
+  const wantsContext = CONTEXT_SIGNAL_RE.test(m);
+  const wantsPlacement = !detectPlacementSuppression(message);
+
   return {
     contact,
-    limit: parseLimit(message),
+    wantsContext,
+    contextLimit: parseLimit(message),
+    wantsPlacement,
   };
 }
 

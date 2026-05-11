@@ -183,6 +183,69 @@
   binary under `~/.local/share/claude/versions/<latest>`, not the Terminal app
   and not a stale "bun binary is missing FDA" message.
 
+## 2026-05-11 - Broaden draft detection; decouple context fetch from placement
+
+- Live regression 2026-05-11 ~17:53Z right after the autopaste worked for
+  Peggy: "Draft a message to William (me) saying hey wuddup" produced text
+  in Telegram with no compose-box placement. User: "It should AUTOMATICALLY
+  draft it in the imessage draft box like you did for peggy."
+- Root cause: `isIMessageDraftRequest` required all three of (a) the literal
+  token `imessage|text messages?|texts?|sms`, (b) a draft verb, and (c) a
+  context keyword like `last/recent/context`. The user wrote `message` (not
+  `imessage`) and gave the body verbatim (no context request). One AND two
+  failed, so `extractIMessageContextRequest` returned null, `wantsIMessage
+  Placement` was false, and no marker/post-action ran.
+- The function name was also misleading: it conflated three independent
+  intents. Replaced with `extractIMessageDraftRequest` returning explicit
+  `wantsContext` and `wantsPlacement` flags. Trigger keywords broadened to
+  include `message|messages|chat message` in the type set and
+  `text|message|shoot|send` in the verb set. Contact extraction is now the
+  required gate, not the context keyword.
+- Placement now defaults to TRUE for any detected draft request. Explicit
+  suppression signals (`just give me the text`, `in Telegram only`,
+  `don't open Messages`) opt out. The user no longer has to repeat
+  "directly in the iMessage box" each time.
+- The prefetch helper still runs whenever the intent is extracted, so the
+  relay always has a `resolvedRecipient` ready for placement. But the
+  `IMESSAGE CONTEXT FOR ...` block is only rendered when `wantsContext` is
+  true, which keeps short verbatim drafts ("hey wuddup") from inflating the
+  prompt with 10 messages of unused thread history.
+- Known follow-up: self-recipient ("to me", "to William (me)") relies on
+  the AddressBook having an entry for the user. If it doesn't, the helper
+  falls back to a Messages text search which won't find a self-thread.
+  Cleanest fix later: add a `USER_IMESSAGE_HANDLE` env and special-case
+  `\((me|myself)\)` in the contact extractor.
+
+## 2026-05-11 - Compose-box autopaste vs clipboard fallback
+
+- Follow-up live failure 2026-05-11T20:29Z: the helper reported
+  `imessage_draft_mode: "pasted"`, but the user did not see the draft where
+  expected. Root cause: `osascript` success only proves macOS accepted a
+  Cmd+V keystroke; it does not prove the compose field received the paste.
+  Blind UI keystrokes are not a reliable correctness signal.
+- Better fix: use Messages' native URL body prefill:
+  `sms:<recipient>&body=<url-encoded-body>`. A manual local test opened the
+  self thread with `codex-test-do-not-send` visibly in the Mac compose box
+  without sending. This avoids Accessibility, System Events, and focus races.
+- Helper now emits a JSON envelope on stdout instead of free text:
+  `{"ok":true,"mode":"pasted","recipient":"..."}` when paste succeeded, or
+  `{"ok":true,"mode":"clipboard_only","recipient":"...","reason":"..."}`
+  when native URL body prefill failed and the helper fell back to clipboard
+  plus opening the thread. Body is never printed. The relay parses the
+  envelope and tells the user the actual placement state — never claims "in
+  the compose box" when only the clipboard succeeded.
+- Telemetry: `imessage_draft_mode: "pasted" | "clipboard_only"` added to
+  `DecisionRecord` so the JSONL distinguishes the two success modes without
+  scraping the reply text. `imessage_draft_status` remains the coarse
+  success/failure field.
+- The Messages helper's message-text contact fallback is unsafe for short
+  relationship aliases. Live evidence: `mom` resolved to William's own
+  one-on-one thread because the word appeared in recent message text, so the
+  relay claimed it placed a draft for mom while addressing the wrong thread.
+  Guard that fallback for short and relationship-style inputs (`mom`, `dad`,
+  `me`, `wife`, etc.). If AddressBook cannot resolve those aliases, fail
+  closed and ask for a phone/email instead of guessing.
+
 ## 2026-05-11 - Deterministic iMessage draft placement (mirror of prefetch)
 
 - Live failure 2026-05-11T15:20:59Z: prefetch worked (10 Peggy messages

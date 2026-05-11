@@ -55,6 +55,25 @@ is_direct_identifier() {
   [[ "$1" =~ ^[+0-9][0-9[:space:]().-]{6,}$ || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
 }
 
+allow_message_text_fallback() {
+  local input_lc
+  input_lc="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
+
+  # The message-text fallback is inherently weak: it finds a thread where the
+  # word appeared in message text, not a contact whose name is that word. Keep
+  # it away from short or relationship-style aliases like "mom", which can
+  # otherwise resolve to the wrong one-on-one thread.
+  if [[ ${#input_lc} -lt 4 ]]; then
+    return 1
+  fi
+
+  if [[ "$input_lc" =~ (^|[^[:alpha:]])(me|myself|mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)([^[:alpha:]]|$) ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
 resolve_recipient() {
   local input="$1"
   if is_direct_identifier "$input"; then
@@ -84,8 +103,14 @@ SQL
     fi
   fi
 
-  # Fallback for contacts not saved in AddressBook: find a one-on-one thread
-  # where the name appears in message text, then use that chat identifier.
+  if ! allow_message_text_fallback "$input"; then
+    return 0
+  fi
+
+  # Last-resort fallback for contacts not saved in AddressBook: find a
+  # one-on-one thread where the specific name appears in message text, then
+  # use that chat identifier. Do not use this for short or relationship-style
+  # aliases; those are too ambiguous to place a draft safely.
   sqlite3 -readonly "$DB" <<SQL
 SELECT c.chat_identifier
 FROM message m

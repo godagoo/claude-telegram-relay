@@ -42,6 +42,7 @@ export interface DecisionRecord {
     | "no_recipient"
     | "helper_failed"
     | "no_intent";
+  imessage_draft_mode?: "pasted" | "clipboard_only";
   memory_tags_stripped?: number;
   wrapper_tags_stripped?: number;
   scaffolding_tags_stripped?: number;

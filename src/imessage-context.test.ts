@@ -1,26 +1,82 @@
 import { expect, test } from "bun:test";
 import {
   detectIMessageWriteIntent,
-  extractIMessageContextRequest,
+  extractIMessageDraftRequest,
   renderIMessageContext,
   type IMessageContextResult,
 } from "./imessage-context";
 
-test("extracts contact and upper bound from iMessage context draft request", () => {
+test("extracts contact, context flag, and placement flag from a full context+placement request", () => {
   expect(
-    extractIMessageContextRequest(
-      "Go through my last 5-10 text messages with Peggy for context and draft an iMessage to her",
+    extractIMessageDraftRequest(
+      "Go through my last 5-10 text messages with Peggy for context and draft an iMessage to her (directly in the iMessage box)",
     ),
   ).toEqual({
     contact: "Peggy",
-    limit: 10,
+    wantsContext: true,
+    contextLimit: 10,
+    wantsPlacement: true,
   });
 });
 
-test("ignores ordinary draft requests without a context request", () => {
+test("plain 'Draft a message to William saying hey wuddup' still triggers placement", () => {
   expect(
-    extractIMessageContextRequest("Draft an iMessage to Peggy saying thanks"),
+    extractIMessageDraftRequest(
+      "Draft a message to William (me) saying hey wuddup",
+    ),
+  ).toEqual({
+    contact: "William",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+});
+
+test("'iMessage' keyword still works even without explicit placement phrasing", () => {
+  expect(
+    extractIMessageDraftRequest("Draft an iMessage to Peggy saying thanks"),
+  ).toEqual({
+    contact: "Peggy",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+});
+
+test("returns null when there is no draft verb", () => {
+  expect(
+    extractIMessageDraftRequest("Tell me about Peggy's cleaning business"),
   ).toBeNull();
+});
+
+test("returns null when there is no contact", () => {
+  expect(
+    extractIMessageDraftRequest("Draft a message saying hey"),
+  ).toBeNull();
+});
+
+test("suppresses placement when the user asks for Telegram-only output", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Just show me the text of a message to Peggy — don't open Messages",
+    ),
+  ).toMatchObject({
+    contact: "Peggy",
+    wantsPlacement: false,
+  });
+});
+
+test("detectIMessageWriteIntent still recognizes explicit placement phrasings", () => {
+  expect(
+    detectIMessageWriteIntent(
+      "draft an iMessage to her (directly in the iMessage box) letting her know...",
+    ),
+  ).toBe(true);
+  expect(
+    detectIMessageWriteIntent("put it in the iMessage chatbox when I have it configured"),
+  ).toBe(true);
+  expect(detectIMessageWriteIntent("drop it into Messages")).toBe(true);
+  expect(detectIMessageWriteIntent("open Messages on her thread")).toBe(true);
 });
 
 test("renders found context without telling Claude access failed", () => {
@@ -38,30 +94,6 @@ test("renders found context without telling Claude access failed", () => {
   expect(rendered).toContain("me: Can we book a clean?");
   expect(rendered).toContain("them: Sounds good.");
   expect(rendered).toContain("Do not claim you lacked iMessage access");
-});
-
-test("detects write-intent phrasings the user has used", () => {
-  expect(
-    detectIMessageWriteIntent(
-      "draft an iMessage to her (directly in the iMessage box) letting her know...",
-    ),
-  ).toBe(true);
-  expect(
-    detectIMessageWriteIntent("put it in the iMessage chatbox when I have it configured"),
-  ).toBe(true);
-  expect(detectIMessageWriteIntent("drop it into Messages")).toBe(true);
-  expect(detectIMessageWriteIntent("open Messages on her thread")).toBe(true);
-});
-
-test("does not flag plain draft requests with no placement signal", () => {
-  expect(
-    detectIMessageWriteIntent("draft an iMessage to Peggy saying thanks"),
-  ).toBe(false);
-  expect(
-    detectIMessageWriteIntent(
-      "go through my last 5 messages with Peggy and draft a reply",
-    ),
-  ).toBe(false);
 });
 
 test("renders empty lookup as contact mismatch, not FDA failure", () => {

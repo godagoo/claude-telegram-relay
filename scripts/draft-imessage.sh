@@ -1,31 +1,35 @@
 #!/usr/bin/env bash
-# draft-imessage.sh — drop an iMessage draft into the Messages.app compose
-# surface without sending it. Reads the draft body from stdin and the
-# recipient from $1.
+# draft-imessage.sh — place an iMessage draft into Messages.app's compose
+# surface without sending it. Reads the body from stdin and the recipient
+# from $1.
 #
-# Usage:
-#   echo "Hey Peggy ..." | scripts/draft-imessage.sh +16043154583
-#   echo "Hi mom" | scripts/draft-imessage.sh mom@icloud.com
+# Behavior:
+#   1. Body → clipboard via pbcopy.
+#   2. open sms:RECIPIENT&body=ENCODED_BODY — Messages opens a compose
+#      draft for that recipient with the body prefilled. This avoids blind
+#      Cmd+V UI scripting and does not require Accessibility.
+#   3. If the URL open fails, fall back to clipboard + imessage:// thread
+#      open and report clipboard_only mode.
 #
-# Mechanism:
-#   1. Read body from stdin and copy to the macOS clipboard via pbcopy.
-#   2. Open the Messages conversation with the given recipient via the
-#      imessage:// URL scheme. macOS focuses Messages on the right thread.
-#   3. Print a one-line instruction telling the user to paste (Cmd+V) and
-#      review before sending. NEVER sends the message.
+# Output: a single JSON envelope on stdout. Body content is NEVER printed.
+#   {"ok":true,"mode":"pasted","recipient":"+15196816391"}
+#   {"ok":true,"mode":"clipboard_only","recipient":"+15196816391","reason":"..."}
+#   {"ok":false,"recipient":"...","reason":"..."}
 #
-# Why this design:
-#   - No Full Disk Access required (clipboard + open are unrestricted).
-#   - No Automation/Accessibility permission required.
-#   - Honors the hard rule that the bot never sends; user always reviews
-#     and sends manually.
+# Exit code:
+#   0  — pasted or clipboard_only (both are usable)
+#   64 — usage error (missing recipient)
+#   65 — empty body on stdin
+#   66 — pbcopy failed
+#   67 — open imessage:// failed
 #
-# See: docs/IMESSAGE-SETUP.md for the read-context path which DOES need FDA.
+# Hard rule: NEVER sends. This script never presses Return/Enter.
 
-set -euo pipefail
+set -uo pipefail
 
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 RECIPIENT (phone like +16043154583 or email)" >&2
+  printf '{"ok":false,"reason":"usage"}\n'
   exit 64
 fi
 
@@ -34,16 +38,42 @@ BODY="$(cat)"
 
 if [[ -z "$BODY" ]]; then
   echo "error: empty draft body on stdin" >&2
+  printf '{"ok":false,"recipient":"%s","reason":"empty_body"}\n' "$RECIPIENT"
   exit 65
 fi
 
-printf '%s' "$BODY" | pbcopy
+if ! printf '%s' "$BODY" | pbcopy; then
+  printf '{"ok":false,"recipient":"%s","reason":"pbcopy_failed"}\n' "$RECIPIENT"
+  exit 66
+fi
 
-# imessage:// URL handles both phone numbers and emails. Phone numbers should
-# include the country code, e.g. +16043154583.
-open "imessage://$RECIPIENT"
+if ! command -v python3 >/dev/null 2>&1; then
+  if open "imessage://$RECIPIENT"; then
+    printf '{"ok":true,"mode":"clipboard_only","recipient":"%s","reason":"python3_missing_for_url_encoding"}\n' "$RECIPIENT"
+    exit 0
+  fi
+  printf '{"ok":false,"recipient":"%s","reason":"open_failed"}\n' "$RECIPIENT"
+  exit 67
+fi
 
-cat <<EOF
-Draft copied to clipboard. Messages.app is open on the thread with $RECIPIENT.
-Paste with Cmd+V, review, then send manually. The relay will not send for you.
-EOF
+COMPOSE_URL="$(
+  RECIPIENT="$RECIPIENT" BODY="$BODY" python3 - <<'PY'
+import os
+from urllib.parse import quote
+
+recipient = os.environ["RECIPIENT"]
+body = os.environ["BODY"]
+print(f"sms:{quote(recipient, safe='+@._-')}&body={quote(body, safe='')}")
+PY
+)"
+
+if open "$COMPOSE_URL"; then
+  printf '{"ok":true,"mode":"pasted","recipient":"%s"}\n' "$RECIPIENT"
+else
+  if open "imessage://$RECIPIENT"; then
+    printf '{"ok":true,"mode":"clipboard_only","recipient":"%s","reason":"sms_body_url_open_failed"}\n' "$RECIPIENT"
+    exit 0
+  fi
+  printf '{"ok":false,"recipient":"%s","reason":"open_failed"}\n' "$RECIPIENT"
+  exit 67
+fi

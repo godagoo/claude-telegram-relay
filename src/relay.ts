@@ -27,8 +27,7 @@ import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
 import { sanitizeClaudeResponse } from "./response-sanitize.ts";
 import {
-  detectIMessageWriteIntent,
-  extractIMessageContextRequest,
+  extractIMessageDraftRequest,
   fetchIMessageContext,
   renderIMessageContext,
 } from "./imessage-context.ts";
@@ -591,18 +590,27 @@ bot.on("message:text", async (ctx) => {
     // Compose relevant-context block: recent conversation + indexed content
     // + supabase fallback (inert when Supabase is null).
     const indexedContent = renderFtsContext(ftsHits);
-    const imessageContextRequest = extractIMessageContextRequest(text);
-    const imessageContextResult = imessageContextRequest
-      ? await fetchIMessageContext(PROJECT_ROOT, imessageContextRequest)
+    // Higher-level intent: contact + whether the user wants prior thread
+    // context fetched + whether the draft should be placed in Messages.app.
+    // Placement defaults to TRUE for any iMessage/text/SMS draft so the user
+    // doesn't have to repeat "directly in the iMessage box" each time.
+    const draftRequest = extractIMessageDraftRequest(text);
+    const imessageContextResult = draftRequest
+      ? await fetchIMessageContext(PROJECT_ROOT, {
+          contact: draftRequest.contact,
+          limit: draftRequest.contextLimit,
+        })
       : null;
-    const wantsIMessagePlacement =
-      imessageContextRequest !== null && detectIMessageWriteIntent(text);
-    const imessageContext = imessageContextResult
+    const wantsIMessagePlacement = draftRequest?.wantsPlacement ?? false;
+    // Only render the IMESSAGE CONTEXT block when the user explicitly asked
+    // for prior context. The helper still ran (cheap) so we have the
+    // resolved recipient for placement.
+    const imessageContext = (imessageContextResult && draftRequest?.wantsContext)
       ? renderIMessageContext(imessageContextResult)
       : "";
-    if (imessageContextResult) {
+    if (imessageContextResult && draftRequest) {
       console.log(
-        `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length} placement=${wantsIMessagePlacement}`,
+        `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length} render_context=${draftRequest.wantsContext} placement=${wantsIMessagePlacement}`,
       );
     }
     const recentBlock = renderRecentTurnsPlain(recentTurns, MAX_RECENT_TURNS_RENDERED, {
@@ -621,7 +629,7 @@ bot.on("message:text", async (ctx) => {
     const enrichedPrompt = capPrompt(
       buildPrompt(text, combinedRelevant, memoryContext, {
         iMessageDraftContact: wantsIMessagePlacement
-          ? imessageContextRequest?.contact
+          ? draftRequest?.contact
           : undefined,
       }),
       text,
@@ -670,11 +678,12 @@ bot.on("message:text", async (ctx) => {
     const claudeMs = Date.now() - tClaude0;
 
     let imessageDraftStatus: IMessageDraftStatus | undefined;
+    let imessageDraftMode: "pasted" | "clipboard_only" | undefined;
     if (wantsIMessagePlacement) {
       const body = extractDraftBody(assistantText);
       const resolved = imessageContextResult?.resolvedRecipient;
       const contactLabel =
-        imessageContextRequest?.contact ?? resolved ?? "this contact";
+        draftRequest?.contact ?? resolved ?? "this contact";
 
       if (!body) {
         imessageDraftStatus = "markers_missing";
@@ -696,14 +705,28 @@ bot.on("message:text", async (ctx) => {
         );
       } else {
         const placement = await placeIMessageDraft(PROJECT_ROOT, resolved, body);
-        if (placement.ok) {
+        if (placement.ok && placement.mode === "pasted") {
           imessageDraftStatus = "placed";
+          imessageDraftMode = "pasted";
+          assistantText = replaceDraftBlock(
+            assistantText,
+            `${body}\n\nDraft is in the Messages compose box for ${contactLabel}. Review and send when ready.`,
+          );
+          console.log(
+            `[imessage-draft] pasted into compose for ${contactLabel} (${resolved})`,
+          );
+        } else if (placement.ok) {
+          // clipboard_only fallback — body is on the clipboard, Messages is
+          // open on the right thread, but native URL body prefill failed.
+          // Tell the user the truth instead of claiming compose-box placement.
+          imessageDraftStatus = "placed";
+          imessageDraftMode = "clipboard_only";
           assistantText = replaceDraftBlock(
             assistantText,
             `${body}\n\nDraft is on your clipboard and Messages is open on the thread with ${contactLabel}. Paste with Cmd+V and send when ready.`,
           );
           console.log(
-            `[imessage-draft] placed for ${contactLabel} (${resolved})`,
+            `[imessage-draft] clipboard_only fallback for ${contactLabel}: ${placement.reason ?? "no reason"}`,
           );
         } else {
           imessageDraftStatus = "helper_failed";
@@ -756,6 +779,7 @@ bot.on("message:text", async (ctx) => {
       imessage_context_count: imessageContextResult?.messages.length,
       imessage_context_contact: imessageContextResult?.request.contact,
       imessage_draft_status: imessageDraftStatus,
+      imessage_draft_mode: imessageDraftMode,
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
