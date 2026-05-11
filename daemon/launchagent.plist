@@ -29,6 +29,13 @@
         <key>HOME</key>
         <!-- UPDATE THIS -->
         <string>/Users/YOUR_USERNAME</string>
+        <key>CLAUDE_PATH</key>
+        <!-- UPDATE THIS: launchd does not inherit your interactive shell PATH -->
+        <string>/Users/YOUR_USERNAME/.local/bin/claude</string>
+        <key>CLAUDE_TIMEOUT_MS</key>
+        <string>90000</string>
+        <key>CLAUDE_RESUME</key>
+        <string>0</string>
     </dict>
 
     <!-- Start when loaded -->

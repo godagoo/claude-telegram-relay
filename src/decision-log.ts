@@ -32,6 +32,12 @@ export interface DecisionRecord {
   prompt_chars?: number;
   turn_buffer_size_before?: number;
   timeout_kind?: "fts" | "claude";
+  memory_tags_stripped?: number;
+  wrapper_tags_stripped?: number;
+  prose_dashes_stripped?: number;
+  response_chars?: number;
+  catalog_response_used?: boolean;
+  skipped_textbook_response_used?: boolean;
 }
 
 function dateUtc(offsetDays = 0): string {

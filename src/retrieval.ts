@@ -7,6 +7,7 @@ import { Database } from "bun:sqlite";
 import { accessSync, constants } from "fs";
 import { homedir } from "os";
 import { basename, dirname, join } from "path";
+import { BOOKS, BOOK_KEY_SET, CATALOG_BOOK_LIST } from "./books";
 
 const DB_PATH = process.env.INDEXER_DB
   ?? join(homedir(), ".local-search", "metadata.db");
@@ -196,16 +197,14 @@ SELECT c.id AS id,
  LIMIT ?
 `;
 
-const BOOK_PATH_FILTERS: Record<string, string> = {
-  barash: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "barash9") + "/%",
-  chestnut: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "chestnut6") + "/%",
-  cote: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "cote_ped6") + "/%",
-  fleisher: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "fleisher_uncommon") + "/%",
-  miller: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "miller10") + "/%",
-  stoelting: join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown", "stoelting8") + "/%",
-};
+const BOOK_PATH_FILTERS: Record<string, string> = Object.fromEntries(
+  BOOKS.map((book) => [
+    book.key,
+    join(TEXTBOOK_MARKDOWN_ROOT, book.pathSegment) + "/%",
+  ]),
+);
 
-const FTS_BOOK_FILTER_TOKENS = new Set(Object.keys(BOOK_PATH_FILTERS));
+const FTS_BOOK_FILTER_TOKENS = BOOK_KEY_SET;
 
 const PATH_ANCHOR_STOPWORDS = new Set([
   "textbook",
@@ -216,8 +215,7 @@ const PATH_ANCHOR_STOPWORDS = new Set([
 
 const PATH_FALLBACK_TRIGGERS = new Set([
   "anesthesia",
-  "barash",
-  "miller",
+  ...BOOK_KEY_SET,
 ]);
 
 function pathTokensFromQuery(query: string): string[] {
@@ -235,9 +233,7 @@ function pathTokensFromQuery(query: string): string[] {
   }
   if (!shouldSearchPaths) return [];
 
-  const namedTitles = tokens.filter((token) =>
-    token === "miller" || token === "barash"
-  );
+  const namedTitles = tokens.filter((token) => BOOK_KEY_SET.has(token));
   if (namedTitles.length > 0) return namedTitles.slice(0, 2);
 
   return tokens.slice(0, 2);
@@ -407,20 +403,7 @@ function isBroadTextbookInventoryQuery(query: string): boolean {
   );
 }
 
-// Books available in the converted Markdown corpus. Shared source of truth so
-// textbook-response.ts can render a deterministic catalog reply without
-// re-parsing the FTS hit content.
-const CATALOG_BOOKS = [
-  "Barash 9",
-  "Chestnut 6",
-  "Cote Pediatric Anesthesia 6",
-  "Fleisher Uncommon Diseases",
-  "Miller 10",
-  "Stoelting 8",
-] as const;
-
 export const CATALOG_HIT_PATH = TEXTBOOK_CATALOG_PATH;
-export const CATALOG_BOOK_LIST: readonly string[] = CATALOG_BOOKS;
 
 function textbookCatalogHits(k: number): Hit[] {
   if (k < 1) return [];
@@ -430,7 +413,7 @@ function textbookCatalogHits(k: number): Hit[] {
     file_path: TEXTBOOK_CATALOG_PATH,
     content: [
       "Converted anesthesia textbook corpus indexed as per-page Markdown.",
-      `Available books: ${CATALOG_BOOKS.join(", ")}.`,
+      `Available books: ${CATALOG_BOOK_LIST.join(", ")}.`,
       "For clinical retrieval, ask a book-specific or topic-specific question such as: What does Miller say about arterial line indications?",
     ].join("\n"),
     chunk_index: 0,

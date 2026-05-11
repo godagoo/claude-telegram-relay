@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { stripMemoryTags, stripWrapperTags } from "./response-sanitize";
+import {
+  sanitizeClaudeResponse,
+  stripMemoryTags,
+  stripProseDashes,
+  stripWrapperTags,
+} from "./response-sanitize";
 
 // Live failure 2026-05-10T21:08:25 and 21:58:25: Claude emitted just
 // "<response>" as its entire reply. The bare tag must be stripped so the
@@ -47,4 +52,21 @@ test("stripMemoryTags still strips the three memory intent tags", () => {
   const r = stripMemoryTags(input);
   expect(r.clean).toBe("Hello  world  !");
   expect(r.stripped).toBe(3);
+});
+
+test("replaces prose em/en dashes outside code spans", () => {
+  const input = "This reads like AI — too stiff. Use pages 10–12, not `a—b`.";
+  const r = stripProseDashes(input);
+  expect(r.clean).toBe("This reads like AI, too stiff. Use pages 10 to 12, not `a—b`.");
+  expect(r.stripped).toBe(2);
+});
+
+test("sanitizes memory tags, wrapper tags, and prose dashes in one pass", () => {
+  const r = sanitizeClaudeResponse(
+    "<response>Hello — world [REMEMBER: user likes short replies]</response>",
+  );
+  expect(r.clean).toBe("Hello, world");
+  expect(r.memoryTagsStripped).toBe(1);
+  expect(r.wrapperTagsStripped).toBeGreaterThanOrEqual(1);
+  expect(r.proseDashesStripped).toBe(1);
 });

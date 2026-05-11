@@ -94,6 +94,12 @@ function generatePlist(opts: {
         <string>${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>${HOME}</string>
+        <key>CLAUDE_PATH</key>
+        <string>${HOME}/.local/bin/claude</string>
+        <key>CLAUDE_TIMEOUT_MS</key>
+        <string>90000</string>
+        <key>CLAUDE_RESUME</key>
+        <string>0</string>
     </dict>
 ${opts.keepAlive ? `
     <key>RunAtLoad</key>

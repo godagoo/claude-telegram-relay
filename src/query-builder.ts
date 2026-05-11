@@ -3,6 +3,8 @@
 // Returns "" when fewer than two useful content tokens remain, so callers can
 // skip broad single-token searches that are both noisy and expensive.
 
+import { BOOK_KEY_SET } from "./books";
+
 export interface Turn {
   role: "user" | "assistant";
   content: string;
@@ -18,15 +20,7 @@ const MAX_QUERY_CHARS = 256;
 // Pinned ahead of the length-based selection so multi-book comparison queries
 // like "compare cote and barash on epidural opioids" don't drop the book names
 // in favour of longer clinical adjectives.
-// Must stay in sync with BOOK_PATH_FILTERS keys in retrieval.ts.
-const BOOK_NAME_ANCHORS: ReadonlySet<string> = new Set([
-  "barash",
-  "chestnut",
-  "cote",
-  "fleisher",
-  "miller",
-  "stoelting",
-]);
+const BOOK_NAME_ANCHORS = BOOK_KEY_SET;
 
 const FTS5_RESERVED = new Set(["AND", "OR", "NOT", "NEAR"]);
 

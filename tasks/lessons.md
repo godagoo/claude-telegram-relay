@@ -254,3 +254,27 @@
 - Bare inventory prompts such as `anesthesia textbook` are not clinical search
   questions. Return a fast catalog hit instead of running broad FTS over the
   whole corpus; keep FTS for book-specific or topic-specific questions.
+
+## 2026-05-11 - Codex review hardening pass
+
+- Book metadata must have one source of truth. Keep textbook keys, display
+  names, path segments, and trigger aliases in `src/books.ts`; derive trigger
+  regexes, query-builder anchors, retrieval path filters, and catalog responses
+  from that file. Manual three-way updates caused drift between Cote/Chestnut/
+  Fleisher/Stoelting trigger coverage and retrieval support.
+- Every Claude response path needs the same sanitizer. Text, voice, image, and
+  document replies all pass through memory-tag stripping, wrapper-tag stripping,
+  and prose Unicode dash replacement before Telegram sees them. Sanitizer
+  activations are now logged in decision JSONL so regressions are visible.
+- Default to fresh Claude CLI calls plus bounded `RECENT CONVERSATION:` context.
+  `--resume` is opt-in via `CLAUDE_RESUME=1`; resumed sessions can preserve bad
+  output patterns such as bare `<response>` tags after a single poisoned turn.
+- Non-text handlers must persist turns into the local short-term buffer. Saving
+  only to dormant Supabase leaves voice/image/document replies out of later
+  `RECENT CONVERSATION:` prompts.
+- launchd cannot be trusted to inherit an interactive shell PATH. Default
+  `CLAUDE_PATH` to `~/.local/bin/claude`, verify it during preflight, and fail
+  loudly if the CLI is not executable.
+- Five-minute Claude calls are too expensive for Telegram chat failures. Make
+  `CLAUDE_TIMEOUT_MS` configurable and default it to 90 seconds; longer
+  workflows should be explicit, not the default chat path.

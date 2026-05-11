@@ -1,4 +1,5 @@
-import { CATALOG_BOOK_LIST, CATALOG_HIT_PATH, type Hit } from "./retrieval";
+import { CATALOG_BOOK_LIST } from "./books";
+import { CATALOG_HIT_PATH, type Hit } from "./retrieval";
 
 const TEXTBOOK_REQUEST =
   /\b(barash|miller|textbooks?|anesthesia\s+textbooks?|anesthesia\s+book)\b/i;

@@ -9,7 +9,8 @@
 
 import { Bot, Context } from "grammy";
 import { spawn } from "bun";
-import { writeFile, mkdir, readFile, unlink } from "fs/promises";
+import { constants } from "fs";
+import { writeFile, mkdir, readFile, unlink, access } from "fs/promises";
 import { join, dirname } from "path";
 import { homedir } from "os";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -24,7 +25,7 @@ import { isReferential } from "./trigger.ts";
 import { buildSearchQuery, countContentTokens, type Turn } from "./query-builder.ts";
 import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
-import { stripMemoryTags, stripWrapperTags } from "./response-sanitize.ts";
+import { sanitizeClaudeResponse } from "./response-sanitize.ts";
 import {
   clearUpdateMarker,
   loadSeenUpdateIds,
@@ -41,7 +42,8 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
-const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
+const DEFAULT_CLAUDE_PATH = join(homedir(), ".local", "bin", "claude");
+const CLAUDE_PATH = process.env.CLAUDE_PATH || DEFAULT_CLAUDE_PATH;
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 // Pin the cwd for every `claude` spawn so future --resume work (Phase 1.1)
 // can locate session JSONLs in a stable project bucket. Per
@@ -50,10 +52,11 @@ const PROJECT_DIR = process.env.PROJECT_DIR || "";
 // replaced by '-'. Inheriting launchd's cwd ('/') would scatter sessions.
 const RELAY_CWD = (process.env.HOME ?? "") + "/Projects/claude-telegram-relay";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
-const CLAUDE_TIMEOUT_MS = 5 * 60 * 1000;
+const CLAUDE_TIMEOUT_MS = positiveIntEnv("CLAUDE_TIMEOUT_MS", 90_000);
 const KILL_GRACE_MS = 10_000;
 const MAX_PROMPT_CHARS = 120_000;
 const MAX_RECENT_TURNS_RENDERED = 6;
+const CLAUDE_RESUME_ENABLED = process.env.CLAUDE_RESUME === "1";
 
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
@@ -65,6 +68,13 @@ const SESSION_FILE = join(RELAY_DIR, "session.json");
 interface SessionState {
   sessionId: string | null;
   lastActivity: string;
+}
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 // ============================================================
@@ -85,6 +95,13 @@ async function saveSession(state: SessionState): Promise<void> {
 }
 
 let session = await loadSession();
+
+async function resetClaudeSession(reason: string): Promise<void> {
+  if (!session.sessionId) return;
+  console.log(`[session] reset Claude session: ${reason}`);
+  session = { sessionId: null, lastActivity: new Date().toISOString() };
+  await unlink(SESSION_FILE).catch(() => undefined);
+}
 
 // ============================================================
 // LOCK FILE (prevent multiple instances)
@@ -248,7 +265,7 @@ async function callClaude(
   const args = [CLAUDE_PATH, "-p", prompt];
 
   // Resume previous session if available and requested
-  if (options?.resume && session.sessionId) {
+  if (CLAUDE_RESUME_ENABLED && options?.resume && session.sessionId) {
     args.push("--resume", session.sessionId);
   }
 
@@ -303,12 +320,17 @@ async function callClaude(
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
-    // Extract session ID from output if present (for --resume)
-    const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
-    if (sessionMatch) {
-      session.sessionId = sessionMatch[1];
-      session.lastActivity = new Date().toISOString();
-      await saveSession(session);
+    if (CLAUDE_RESUME_ENABLED) {
+      // Extract session ID from output if present (for --resume). Default
+      // relay mode intentionally avoids --resume and relies on the bounded
+      // RECENT CONVERSATION block instead; that prevents poisoned Claude
+      // session state from recurring across Telegram turns.
+      const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
+      if (sessionMatch) {
+        session.sessionId = sessionMatch[1];
+        session.lastActivity = new Date().toISOString();
+        await saveSession(session);
+      }
     }
 
     return output.trim();
@@ -392,6 +414,49 @@ function ensureSendableResponse(text: string, fallback: string): string {
   return trimmed.length > 0 ? trimmed : fallback;
 }
 
+interface PostClaudeResult {
+  text: string;
+  memoryTagsStripped: number;
+  wrapperTagsStripped: number;
+  proseDashesStripped: number;
+}
+
+async function postProcessClaudeResponse(
+  raw: string,
+  fallback: string,
+): Promise<PostClaudeResult> {
+  const intentResult = supabase
+    ? await processMemoryIntents(supabase, raw)
+    : raw;
+  const cleanResult = sanitizeClaudeResponse(intentResult);
+
+  if (cleanResult.wrapperTagsStripped > 0) {
+    console.log(
+      `[wrapper-tag-strip] removed ${cleanResult.wrapperTagsStripped} bare wrapper tag(s)`,
+    );
+    if (CLAUDE_RESUME_ENABLED) {
+      await resetClaudeSession("wrapper tag emitted");
+    }
+  }
+
+  const strippedTotal =
+    cleanResult.memoryTagsStripped +
+    cleanResult.wrapperTagsStripped +
+    cleanResult.proseDashesStripped;
+  if (strippedTotal > 0) {
+    console.log(
+      `[response-sanitize] memory=${cleanResult.memoryTagsStripped} wrapper=${cleanResult.wrapperTagsStripped} prose_dashes=${cleanResult.proseDashesStripped}`,
+    );
+  }
+
+  return {
+    text: ensureSendableResponse(cleanResult.clean, fallback),
+    memoryTagsStripped: cleanResult.memoryTagsStripped,
+    wrapperTagsStripped: cleanResult.wrapperTagsStripped,
+    proseDashesStripped: cleanResult.proseDashesStripped,
+  };
+}
+
 // ============================================================
 // MESSAGE HANDLERS
 // ============================================================
@@ -461,7 +526,9 @@ bot.on("message:text", async (ctx) => {
 
     const tClaude0 = Date.now();
     let assistantText = "";
-    let stripped = 0;
+    let memoryTagsStripped = 0;
+    let wrapperTagsStripped = 0;
+    let proseDashesStripped = 0;
     let errorMsg: string | undefined;
     const deterministicTextbookResponse = buildSkippedTextbookResponse(text, ftsHits, {
       referentialFired: referential,
@@ -475,19 +542,14 @@ bot.on("message:text", async (ctx) => {
     } else {
       try {
         const raw = await callClaude(enrichedPrompt, { resume: true });
-        const intentResult = supabase
-          ? await processMemoryIntents(supabase, raw)
-          : raw;
-        const memResult = stripMemoryTags(intentResult);
-        const wrapResult = stripWrapperTags(memResult.clean);
-        if (wrapResult.stripped > 0) {
-          console.log(`[wrapper-tag-strip] removed ${wrapResult.stripped} bare wrapper tag(s)`);
-        }
-        assistantText = ensureSendableResponse(
-          wrapResult.clean,
+        const processed = await postProcessClaudeResponse(
+          raw,
           "Hmm, I didn't generate a useful reply this time. Could you rephrase or ask a more specific question?",
         );
-        stripped = memResult.stripped + wrapResult.stripped;
+        assistantText = processed.text;
+        memoryTagsStripped = processed.memoryTagsStripped;
+        wrapperTagsStripped = processed.wrapperTagsStripped;
+        proseDashesStripped = processed.proseDashesStripped;
       } catch (err) {
         errorMsg = err instanceof Error ? err.message : String(err);
         if (errorMsg.startsWith("claude_timeout_")) {
@@ -503,10 +565,6 @@ bot.on("message:text", async (ctx) => {
     await sendResponse(ctx, assistantText);
     await saveMessage("assistant", assistantText);
     await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
-
-    if (stripped > 0) {
-      console.log(`[memory-tag-leak-strip] stripped ${stripped} tag(s) from response`);
-    }
 
     const rec: DecisionRecord = {
       ts,
@@ -531,6 +589,12 @@ bot.on("message:text", async (ctx) => {
       prompt_chars: enrichedPrompt.length,
       turn_buffer_size_before: turnBufferSizeBefore,
       timeout_kind: timeoutKind,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: assistantText.length,
+      catalog_response_used: Boolean(deterministicCatalogResponse),
+      skipped_textbook_response_used: Boolean(deterministicTextbookResponse),
     };
     await logDecision(rec);
   });
@@ -546,6 +610,10 @@ bot.on("message:voice", async (ctx) => {
   console.log(`Voice message: ${voice.duration}s`);
 
   let errorMsg: string | undefined;
+  let assistantText = "";
+  let memoryTagsStripped = 0;
+  let wrapperTagsStripped = 0;
+  let proseDashesStripped = 0;
   try {
     await ctx.replyWithChatAction("typing");
 
@@ -568,7 +636,9 @@ bot.on("message:voice", async (ctx) => {
       return;
     }
 
-    await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
+    const userTurn = `[Voice ${voice.duration}s]: ${transcription}`;
+    await saveMessage("user", userTurn);
+    await appendTurn(chatId, { role: "user", content: userTurn, ts });
 
     const [relevantContext, memoryContext] = supabase
       ? await Promise.all([
@@ -584,12 +654,18 @@ bot.on("message:voice", async (ctx) => {
       memoryContext
     ), voiceUserMessage);
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = supabase
-      ? await processMemoryIntents(supabase, rawResponse)
-      : rawResponse;
+    const processed = await postProcessClaudeResponse(
+      rawResponse,
+      "I transcribed the voice message, but I didn't generate a useful reply. Could you ask again more specifically?",
+    );
+    assistantText = processed.text;
+    memoryTagsStripped = processed.memoryTagsStripped;
+    wrapperTagsStripped = processed.wrapperTagsStripped;
+    proseDashesStripped = processed.proseDashesStripped;
 
-    await saveMessage("assistant", claudeResponse);
-    await sendResponse(ctx, claudeResponse);
+    await saveMessage("assistant", assistantText);
+    await sendResponse(ctx, assistantText);
+    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
   } catch (error) {
     errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Voice error:", error);
@@ -609,6 +685,10 @@ bot.on("message:voice", async (ctx) => {
       injected_count: 0,
       total_ms: Date.now() - t0,
       error: errorMsg,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: assistantText.length,
     }).catch(() => undefined);
   }
 });
@@ -622,6 +702,10 @@ bot.on("message:photo", async (ctx) => {
   console.log("Image received");
 
   let errorMsg: string | undefined;
+  let assistantText = "";
+  let memoryTagsStripped = 0;
+  let wrapperTagsStripped = 0;
+  let proseDashesStripped = 0;
   try {
     await ctx.replyWithChatAction("typing");
 
@@ -644,18 +728,26 @@ bot.on("message:photo", async (ctx) => {
     const caption = ctx.message.caption || "Analyze this image.";
     const prompt = capPrompt(`[Image: ${filePath}]\n\n${caption}`);
 
-    await saveMessage("user", `[Image]: ${caption}`);
+    const userTurn = `[Image]: ${caption}`;
+    await saveMessage("user", userTurn);
+    await appendTurn(chatId, { role: "user", content: userTurn, ts });
 
     const claudeResponse = await callClaude(prompt, { resume: true });
 
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = supabase
-      ? await processMemoryIntents(supabase, claudeResponse)
-      : claudeResponse;
-    await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    const processed = await postProcessClaudeResponse(
+      claudeResponse,
+      "I looked at the image, but I didn't generate a useful reply. Could you ask again more specifically?",
+    );
+    assistantText = processed.text;
+    memoryTagsStripped = processed.memoryTagsStripped;
+    wrapperTagsStripped = processed.wrapperTagsStripped;
+    proseDashesStripped = processed.proseDashesStripped;
+    await saveMessage("assistant", assistantText);
+    await sendResponse(ctx, assistantText);
+    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
   } catch (error) {
     errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Image error:", error);
@@ -672,6 +764,10 @@ bot.on("message:photo", async (ctx) => {
       injected_count: 0,
       total_ms: Date.now() - t0,
       error: errorMsg,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: assistantText.length,
     }).catch(() => undefined);
   }
 });
@@ -686,6 +782,10 @@ bot.on("message:document", async (ctx) => {
   console.log(`Document: ${doc.file_name}`);
 
   let errorMsg: string | undefined;
+  let assistantText = "";
+  let memoryTagsStripped = 0;
+  let wrapperTagsStripped = 0;
+  let proseDashesStripped = 0;
   try {
     await ctx.replyWithChatAction("typing");
 
@@ -703,17 +803,25 @@ bot.on("message:document", async (ctx) => {
     const caption = ctx.message.caption || `Analyze: ${doc.file_name}`;
     const prompt = capPrompt(`[File: ${filePath}]\n\n${caption}`);
 
-    await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
+    const userTurn = `[Document: ${doc.file_name}]: ${caption}`;
+    await saveMessage("user", userTurn);
+    await appendTurn(chatId, { role: "user", content: userTurn, ts });
 
     const claudeResponse = await callClaude(prompt, { resume: true });
 
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = supabase
-      ? await processMemoryIntents(supabase, claudeResponse)
-      : claudeResponse;
-    await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    const processed = await postProcessClaudeResponse(
+      claudeResponse,
+      "I looked at the document, but I didn't generate a useful reply. Could you ask again more specifically?",
+    );
+    assistantText = processed.text;
+    memoryTagsStripped = processed.memoryTagsStripped;
+    wrapperTagsStripped = processed.wrapperTagsStripped;
+    proseDashesStripped = processed.proseDashesStripped;
+    await saveMessage("assistant", assistantText);
+    await sendResponse(ctx, assistantText);
+    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
   } catch (error) {
     errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Document error:", error);
@@ -730,6 +838,10 @@ bot.on("message:document", async (ctx) => {
       injected_count: 0,
       total_ms: Date.now() - t0,
       error: errorMsg,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: assistantText.length,
     }).catch(() => undefined);
   }
 });
@@ -846,6 +958,38 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
   }
 }
 
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+async function verifyClaudeExecutable(): Promise<void> {
+  if (CLAUDE_PATH.includes("/")) {
+    try {
+      await access(CLAUDE_PATH, constants.X_OK);
+    } catch {
+      throw new Error(
+        `preflight: CLAUDE_PATH is not executable: ${CLAUDE_PATH}`,
+      );
+    }
+    console.log(`[preflight] Claude CLI: ${CLAUDE_PATH}`);
+    return;
+  }
+
+  const result = Bun.spawnSync({
+    cmd: ["/bin/sh", "-lc", `command -v ${shellQuote(CLAUDE_PATH)}`],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `preflight: Claude CLI '${CLAUDE_PATH}' not found on PATH; set CLAUDE_PATH`,
+    );
+  }
+  console.log(
+    `[preflight] Claude CLI: ${new TextDecoder().decode(result.stdout).trim()}`,
+  );
+}
+
 // ============================================================
 // START
 // ============================================================
@@ -855,6 +999,10 @@ async function runStartupPreflight(): Promise<void> {
   console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
   console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
   console.log("[relay] RELAY_CWD:", RELAY_CWD);
+  console.log(`[relay] Claude resume: ${CLAUDE_RESUME_ENABLED ? "enabled" : "disabled"}`);
+  console.log(`[relay] Claude timeout: ${CLAUDE_TIMEOUT_MS}ms`);
+
+  await verifyClaudeExecutable();
 
   console.log("[relay] running retrieval preflight...");
   try {

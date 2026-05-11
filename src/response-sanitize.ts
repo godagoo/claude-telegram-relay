@@ -39,3 +39,47 @@ export function stripWrapperTags(text: string): { clean: string; stripped: numbe
     .trim();
   return { clean, stripped };
 }
+
+export function stripProseDashes(text: string): { clean: string; stripped: number } {
+  let stripped = 0;
+  const parts = text.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
+  const clean = parts
+    .map((part, index) => {
+      if (index % 2 === 1) return part;
+      return part
+        .replace(/(\d)\s*–\s*(\d)/g, (_match, left, right) => {
+          stripped++;
+          return `${left} to ${right}`;
+        })
+        .replace(/\s*[—–]\s*/g, () => {
+          stripped++;
+          return ", ";
+        });
+    })
+    .join("")
+    .replace(/,\s*,/g, ",")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return { clean, stripped };
+}
+
+export interface SanitizedClaudeResponse {
+  clean: string;
+  memoryTagsStripped: number;
+  wrapperTagsStripped: number;
+  proseDashesStripped: number;
+}
+
+export function sanitizeClaudeResponse(text: string): SanitizedClaudeResponse {
+  const memResult = stripMemoryTags(text);
+  const wrapResult = stripWrapperTags(memResult.clean);
+  const dashResult = stripProseDashes(wrapResult.clean);
+
+  return {
+    clean: dashResult.clean,
+    memoryTagsStripped: memResult.stripped,
+    wrapperTagsStripped: wrapResult.stripped,
+    proseDashesStripped: dashResult.stripped,
+  };
+}
