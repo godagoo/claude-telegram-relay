@@ -34,42 +34,53 @@ The bot needs to read `~/Library/Messages/chat.db` to pull recent messages with 
 
 ### One-time setup
 
-1. Open **System Settings → Privacy & Security → Full Disk Access**.
-2. Click the **+** button.
-3. Press **Cmd+Shift+G** to open the path picker.
-4. Paste this path and press Return:
+The target binary is **`bun`** at its resolved Cellar path — not the Claude CLI. See the "Why this exact binary" section below for the process-tree explanation.
 
-   ```
-   /Users/williamregan/.local/share/claude/versions
+1. Find the resolved bun path:
+
+   ```bash
+   readlink -f "$(which bun)"
    ```
 
-5. Select the most recent versioned binary in there (e.g. `2.1.138`). Click Open.
-6. Make sure the toggle next to that entry is **on**.
-7. Restart the relay so the running Claude subprocesses pick up the new permission:
+   On Apple Silicon + Homebrew this is typically `/opt/homebrew/Cellar/bun/<version>/bin/bun`. On Intel + Homebrew it's `/usr/local/Cellar/bun/<version>/bin/bun`. Always use the resolved Cellar path, never the `/opt/homebrew/bin/bun` or `/usr/local/bin/bun` symlink — symlinks re-point on every `brew upgrade bun` and TCC then silently denies again.
+
+2. Open **System Settings → Privacy & Security → Full Disk Access**.
+3. Click the **+** button.
+4. Press **Cmd+Shift+G** to open the path picker.
+5. Paste the resolved Cellar path from step 1 and press Return.
+6. Select the binary and click Open.
+7. Make sure the toggle next to that entry is **on**.
+8. Restart the relay so the launchd-spawned bun inherits the new TCC grant:
 
    ```bash
    launchctl kickstart -k gui/$(id -u)/com.claude.telegram-relay
    ```
 
-8. (Optional) Verify by running the read helper directly with one of your contacts:
+9. (Optional) Verify by running the read helper directly with one of your contacts:
 
    ```bash
    ~/Projects/claude-telegram-relay/scripts/imessage-thread.sh +16043154583 5
    ```
 
-   If FDA is correctly granted you will see JSON rows for the last 5 messages. If you see `error: cannot read /Users/.../chat.db`, FDA is not granted to the binary that ran sqlite3.
+   If FDA is correctly granted you will see JSON rows for the last 5 messages. If you see `error: cannot read /Users/.../chat.db`, FDA is not granted to the bun binary that ran sqlite3.
 
 ### Why this exact binary
 
-The relay does not run from a terminal. It runs as a launchd service that spawns `bun` (the relay process) which then spawns the Claude CLI as a child. macOS TCC (Transparency, Consent, Control) tracks FDA per executable. The Claude CLI is the process that actually invokes the Bash tool that ends up calling `sqlite3`, so granting FDA to the Claude CLI binary covers the whole chain.
+The relay does not run from a terminal. It runs as a launchd service. The iMessage context prefetch is executed deterministically by the relay process itself, **not** by a Claude subprocess. The actual process tree is:
 
-If you upgrade the Claude CLI later, a new versioned folder appears under `~/.local/share/claude/versions/`. macOS will block reads again until you grant FDA to the new versioned binary. Re-run the grant if that happens.
+```
+launchd → bun (relay.ts) → bash → imessage-thread.sh → sqlite3
+```
+
+`src/imessage-context.ts` was rewritten on 2026-05-11 so that `fetchIMessageContext` spawns the helper script via bun's native `spawn` API before Claude is ever invoked. Claude is not in this chain at all anymore. macOS TCC (Transparency, Consent, Control) checks Full Disk Access against the responsible process that opens the protected file; that process is **bun**. Granting FDA to the bun binary covers the whole prefetch chain.
+
+If you upgrade bun (`brew upgrade bun`), a new versioned folder appears under Cellar (e.g. `/opt/homebrew/Cellar/bun/1.3.14/`). macOS will block reads again until you grant FDA to the new versioned binary. Re-run the grant if that happens.
 
 ### What does NOT work
 
 - Granting FDA to Terminal.app, iTerm, Warp, Ghostty, or any GUI shell. The relay does not run inside any of them.
-- Granting FDA to `bun` at `/usr/local/bin/bun`. That covers the relay parent process but not the Claude subprocess that runs the Bash tool.
-- Granting FDA only to the symlink at `~/.local/bin/claude`. macOS resolves the symlink and grants the underlying binary; toggling the symlink in System Settings sometimes works but is fragile across upgrades.
+- Granting FDA to the Claude CLI binary at `~/.local/share/claude/versions/<vN>`. The iMessage context prefetch no longer routes through Claude — `src/imessage-context.ts:fetchIMessageContext` spawns the helper from bun directly. Older versions of this doc (and older relay code) DID route through Claude and instructed granting FDA there; that path is gone.
+- Granting FDA only to the symlink at `/opt/homebrew/bin/bun` or `/usr/local/bin/bun`. macOS TCC may or may not follow the symlink correctly, and any `brew upgrade bun` re-points it to a new Cellar binary that has no grant. Use the resolved Cellar path from `readlink -f`.
 
 ### Privacy note
 

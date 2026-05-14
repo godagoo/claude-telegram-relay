@@ -1033,3 +1033,46 @@
   times out and the relay sets `retrievalAvailable=false`, FTS stays disabled
   until a manual restart even though later searches may work. Keep retrieval
   enabled after preflight failure and let per-request search handling decide.
+
+## 2026-05-13 - FDA target is bun, not claude; 409 Conflict means two instances
+
+- FDA target is **bun**, not Claude CLI, for the imessage-context prefetch
+  path. `src/imessage-context.ts:fetchIMessageContext` spawns
+  `scripts/imessage-thread.sh` directly via bun's native `spawn` API; the
+  actual process tree is `launchd → bun (relay.ts) → bash →
+  imessage-thread.sh → sqlite3`. Claude is not in this chain at all
+  anymore. macOS TCC checks Full Disk Access against the responsible
+  process that opens `chat.db`; that process is bun. Live evidence
+  2026-05-13: relay log on Mac A showed
+  `[imessage-context] contact=Mark status=fda_denied messages=0` after
+  Mac A migration even though the user had granted FDA per the previous
+  `docs/IMESSAGE-SETUP.md`, which still pointed at the Claude CLI binary
+  — dead code for this path. **Why:** the relay was rewritten on
+  2026-05-11 to do deterministic context prefetch before Claude runs,
+  removing the Claude → Bash → sqlite3 chain the old setup doc assumed.
+  **How to apply:** any future code change that moves iMessage fetching
+  to a different process MUST update `docs/IMESSAGE-SETUP.md` in the
+  same commit. Grant FDA to `readlink -f "$(which bun)"` — the resolved
+  Cellar path (`/opt/homebrew/Cellar/bun/<version>/bin/bun` on Apple
+  Silicon), not the `/opt/homebrew/bin/bun` or `/usr/local/bin/bun`
+  symlink. Symlinks re-point on every `brew upgrade bun` and TCC
+  silently denies again.
+- 409 Conflict in `relay.err.log` = two bot instances polling the same
+  Telegram token. GrammyError shape:
+  `Call to 'getUpdates' failed! (409: Conflict: terminated by other
+  getUpdates request; make sure that only one bot instance is running)`.
+  Telegram delivers each incoming update to exactly one of N pollers
+  non-deterministically — user-facing symptom is "mixed, confusing,
+  unrepeatable" replies because some messages get processed by the old
+  instance and some by the new. Live evidence 2026-05-13: during the
+  Mac B → Mac A migration, Mac B's launchd `com.claude.telegram-relay`
+  stayed loaded after Mac A's relay came up; a screenshot of an
+  unexpected 90s timeout response was actually Mac B's old code
+  answering, not Mac A's. **Why:** `launchctl kickstart` on Mac A does
+  not stop Mac B's process — they're independent machines polling the
+  same bot token. **How to apply:** always
+  `grep 409 ~/Projects/claude-telegram-relay/logs/com.claude.telegram-relay.error.log`
+  before investigating relay logic bugs. `launchctl unload` the old
+  instance (and `pkill -f 'bun run src/relay.ts'` any stragglers)
+  before starting the new one. Never rely on the new instance "winning"
+  the poll race — Telegram's delivery is non-deterministic.
