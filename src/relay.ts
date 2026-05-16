@@ -1138,49 +1138,51 @@ bot.on("message:text", async (ctx) => {
             placement = await placeIMessageDraft(PROJECT_ROOT, target, body);
           }
 
-          if (!handoff?.ok && placement?.ok && placement.mode === "pasted") {
-            // iCloud Drive failed; Mac paste is the fallback.
-            imessageDraftStatus = "placed";
-            imessageDraftMode = "pasted";
-            assistantText = rebuildAroundDraftBlock(
-              assistantText,
-              `${body}\n\nDraft is in the Messages compose box on your Mac for ${contactLabel}.`,
-            );
-            console.log(
-              `[imessage-draft] pasted into compose for ${contactLabel} (${resolved}) — iCloud Drive fallback`,
-            );
-          } else if (!handoff?.ok && placement?.ok && placement.mode === "new_compose") {
-            imessageDraftStatus = "placed";
-            imessageDraftMode = "new_compose";
-            assistantText = rebuildAroundDraftBlock(
-              assistantText,
-              `${body}\n\nI couldn't find a thread for ${contactLabel}, so I opened a new Messages compose on your Mac with the body prefilled. Pick the contact in the To field.`,
-            );
-            console.log(
-              `[imessage-draft] new_compose for ${contactLabel} (context_status=${imessageContextResult?.status})`,
-            );
-          } else if (!handoff?.ok && placement?.ok) {
-            imessageDraftStatus = "placed";
-            imessageDraftMode = "clipboard_only";
-            const where = resolved
-              ? `Messages on your Mac is open to the ${contactLabel} thread`
-              : placement.reason === "sms_body_url_opened_unverified_new_compose"
-                ? `Messages on your Mac opened a new compose window for ${contactLabel}`
-              : `Messages on your Mac is open — press Cmd+N for a new message, pick ${contactLabel}`;
-            assistantText = rebuildAroundDraftBlock(
-              assistantText,
-              `${body}\n\nDraft is on your clipboard and ${where}. Paste with Cmd+V.`,
-            );
-            console.log(
-              `[imessage-draft] clipboard_only fallback for ${contactLabel}: ${placement.reason ?? "no reason"}`,
-            );
-          } else if (!handoff?.ok) {
-            imessageDraftStatus = "helper_failed";
-            assistantText = rebuildAroundDraftBlock(
-              assistantText,
-              `${body}\n\n(Couldn't place this in Messages: ${placement?.error ?? "unknown error"}.)`,
-            );
-            console.error(`[imessage-draft] helper failed: ${placement?.error}`);
+          if (placement !== undefined) {
+            if (!handoff?.ok && placement.ok && placement.mode === "pasted") {
+              // iCloud Drive failed; Mac paste is the fallback.
+              imessageDraftStatus = "placed";
+              imessageDraftMode = "pasted";
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\nDraft is in the Messages compose box on your Mac for ${contactLabel}.`,
+              );
+              console.log(
+                `[imessage-draft] pasted into compose for ${contactLabel} (${resolved}) — iCloud Drive fallback`,
+              );
+            } else if (!handoff?.ok && placement.ok && placement.mode === "new_compose") {
+              imessageDraftStatus = "placed";
+              imessageDraftMode = "new_compose";
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\nI couldn't find a thread for ${contactLabel}, so I opened a new Messages compose on your Mac with the body prefilled. Pick the contact in the To field.`,
+              );
+              console.log(
+                `[imessage-draft] new_compose for ${contactLabel} (context_status=${imessageContextResult?.status})`,
+              );
+            } else if (!handoff?.ok && placement.ok) {
+              imessageDraftStatus = "placed";
+              imessageDraftMode = "clipboard_only";
+              const where = resolved
+                ? `Messages on your Mac is open to the ${contactLabel} thread`
+                : placement.reason === "sms_body_url_opened_unverified_new_compose"
+                  ? `Messages on your Mac opened a new compose window for ${contactLabel}`
+                : `Messages on your Mac is open — press Cmd+N for a new message, pick ${contactLabel}`;
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\nDraft is on your clipboard and ${where}. Paste with Cmd+V.`,
+              );
+              console.log(
+                `[imessage-draft] clipboard_only fallback for ${contactLabel}: ${placement.reason ?? "no reason"}`,
+              );
+            } else {
+              imessageDraftStatus = "helper_failed";
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\n(Couldn't place this in Messages: ${placement.error ?? "unknown error"}.)`,
+              );
+              console.error(`[imessage-draft] helper failed: ${placement.error}`);
+            }
           }
         }
       }

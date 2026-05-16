@@ -825,8 +825,14 @@
   writes can be picked up by Mac Messages.app, but file-based draft state did
   not propagate to the iPhone compose box. Do not keep iterating on
   `composition.plist` as the phone-delivery path.
-- Gate 2B v1 uses the Shortcuts iCloud container as the handoff surface:
-  `~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json`.
+- 2026-05-14 correction: the Shortcuts iCloud container was a Mac-local
+  verification trap on this machine. The file existed locally but did not
+  reach the iPhone. The active iCloud Drive container is
+  `~/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json`;
+  the relay default and the iOS Shortcut's Get File action must both target
+  that iCloud Drive path.
+- Gate 2B now uses an iCloud JSON file as the handoff surface:
+  `~/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json`.
   The file contains the current plaintext draft because the iPhone Shortcut
   needs to read it, but decision logs store only the path, Shortcut URL, and
   SHA-256 hash.
@@ -838,16 +844,13 @@
   detection (mkdir/open/write/fsync/chmod/rename) into `{ ok: false }`, not
   throw. The relay depends on that contract to fall back to the Mac compose
   helper instead of failing the whole Telegram reply.
-- The storage selector in Shortcuts is load-bearing. The working shortcut
-  reads "Get File from Shortcuts at path claude-relay-drafts/latest.json",
-  which maps to `iCloud~is~workflow~my~workflows/Documents` on macOS. Writing
-  the general `com~apple~CloudDocs/claude-relay-drafts/latest.json` path is a
-  different file and will not feed the Shortcut unless the Shortcut is also
-  pointed at general iCloud Drive.
-- 2026-05-13 audit: the terminal's successful Mac Shortcut run only worked
-  after copying `latest.json` into the Shortcuts container. That proved the
-  relay default was wrong, not that the Shortcut should be repointed. Fix the
-  writer to match the working Shortcut storage selector.
+- The storage selector in Shortcuts is load-bearing. If the Shortcut editor
+  reads "Get File from Shortcuts at path claude-relay-drafts/latest.json", it
+  maps to `iCloud~is~workflow~my~workflows/Documents` on macOS. That path
+  worked for a Mac-side `shortcuts run` smoke test but did not sync to the
+  iPhone on 2026-05-14. For the phone handoff, pick the real iCloud Drive
+  file under `com~apple~CloudDocs` in the Shortcut editor and keep
+  `RELAY_ICLOUD_DRAFT_DIR` aligned with it.
 - User-facing placement copy must avoid the banned "review and send" /
   "send manually" footer family. The phone handoff status is:
   `Phone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft`.
@@ -947,14 +950,14 @@
     edit and embed them. **And** `WFGetFilePath` must be empty/absent when
     `WFFile` already names a specific file, or runtime errors with "the
     provided file path must be contained within the directory."
-  - Because the bookmark is device-specific, the simpler design is to write
-    the relay's payload into the Shortcuts container and let the shortcut
-    use its default storage. That's what the relay was changed to do on
-    2026-05-13 (relay code change made in parallel during this build):
-    write to
-    `~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json`,
-    so the Shortcut's default `WFGetFilePath="claude-relay-drafts/latest.json"`
-    resolves correctly without any custom bookmark.
+  - 2026-05-14 correction: the Shortcuts-container simplification was wrong
+    for the real iPhone handoff on this Mac. It proved only that
+    `shortcuts run ClaudeDraft` on the Mac could read the file. The file did
+    not reach the iPhone. The relay now writes to the active iCloud Drive
+    container:
+    `~/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json`.
+    The Shortcut must therefore be edited to read that iCloud Drive file, not
+    the default "Shortcuts" provider path.
 - Send Message action triggers a one-time **OS privacy prompt** the first
   time it runs: "Allow 'ClaudeDraft' to send 1 dictionary in a message?"
   with Don't Allow / Allow Once / Always Allow. The word "dictionary"
@@ -1005,10 +1008,9 @@
   requests. Accept strong self-draft shapes (`reply to me`, `text me`, `ping
   me`, `send me a message`, `draft a message to me`) but do not treat every
   stray `to me` as a draft.
-- Do not rely only on Telegram inline buttons for `shortcuts://` handoff URLs.
-  Custom-scheme behavior can vary by Telegram/iOS client. Keep the inline
-  "Open draft on iPhone" button, but also leave a visible `shortcuts://...`
-  fallback in the message so the user can copy it if the button does nothing.
+- Do not use Telegram inline buttons for `shortcuts://` handoff URLs.
+  Telegram rejects custom schemes in inline keyboard URLs. Keep the
+  `shortcuts://...` URL as plain message text only.
 - Exact-body iMessage requests should bypass Claude. If the user says
   "Reply to myself saying X" or "Text Peggy with X", the body is already known;
   wrapping it in the draft markers locally avoids a slow Claude call and avoids
@@ -1076,3 +1078,337 @@
   instance (and `pkill -f 'bun run src/relay.ts'` any stragglers)
   before starting the new one. Never rely on the new instance "winning"
   the poll race — Telegram's delivery is non-deterministic.
+
+## 2026-05-14 - Senior hardening pass: fail closed, prove smoke paths, bound side effects
+
+- `TELEGRAM_USER_ID` is not optional for this relay. A missing allowlist turns a
+  local Claude Code bridge into a public bot. Startup must fail closed when the
+  user ID is missing, a placeholder, or non-numeric; setup verification should
+  mirror that check.
+- Claude subprocesses must not inherit the relay's whole environment. Pass a
+  narrow auth/runtime allowlist, disable tools for ordinary text turns, and only
+  enable `Read` from the upload directory for image/document turns. A one-line
+  `claude -p ... --no-session-persistence --tools ''` probe is the cheapest
+  way to catch flag/env breakage before restarting launchd.
+- Update markers need phase semantics. `started` means retry after a crash;
+  `sent` means Telegram accepted a user-visible reply and redelivery would
+  duplicate it. Never load raw in-flight `started` markers as permanently seen.
+- iMessage helper envelopes must be generated with JSON escaping, not raw
+  `printf` interpolation. The `?`/`-`/empty recipient sentinel is a real
+  blank-recipient compose path and needs a test that verifies the generated
+  `sms:&body=...` URL without launching Messages.
+- `imessage-thread.sh` is a directly runnable boundary script. Validate `LIMIT`
+  in the script, cap it, and classify sqlite authorization/open failures as
+  exit 77 even if the initial `-r chat.db` check passed.
+- The active converted textbook corpus on this machine is indexed under
+  `~/Downloads/anes-textbooks-markdown` while the older catalog/path constants
+  pointed at `~/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown`. Retrieval
+  should search both roots and prefer converted Markdown before skipped PDF path
+  hits. Book-scoped strict AND queries can miss real content; if the strict
+  query returns zero, try adjacent clinical token pairs before path fallback.
+- `bun test` is not enough for retrieval work. Package-level verification must
+  include `scripts/smoke-poison-query.ts` and
+  `scripts/smoke-textbook-retrieval.ts` so a green unit suite cannot hide a
+  broken live-index query.
+- Uploaded Telegram filenames are untrusted. Never join `doc.file_name`
+  directly into `UPLOADS_DIR`; use a generated filename with a sanitized
+  extension, keep the original only as prompt metadata, and unlink upload files
+  from a `finally` block so Claude timeouts do not leave sensitive artifacts on
+  disk.
+- Setup scripts are part of the operational surface. `setup:verify` must check
+  the actual voice providers (`VOICE_PROVIDER=groq|local`), and any printed
+  launchd stop command must be implemented (`--unload --service all`) rather
+  than being aspirational CLI copy.
+- Telegram inline keyboard URLs cannot use custom schemes such as
+  `shortcuts://`. iPhone Shortcut handoff links must remain plain message text;
+  otherwise Telegram rejects `sendMessage` with 400
+  `Unsupported URL protocol` after the relay has already generated and written
+  the draft. After fixing source, restart launchd or the live bot will keep
+  running the stale reply path.
+- The final Telegram-visible response must be computed before sending,
+  persistence, short-term history, memory capture, and decision metrics. Do not
+  hide display-only rewrites inside `sendResponse`; that recreates the old
+  Conor empty-response bug in a new form. 2026-05-14 example: `sendResponse`
+  showed `Open on iPhone: shortcuts://...`, but `appendTurn` saved the
+  internal `Phone handoff ready:` line, contaminating the next Claude prompt.
+- Multi-chunk Telegram replies need explicit partial-send semantics. If at
+  least one chunk is accepted and a later chunk fails, treat the update as
+  user-visible and log `telegram_partial_send_after_*`; retrying the same
+  update would duplicate the accepted prefix. Only rethrow when zero chunks
+  were accepted.
+- Runtime state is sensitive. `~/.claude-relay`, decision logs, update
+  markers, and short-term chat state must be `0700`/`0600`; setup verification
+  should check the actual runtime directories, not just repo-local folders.
+- Upload turns must use per-update private directories and pass only that
+  directory via Claude `--add-dir`. A shared upload root lets concurrent
+  prompt-injected uploads read each other's files.
+- Telegram downloads require explicit status and size gates before buffering or
+  writing. Check Telegram metadata, `response.ok`, `Content-Length`, and stream
+  byte counts with per-type caps.
+- Lock files must be acquired atomically with exclusive create. A read-check-
+  write lock can start two long-polling relays during launchd/manual races.
+- launchd setup must fail if unload fails, XML-escape generated plist strings,
+  and lint the plist before loading. Otherwise stale pollers or invalid plists
+  look like successful installs.
+- Do not send Claude CLI stderr back to Telegram. Log a bounded sanitized
+  summary locally and send a generic failure to the user; stderr can contain
+  local paths, stack traces, or configuration details.
+- Keep startup preflight probes aligned with smoke-test semantics. Do not use a
+  poison query as a startup health probe; if the smoke test says a query should
+  return zero rows, preflight must not warn when it does.
+
+## 2026-05-14 - ClaudeDraft Shortcut verifier must catch UI path drift
+
+- The iPhone error `latest.jsoneon couldn't be opened` was not a relay writer
+  typo: source still wrote `latest.json` under
+  `com~apple~CloudDocs/claude-relay-drafts`. The installed Shortcut path had
+  been corrupted by a stray UI edit. Source-level fix: `setup:verify` now
+  decodes the installed `ClaudeDraft` actions from `~/Library/Shortcuts/Shortcuts.sqlite`
+  and fails on `latest.jsoneon`, the old Shortcuts app container, or
+  `ShowWhenRun !== true`.
+- A valid CloudDocs Shortcut shape on this machine can be either a folder
+  bookmark to `com~apple~CloudDocs/claude-relay-drafts` with `WFGetFilePath`
+  set exactly to `latest.json`, or a file bookmark directly to `.../latest.json`
+  with an empty path field. `claude-relay-drafts/latest.json` looks plausible
+  in the editor but produced `Error: The file "latest.json" couldn't be
+  opened because there is no such file` during `shortcuts run ClaudeDraft`;
+  reject it in `setup:verify`.
+- Keep the old Shortcuts-container file visible in verification. If
+  `~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json`
+  exists, warn every time; that stale copy can make a wrong-provider Shortcut
+  appear healthy until the CloudDocs and Shortcuts-container files diverge.
+- During the same iPhone edit session, the Shortcut lost its entire Get File
+  action. `setup:verify` caught this as `ClaudeDraft is missing the Get File
+  action`; restore only from a known-good five-action plist after backing up
+  `~/Library/Shortcuts/Shortcuts.sqlite*`. Keep a fixture test for missing Get
+  File so verifier regressions fail in `bun test`.
+- Presence is not enough for Shortcut validation. The live editor moved Get
+  File to the end once, leaving the dictionary parser wired to an output that
+  no longer existed at runtime. The verifier must require Get File as action 0
+  and require `Get Dictionary from Input` to read that exact action UUID.
+- Recipient appearing in Messages is not proof the body was wired correctly.
+  On iPhone, `ClaudeDraft` opened a compose sheet for Mark but left the body
+  blank because `WFSendMessageContent` was stored as a raw
+  `WFTextTokenAttachment`. Working Shortcuts wrap variable message bodies as a
+  `WFTextTokenString` with the object-replacement placeholder and an
+  `attachmentsByRange` entry pointing at the body dictionary value. The
+  verifier must reject raw body attachments and require the wrapped token
+  string form.
+- Mac-side Shortcut validation is not iPhone validation. A directly patched
+  `~/Library/Shortcuts/Shortcuts.sqlite` can pass locally while the iPhone
+  still has the stale shortcut. If `ClaudeDraft-install.shortcut` is present
+  in iCloud Drive, `setup:verify` must treat the iPhone install as pending
+  after validating the signed artifact, not report the handoff as fully ready.
+- iPhone import uses the `.shortcut` filename as the installed shortcut name.
+  `ClaudeDraft-install.shortcut` imports as `ClaudeDraft-install`, so it does
+  not replace the relay target. To fix the actual iPhone handoff, install a
+  signed file named exactly `ClaudeDraft.shortcut`, then delete both temporary
+  iCloud artifacts after the phone accepts it.
+- The Shortcut validator must enforce the whole five-action chain, not just
+  the presence of safe-looking actions. Extra actions or a second Send Message
+  action can bypass the safety contract even when the first Send Message has
+  `ShowWhenRun=true`.
+- `open sms:...` success is not proof that Messages accepted the body into the
+  compose field. Until there is UI-level confirmation, the Mac fallback should
+  be reported as opened Messages plus clipboard, not as a pasted draft.
+- If `Always Allow` is accidentally granted on the iPhone Shortcut's Send
+  Message privacy prompt, reset it from `ClaudeDraft` editor -> bottom info
+  button -> Privacy -> Reset Privacy. After reset, the `Allow Send Message to
+  use ... Always Allow` row disappears. The source verifier still needs to
+  enforce `ShowWhenRun=true`; the phone-side privacy reset only clears the OS
+  prompt grant.
+
+## 2026-05-14 - Relay runtime hardening: queues, state roots, and partial sends
+
+- Per-chat ordering must cover every Telegram update type, not just text.
+  Voice/photo/document handlers also append to short-term state, so a global
+  per-chat queue middleware is required. If a text handler still calls
+  `enqueue()` internally, make the queue re-entrant with `AsyncLocalStorage`
+  or it will deadlock on itself.
+- Partial Telegram send handling must be uniform. If `sendTelegramResponse`
+  accepts chunk 1 and fails on chunk 2 for voice/photo/document replies, record
+  `telegram_partial_send_after_*` in `errorMsg`, mark the update sent, and save
+  the exact sendable text to Supabase and short-term state.
+- Runtime state defaults must share one base. `RELAY_DIR` should drive logs,
+  update markers, uploads, and short-term chat state unless a specific
+  `RELAY_LOG_DIR` or `RELAY_STATE_DIR` override is set. Do not let
+  `setup:verify` pass a custom `RELAY_DIR` while markers or chat state still
+  write to `~/.claude-relay`.
+- If an update throws before any Telegram-visible reply is accepted, remove it
+  from the in-memory seen set so same-process redelivery can retry. If a sent
+  marker was written, keep it as seen to avoid duplicate replies after a late
+  persistence failure.
+- Claude subprocess cwd should come from `PROJECT_DIR`, `RELAY_CWD`, or the
+  actual repo root, not a hardcoded `~/Projects/claude-telegram-relay` path.
+  Verify the cwd is readable at startup so launchd failures are immediate.
+- launchd reload should remove by label before unloading by plist path, then
+  verify `launchctl list <label>` is absent before loading. Otherwise a stale
+  job loaded from an older path can survive and compete for Telegram polling.
+
+## 2026-05-14 - Relationship aliases and formatted phones must resolve before context drafting
+
+- A request like "open up my recent iMessages with my mom and draft a response"
+  failed before the relay reached `imessage-thread.sh`: the parser only
+  extracted proper-noun contacts, phone numbers, or emails after `to/with`.
+  Lowercase relationship aliases like `my mom` returned `null`, so Claude saw
+  a generic chat prompt and drifted into stale Telegram context. Add explicit
+  relationship-alias parsing for `mom/mum/mother`, `dad/father`, and similar
+  family terms while keeping past-draft references suppressed.
+- Follow-up phrasing can hide the same bug one layer earlier. "Please draft a
+  response back to my mom" still bypassed the iMessage path after the first
+  relationship-alias fix because `response` was not treated as a message-draft
+  type. Keep `reply` and `response` in the message-type detector, with the
+  existing email guard and past-draft guard preventing hijacks like "John's
+  email" or "the response to Mom earlier."
+- Parser fixes must harden the new boundary, not just the live phrase. After
+  adding `response` and `reply`, explicitly suppress meta-questions like
+  "Did you draft a response to Peggy yesterday?" or "Has Claude sent a
+  response to Peggy?" and keep the implicit
+  `respond/reply ... to` bridge limited to `back to` / `right back to` so
+  email idioms such as "reply all to John", "reply-all to John", or "reply
+  all back to John" do not open iMessage placement.
+- AddressBook phone numbers are often formatted, e.g. `1 (604) 315-4583`, but
+  Messages `chat_identifier` values are normalized digits such as
+  `+16043154583`. If the resolver returns the formatted AddressBook value,
+  context lookup can resolve a contact and still return zero messages. Normalize
+  contact phones before returning them, and make `imessage-thread.sh` query all
+  equivalent chat identifier shapes.
+- Live verification for this class of bug should avoid printing private message
+  text. Check only the resolved suffix and message count, for example:
+  `scripts/imessage-thread.sh mom 10 | python3 -c '...'`. Acceptance for the
+  2026-05-14 bug was `resolved=True`, suffix `4583`, and `messages=10`.
+
+## 2026-05-15 - Supabase complements Obsidian; it must not compete with it
+
+- Obsidian is the durable memory source of truth for the relay. Keep
+  `MEMORY_AUTHORITY=obsidian` unless intentionally migrating durable facts and
+  goals to Supabase.
+- Supabase is useful as an operational layer: Telegram message history,
+  semantic search over prior conversations, and later analytics. In that mode,
+  `SUPABASE_MESSAGE_HISTORY=1` and `SUPABASE_RELEVANT_CONTEXT=1` are safe.
+- Do not ask Claude to emit `[REMEMBER]`, `[GOAL]`, or `[DONE]` tags merely
+  because Supabase credentials exist. Those tags write to the Supabase
+  `memory` table, so they are enabled only when
+  `MEMORY_AUTHORITY=supabase`.
+- `setup:verify` and `setup/test-supabase.ts` should require the Supabase
+  `messages` table for history/search, but the `memory` table is optional in
+  the default Obsidian-first architecture.
+
+## 2026-05-15 - Relationship aliases must win over proper nouns inside draft bodies
+
+- Live failure: `Text mom saying heading to London` staged an iMessage draft
+  for `London` instead of Mom. The parser matched the explicit `to London`
+  phrase inside the direct body before checking the relationship alias at the
+  start of the request.
+- Contact extraction must prefer relationship aliases (`mom`, `my mom`,
+  `mother`, `dad`, etc.) before scanning for proper-noun `to/with` contacts
+  in the rest of the sentence. Proper nouns inside the message body are often
+  places, people, or topics, not the recipient.
+- Regression acceptance: `extractIMessageDraftRequest("Text mom saying heading
+  to London")` returns `contact: "mom"` and `directBody: "heading to London"`.
+  Live verification wrote `latest.json` with recipient suffix `4583`, ran the
+  `ClaudeDraft` Shortcut with `Allow Once`, and confirmed the iPhone compose
+  sheet showed `To: Mom` with body `heading to London`.
+- Safety acceptance must include a no-send proof. Querying Messages for the
+  exact body in outgoing messages from the last 30 minutes returned `0` before
+  and after the Shortcut run.
+- Telegram custom-scheme text is not a reliable one-tap trigger. Do not phrase
+  the status as if Telegram will open `shortcuts://` directly. Tell the user
+  the truthful next action: run `ClaudeDraft` in Shortcuts on the iPhone.
+- 2026-05-15 follow-up: Mac Messages showing the draft is not proof that the
+  iPhone compose field is populated. The screenshot showed the Mac compose
+  field contained `heading to London` while iPhone Mirroring still showed an
+  empty `iMessage` input. Do not run Mac Messages placement as a "silent bonus"
+  for phone handoff; it creates a false success signal.
+- Direct `sms:+number&body=...` opened the iPhone thread but did not populate
+  the compose field on this setup. The verified phone path was:
+  open the iPhone Messages thread through mirroir, tap the bottom compose
+  field, type the body through mirroir keyboard input, OCR-check that the body
+  is visible, and never tap the send arrow.
+- Enable the mirroir typed-placement path only when iPhone Mirroring is
+  actively available (`RELAY_IPHONE_MIRROR_PLACEMENT=1`). Keep the CloudDocs
+  `latest.json`/ClaudeDraft Shortcut handoff as a fallback, and use Mac
+  Messages only when phone handoff is unavailable.
+- 2026-05-15 architecture correction: iPhone Mirroring is diagnostic-only, not
+  a production path. The relay's real requirement is remote Mac + local iPhone,
+  so the Mac cannot drive the iPhone compose box directly. Leave
+  `RELAY_IPHONE_MIRROR_PLACEMENT=0` for production. The durable production
+  contract is: relay writes CloudDocs `latest.json`; the iPhone runs
+  `ClaudeDraft` locally; the Shortcut opens the compose sheet with
+  `ShowWhenRun=true`.
+- If the product needs fewer taps, solve it with an iPhone-side trigger, not
+  Mac-side mirroring. Candidate production upgrades: an HTTPS redirect link
+  from Telegram that opens `shortcuts://run-shortcut?name=ClaudeDraft`, or a
+  push-notification workflow such as Pushcut/Pushover that the user taps on
+  the iPhone. Fully automatic background iMessage compose on a personal iPhone
+  is blocked by iOS security unless a local iPhone automation/app participates.
+
+## 2026-05-15 - Re-export iPhone Shortcut installs from the validated Mac shortcut
+
+- Live failure repeated at 10:11: Telegram requests for Mom and Dad wrote a
+  correct CloudDocs `latest.json` (`recipient_label: dad`, suffix `1365`,
+  body `heading to London`), but the iPhone Messages compose field stayed
+  empty. The no-send database check for that exact body returned `0`.
+- Root cause is at the Mac/iPhone Shortcut boundary, not the relay parser or
+  the handoff JSON. If Messages opens to the right recipient with no body, the
+  iPhone still has a stale or miswired `ClaudeDraft` Shortcut.
+- Do not try to sign raw `ZSHORTCUTACTIONS.ZDATA` directly. Apple's
+  `shortcuts sign` can crash on a top-level action array. Wrap the validated
+  action array in a workflow dictionary containing `WFWorkflowActions`, icon,
+  import question, input/output class, type, and client-version keys, convert
+  that workflow to a binary plist, then sign it.
+- The repo command for that path is `bun run setup:export-shortcut`. It reads
+  the Mac-installed `ClaudeDraft`, validates it, signs a file named exactly
+  `ClaudeDraft.shortcut`, writes it to iCloud Drive, and validates the signed
+  artifact. The phone still needs the one-time Files install/replace step.
+- `setup:verify` should fail while `~/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut`
+  remains present. That is an intentional pending-install signal, not a code
+  regression. After the phone is confirmed to populate the compose body,
+  delete the install file from iCloud Drive.
+- Decision logs must not record an iCloud Drive handoff as `placed`. A
+  successful `latest.json` write means the phone input is ready, not that the
+  iPhone compose field is populated. Use `phone_handoff_ready`, and while the
+  signed install artifact still exists, use `phone_shortcut_install_pending`
+  and tell the user to install/replace `ClaudeDraft.shortcut` first.
+
+## 2026-05-15 - Pending Shortcut artifacts are setup failures, not live draft copy
+
+- Live failure: after the fixed `ClaudeDraft.shortcut` install artifact was
+  created in iCloud Drive, every draft request returned a long install/replace
+  instruction block instead of the normal handoff response. That was the wrong
+  product boundary. The live draft path should write `latest.json` and report
+  `phone_handoff_ready`; setup health checks should catch leftover install
+  artifacts separately.
+- A stale `~/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut`
+  file must not change the user-facing response for every Telegram draft.
+  `setup:verify` already fails on that artifact, which is the correct place to
+  surface the pending-install problem.
+- Do not expose `shortcuts://run-shortcut?...` in Telegram copy. Telegram
+  rejects custom schemes in inline keyboards and does not make custom-scheme
+  message text a reliable trigger. Keep the runtime wording simple:
+  `Run ClaudeDraft in Shortcuts on your iPhone.`
+- Keep decision logs precise: CloudDocs handoff is `phone_handoff_ready`, not
+  `placed`. Only a verified iPhone Mirroring typed path or another UI-level
+  proof may use `placed`.
+- Diagnostic iPhone Mirroring verification must prove the body is visible on a
+  Messages compose surface, not merely anywhere on the mirrored phone. A live
+  false positive put `heading to London` in iPhone search suggestions and
+  passed because OCR contained the body. Reject known non-Messages surfaces
+  such as Google Suggestions and Telegram before typing or claiming success.
+- 2026-05-15 Telegram product correction: when phone handoff is not verified,
+  the Telegram chatbot should still show the draft itself, not an operational
+  instruction line. Strip internal `Phone handoff ready: shortcuts://...` from
+  the user-visible reply instead of converting it to `Run ClaudeDraft...`.
+  Keep the handoff path and shortcut URL in decision logs for debugging.
+
+---
+
+## 2026-05-16 — iPhone mirror + iCloud Drive failure fallthrough bug
+
+**File:** `src/relay.ts` lines 1141-1185
+
+**Root cause:** Two independent if-chains evaluate the draft placement outcome. Chain 2 sets `imessageDraftStatus = "phone_handoff_ready"` when `iPhoneMirror?.ok` is true, but never assigns `placement`. Chain 3 ran unconditionally and its final `else if (!handoff?.ok)` fired whenever `handoff.ok` was false — including the case where iPhone mirror had already succeeded. Result: `imessageDraftStatus` and `assistantText` were silently overwritten with `"helper_failed"` and an error message even though the draft was placed successfully.
+
+**Fix:** Wrapped all of chain 3 in `if (placement !== undefined)`. `placement` is only assigned in chain 2's `else` branch, which runs only when both iPhone mirror and iCloud Drive failed. The guard makes the invariant structural rather than relying on `!handoff?.ok` being redundantly true.
+
+**Pattern to watch:** Any time a status variable is set in one if-branch and an independent if-chain runs afterward with a broader condition (`!x` where `x` is false in a successful sibling branch), the successful branch's state can be silently overwritten. Always gate follow-up chains on the concrete evidence of what happened (the assigned variable), not on the absence of a prior failure flag.
