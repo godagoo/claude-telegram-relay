@@ -15,10 +15,10 @@
 # Messages.app deterministically when placing a draft.
 #
 # Requires:
-#   Full Disk Access on the process that ends up running sqlite3. When the
-#   bot invokes this via the Claude CLI's Bash tool, that means FDA must be
-#   granted to the resolved Claude binary at
-#     /Users/williamregan/.local/share/claude/versions/<vN>
+#   Full Disk Access on the process that ends up running sqlite3. The relay
+#   invokes this directly from bun before Claude runs, so FDA must be granted
+#   to the resolved bun Cellar binary (`readlink -f "$(which bun)"`), not to
+#   Terminal and not to the Claude CLI.
 #   See docs/IMESSAGE-SETUP.md for the one-time setup.
 #
 # Output goes to the relay's local short-term context, never to a remote
@@ -33,6 +33,16 @@ fi
 
 RECIPIENT="$1"
 LIMIT="${2:-20}"
+
+if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+  echo "error: LIMIT must be a positive integer" >&2
+  exit 64
+fi
+if (( LIMIT < 1 )); then
+  LIMIT=1
+elif (( LIMIT > 50 )); then
+  LIMIT=50
+fi
 
 DB="$HOME/Library/Messages/chat.db"
 CONTACTS_DB="$HOME/Library/Application Support/AddressBook/AddressBook-v22.abcddb"
@@ -49,6 +59,106 @@ fi
 sql_string() {
   # SQLite single-quoted string escaping.
   printf "%s" "$1" | sed "s/'/''/g"
+}
+
+json_string() {
+  local s="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    JSON_VALUE="$s" python3 - <<'PY'
+import json
+import os
+print(json.dumps(os.environ["JSON_VALUE"]), end="")
+PY
+    return
+  fi
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '"%s"' "$s"
+}
+
+chat_identifier_candidates_sql() {
+  local identifier="$1"
+  local digits without_country candidate seen already out
+  local -a candidates unique
+
+  candidates=("$identifier")
+
+  if [[ "$identifier" != *"@"* ]]; then
+    digits="$(printf "%s" "$identifier" | tr -cd '0-9')"
+    if [[ -n "$digits" ]]; then
+      candidates+=("$digits" "+$digits")
+      if [[ ${#digits} -eq 10 ]]; then
+        candidates+=("1$digits" "+1$digits")
+      elif [[ ${#digits} -eq 11 && "$digits" == 1* ]]; then
+        without_country="${digits#1}"
+        candidates+=("$without_country" "+$without_country")
+      fi
+    fi
+  fi
+
+  unique=()
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" ]] || continue
+    already=0
+    if (( ${#unique[@]} > 0 )); then
+      for seen in "${unique[@]}"; do
+        if [[ "$seen" == "$candidate" ]]; then
+          already=1
+          break
+        fi
+      done
+    fi
+    (( already == 0 )) && unique+=("$candidate")
+  done
+
+  out=""
+  if (( ${#unique[@]} > 0 )); then
+    for candidate in "${unique[@]}"; do
+      if [[ -n "$out" ]]; then
+        out+=", "
+      fi
+      out+="'$(sql_string "$candidate")'"
+    done
+  fi
+  printf "%s" "$out"
+}
+
+is_fda_sqlite_error() {
+  local msg
+  msg="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$msg" == *"authorization"* ||
+     "$msg" == *"operation not permitted"* ||
+     "$msg" == *"unable to open database"* ||
+     "$msg" == *"permission denied"* ]]
+}
+
+sqlite_query_or_exit() {
+  local sql="$1"
+  local err_file out status err
+  err_file="$(mktemp "${TMPDIR:-/tmp}/imessage-thread-sqlite.XXXXXX")"
+  set +e
+  out="$(sqlite3 -readonly "$DB" 2>"$err_file" <<<"$sql")"
+  status=$?
+  set -e
+  err="$(cat "$err_file")"
+  rm -f "$err_file"
+  if (( status != 0 )); then
+    if is_fda_sqlite_error "$err"; then
+      cat <<EOF >&2
+error: cannot read $DB
+Full Disk Access is not granted for the current process. See
+docs/IMESSAGE-SETUP.md for the one-time setup.
+$err
+EOF
+      exit 77
+    fi
+    printf "%s\n" "$err" >&2
+    exit "$status"
+  fi
+  printf "%s" "$out"
 }
 
 is_direct_identifier() {
@@ -92,13 +202,41 @@ resolve_recipient() {
   local script_dir
   script_dir="$(cd "$(dirname "$0")" && pwd)"
   local resolver="$script_dir/resolve-contact.py"
-  if [[ -x "$resolver" ]] && command -v python3 >/dev/null 2>&1; then
-    local contact
-    contact="$("$resolver" "$input" 2>/dev/null)"
+  if [[ ! -f "$resolver" ]]; then
+    echo "error: contact resolver missing: $resolver" >&2
+    return 66
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: python3 not found; required for contact aliases in $resolver" >&2
+    return 66
+  fi
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 7) else 1)
+PY
+  then
+    local version
+    version="$(python3 --version 2>&1 || true)"
+    echo "error: python3 >= 3.7 required for $resolver; got ${version:-unknown}" >&2
+    return 66
+  fi
+
+  local contact err_file
+  err_file="$(mktemp "${TMPDIR:-/tmp}/resolve-contact.XXXXXX")"
+  if contact="$(python3 "$resolver" "$input" 2>"$err_file")"; then
+    rm -f "$err_file"
     if [[ -n "$contact" ]]; then
       printf "%s" "$contact"
       return 0
     fi
+  else
+    local status=$?
+    printf "error: contact resolver failed for recipient %q (exit %s)\n" "$input" "$status" >&2
+    if [[ -s "$err_file" ]]; then
+      sed 's/^/resolve-contact.py: /' "$err_file" >&2
+    fi
+    rm -f "$err_file"
+    return 66
   fi
 
   if ! allow_message_text_fallback "$input"; then
@@ -112,7 +250,8 @@ resolve_recipient() {
   # safely.
   local q
   q="$(sql_string "$input")"
-  sqlite3 -readonly "$DB" <<SQL
+  local sql
+  sql="$(cat <<SQL
 SELECT c.chat_identifier
 FROM message m
 JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
@@ -123,6 +262,8 @@ GROUP BY c.ROWID
 ORDER BY MAX(m.date) DESC
 LIMIT 1;
 SQL
+)"
+  sqlite_query_or_exit "$sql"
 }
 
 RESOLVED_RECIPIENT="$(resolve_recipient "$RECIPIENT")"
@@ -131,13 +272,9 @@ if [[ -z "$RESOLVED_RECIPIENT" ]]; then
   exit 0
 fi
 
-# Normalize: strip a leading + so we can match both '+16045555555' and
-# '16045555555' shapes in chat_identifier.
-NAKED="${RESOLVED_RECIPIENT#+}"
-SQL_RECIPIENT="$(sql_string "$RESOLVED_RECIPIENT")"
-SQL_NAKED="$(sql_string "$NAKED")"
+SQL_CHAT_IDENTIFIERS="$(chat_identifier_candidates_sql "$RESOLVED_RECIPIENT")"
 
-MESSAGES_JSON="$(sqlite3 -readonly "$DB" <<SQL
+SQL_MESSAGES="$(cat <<SQL
 .mode json
 SELECT
   m.ROWID AS id,
@@ -147,19 +284,17 @@ SELECT
 FROM message m
 JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
 JOIN chat c ON c.ROWID = cmj.chat_id
-WHERE c.chat_identifier IN ('$SQL_RECIPIENT', '+$SQL_NAKED', '$SQL_NAKED', '+1$SQL_NAKED')
+WHERE c.chat_identifier IN ($SQL_CHAT_IDENTIFIERS)
   AND m.text IS NOT NULL
   AND m.text != ''
 ORDER BY m.date DESC
 LIMIT $LIMIT;
 SQL
 )"
+MESSAGES_JSON="$(sqlite_query_or_exit "$SQL_MESSAGES")"
 
 # sqlite3 .mode json emits nothing for zero rows; coerce to an empty array so
 # the envelope is always valid JSON.
 [[ -z "$MESSAGES_JSON" ]] && MESSAGES_JSON='[]'
 
-# Resolved recipient is always a phone, email, or sanitized chat_identifier
-# (group-chat ids are filtered out upstream), so it never contains characters
-# that would break this raw JSON embedding.
-printf '{"resolved":"%s","messages":%s}\n' "$RESOLVED_RECIPIENT" "$MESSAGES_JSON"
+printf '{"resolved":%s,"messages":%s}\n' "$(json_string "$RESOLVED_RECIPIENT")" "$MESSAGES_JSON"

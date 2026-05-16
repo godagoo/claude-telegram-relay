@@ -1059,19 +1059,27 @@ bot.on("message:text", async (ctx) => {
         //     for the iPhone Shortcut handoff.
         //   - resolved + handoff unavailable → place into that contact's
         //     existing Mac thread.
-        //   - !resolved → open a fresh New Message compose on the Mac with the
-        //     body prefilled and the To: field blank (NEW_COMPOSE_SENTINEL).
-        // FDA-denied is the one case where we cannot place anything at all —
-        // it points to a setup problem the user has to fix first.
-        if (!resolved && imessageContextResult?.status === "fda_denied") {
+        //   - genuinely unresolved contact -> open a fresh New Message compose
+        //     on the Mac with the body prefilled and the To: field blank.
+        // Context lookup failures are setup/runtime problems, not a safe reason
+        // to open a blank-recipient compose.
+        const contextStatus = imessageContextResult?.status;
+        if (
+          !resolved &&
+          (contextStatus === "fda_denied" ||
+            contextStatus === "error" ||
+            contextStatus === "timeout")
+        ) {
           imessageDraftStatus = "no_recipient";
-          const hint = "Couldn't open Messages on your Mac — Full Disk Access is missing. See docs/IMESSAGE-SETUP.md.";
+          const hint = contextStatus === "fda_denied"
+            ? "Couldn't open Messages on your Mac - Full Disk Access is missing. See docs/IMESSAGE-SETUP.md."
+            : "Couldn't place this in Messages because contact resolution failed. Run `bun run setup:verify` on the Mac and check the relay logs.";
           assistantText = rebuildAroundDraftBlock(
             assistantText,
             `${body}\n\n${hint}`,
           );
           console.error(
-            `[imessage-draft] no_recipient for ${contactLabel} (context_status=fda_denied)`,
+            `[imessage-draft] no_recipient for ${contactLabel} (context_status=${contextStatus}${imessageContextResult?.error ? ` error=${JSON.stringify(imessageContextResult.error)}` : ""})`,
           );
         } else {
           // Phone handoff:

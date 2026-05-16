@@ -45,6 +45,24 @@ function pass(msg: string) { console.log(`  ${PASS} ${msg}`); passed++; }
 function fail(msg: string) { console.log(`  ${FAIL} ${msg}`); failed++; }
 function warn(msg: string) { console.log(`  ${WARN} ${msg}`); warned++; }
 
+async function runCommand(
+  args: string[],
+  options: { cwd?: string; env?: Record<string, string | undefined> } = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: options.cwd,
+    env: options.env,
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
 function privateDirOk(path: string): boolean {
   try {
     const stat = statSync(path);
@@ -224,6 +242,69 @@ async function main() {
     existsSync(legacyShortcutsPath)
       ? warn(`Legacy Shortcuts-container draft still exists: ${legacyShortcutsPath}`)
       : pass("No stale Shortcuts-container draft file");
+
+    console.log(`\n${bold("  iMessage Contact Resolver")}`);
+    const resolverPath = join(PROJECT_ROOT, "scripts", "resolve-contact.py");
+    const launchdPath = `${homedir()}/.bun/bin:/usr/local/bin:/usr/bin:/bin`;
+    const resolverEnv = { ...process.env, PATH: launchdPath, HOME: homedir() };
+
+    if (!existsSync(resolverPath)) {
+      fail(`Contact resolver missing: ${resolverPath}`);
+    } else {
+      const stat = statSync(resolverPath);
+      (stat.mode & 0o111) !== 0
+        ? pass("Contact resolver is executable")
+        : fail(`Contact resolver is not executable: chmod +x ${resolverPath}`);
+    }
+
+    if (!(await commandExists("python3"))) {
+      fail("python3 not found in current PATH");
+    } else {
+      const version = await runCommand([
+        "python3",
+        "-c",
+        "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'); raise SystemExit(0 if sys.version_info >= (3, 7) else 1)",
+      ]);
+      if (version.code === 0) {
+        pass(`python3 ${version.stdout.trim()} available`);
+      } else {
+        fail(`python3 must be >= 3.7 for scripts/resolve-contact.py; got ${version.stdout.trim() || version.stderr.trim() || "unknown"}`);
+      }
+    }
+
+    const launchdPython = await runCommand(
+      [
+        "/bin/sh",
+        "-c",
+        "command -v python3 && python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\")'",
+      ],
+      { env: resolverEnv },
+    );
+    if (launchdPython.code === 0) {
+      pass(`launchd PATH resolves python3: ${launchdPython.stdout.trim().replace(/\n/g, " ")}`);
+    } else {
+      fail(`launchd PATH cannot resolve python3 from ${launchdPath}`);
+    }
+
+    if (existsSync(resolverPath) && launchdPython.code === 0) {
+      const compile = await runCommand(["python3", "-m", "py_compile", resolverPath], {
+        cwd: PROJECT_ROOT,
+        env: resolverEnv,
+      });
+      compile.code === 0
+        ? pass("Contact resolver compiles with launchd python3")
+        : fail(`Contact resolver does not compile with launchd python3: ${(compile.stderr || compile.stdout).trim()}`);
+
+      const directResolution = await runCommand(
+        ["python3", resolverPath, "+15555550123"],
+        { cwd: PROJECT_ROOT, env: resolverEnv },
+      );
+      directResolution.code === 0 && directResolution.stdout.trim() === "+15555550123"
+        ? pass("Contact resolver smoke test returns direct phone identifiers")
+        : fail(
+          `Contact resolver smoke test failed: code=${directResolution.code} stdout=${JSON.stringify(directResolution.stdout.trim())} stderr=${JSON.stringify(directResolution.stderr.trim())}`,
+        );
+    }
 
     if (await commandExists("shortcuts")) {
       pass("shortcuts CLI installed");
