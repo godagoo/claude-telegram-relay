@@ -1455,3 +1455,22 @@
   choose the first relationship contact. Until the relay has real group-thread
   support, opt out of one-contact automation rather than drafting to only one
   person.
+
+## 2026-05-16 — Telegram polling diagnostics: do not over-claim ownership
+
+- `bot.start({ onStart })` does not prove this process owns long polling.
+  grammY can invoke `onStart` before a later `getUpdates` call fails with 409,
+  so logs must say "polling attempt" until the process has survived without a
+  conflict. Avoid "owner" wording unless ownership is actually proven.
+- A zero-timeout `getUpdates` probe can succeed during a quiet window while a
+  different 30-second long poller wins the next race. It is useful as a token
+  reachability check, not as proof that no other machine or service owns the
+  bot token.
+- Telegram 409 handling must stay scoped to `getUpdates`. A generic
+  `error_code=409` from `sendMessage` or another Telegram method should not be
+  converted into an infinite polling retry loop. Classify method and message
+  together before suppressing the exception.
+- Persistent polling conflicts need token-safe operator diagnostics: attempt
+  count, elapsed seconds, retry delay, PID, lock path, plugin config presence,
+  local process count, and webhook status. Never print the token, token hash,
+  or full Telegram API URL.

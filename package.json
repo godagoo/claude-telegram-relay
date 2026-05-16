@@ -5,12 +5,16 @@
   "scripts": {
     "start": "bun run src/relay.ts",
     "dev": "bun run --watch src/relay.ts",
+    "test": "bun test",
+    "test:smoke": "bun run scripts/smoke-poison-query.ts && bun run scripts/smoke-textbook-retrieval.ts",
+    "verify": "bun test && bun run test:smoke && bun run setup:verify",
     "setup": "bun run setup/install.ts",
     "test:telegram": "bun run setup/test-telegram.ts",
     "test:supabase": "bun run setup/test-supabase.ts",
     "test:voice": "bun run setup/test-voice.ts",
     "setup:launchd": "bun run setup/configure-launchd.ts",
     "setup:services": "bun run setup/configure-services.ts",
+    "setup:export-shortcut": "bun run setup/export-claudedraft-shortcut.ts",
     "setup:verify": "bun run setup/verify.ts"
   },
   "dependencies": {
@@ -19,6 +23,7 @@
     "groq-sdk": "^0.8.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/bun": "latest"
   }
 }

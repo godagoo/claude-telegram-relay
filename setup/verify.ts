@@ -7,7 +7,7 @@
  * Usage: bun run setup/verify.ts
  */
 
-import { existsSync, statSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import { join, dirname, basename } from "path";
 import { homedir } from "os";
 import {
@@ -81,6 +81,17 @@ async function commandExists(cmd: string): Promise<boolean> {
   return (await proc.exited) === 0;
 }
 
+async function getProcessLines(): Promise<string[] | undefined> {
+  const result = await runCommand(["/bin/ps", "axww", "-o", "pid=,command="]);
+  if (result.code !== 0) return undefined;
+  return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+function pidFromProcessLine(line: string): number | undefined {
+  const pid = Number.parseInt(line.trim().split(/\s+/, 1)[0], 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
 // Load .env
 async function loadEnv(): Promise<Record<string, string>> {
   try {
@@ -122,6 +133,7 @@ async function main() {
   console.log(`\n${bold("  Telegram")}`);
   const token = env.TELEGRAM_BOT_TOKEN || "";
   const userId = env.TELEGRAM_USER_ID || "";
+  let telegramTokenValid = false;
 
   if (!token || token.includes("your_")) {
     fail("TELEGRAM_BOT_TOKEN not set");
@@ -129,7 +141,12 @@ async function main() {
     try {
       const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
       const data = await res.json() as any;
-      data.ok ? pass(`Bot: @${data.result.username}`) : fail(`Invalid token: ${data.description}`);
+      if (data.ok) {
+        telegramTokenValid = true;
+        pass(`Bot: @${data.result.username}`);
+      } else {
+        fail(`Invalid token: ${data.description}`);
+      }
     } catch (e: any) {
       fail(`Telegram API unreachable: ${e.message}`);
     }
@@ -156,6 +173,44 @@ async function main() {
     );
   } else {
     pass("No competing Claude Telegram plugin config found");
+  }
+
+  const processLines = await getProcessLines();
+  if (processLines) {
+    const pluginProcesses = processLines.filter((line) =>
+      line.includes("claude-plugins-official/telegram") ||
+      line.includes("telegram/0.0.6")
+    );
+    if (pluginProcesses.length > 0) {
+      fail(`Competing Claude Telegram plugin process found (${pluginProcesses.length})`);
+    } else {
+      pass("No competing Claude Telegram plugin process found");
+    }
+  } else {
+    warn("Could not inspect local process list for Telegram plugin conflicts");
+  }
+
+  if (telegramTokenValid) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`);
+      const data = await res.json() as any;
+      const webhookUrl = typeof data?.result?.url === "string" ? data.result.url : "";
+      const pendingCount = Number.isInteger(data?.result?.pending_update_count)
+        ? data.result.pending_update_count
+        : 0;
+      if (!data.ok) {
+        warn(`Telegram getWebhookInfo failed: ${data.description || "unknown error"}`);
+      } else if (webhookUrl) {
+        fail(
+          "Telegram webhook is configured for this bot token; getUpdates polling will conflict. " +
+          `Pending updates: ${pendingCount}`,
+        );
+      } else {
+        pass(`Telegram webhook inactive; pending updates: ${pendingCount}`);
+      }
+    } catch (e: any) {
+      warn(`Telegram getWebhookInfo unreachable: ${e.message}`);
+    }
   }
 
   // 3. Supabase
@@ -209,6 +264,40 @@ async function main() {
       const proc = Bun.spawn(["launchctl", "list", label], { stdout: "pipe", stderr: "pipe" });
       const code = await proc.exited;
       code === 0 ? pass(`${label} loaded`) : warn(`${label} not loaded`);
+    }
+
+    const serviceProcessLines = processLines || await getProcessLines();
+    if (serviceProcessLines) {
+      const relayProcesses = serviceProcessLines.filter((line) =>
+        line.includes("bun run src/relay.ts") ||
+        /\/bun(?:\s|.*\s)run\s+src\/relay\.ts/.test(line)
+      );
+      if (relayProcesses.length > 1) {
+        fail(`Multiple local relay processes found (${relayProcesses.length})`);
+      } else if (relayProcesses.length === 1) {
+        pass("Exactly one local relay process found");
+      } else {
+        warn("No local relay process found");
+      }
+
+      const lockPath = join(RELAY_DIR, "bot.lock");
+      if (existsSync(lockPath)) {
+        const lockPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+        const relayPids = relayProcesses
+          .map(pidFromProcessLine)
+          .filter((pid): pid is number => pid !== undefined);
+        if (relayPids.length > 0 && !relayPids.includes(lockPid)) {
+          fail(`bot.lock PID ${lockPid} does not match the running relay process`);
+        } else if (Number.isInteger(lockPid) && lockPid > 0) {
+          pass(`bot.lock PID ${lockPid} is consistent with local relay state`);
+        } else {
+          fail("bot.lock does not contain a valid PID");
+        }
+      } else {
+        warn("bot.lock not found; relay may not be running");
+      }
+    } else {
+      warn("Could not inspect local relay processes");
     }
 
     console.log(`\n${bold("  iMessage Handoff")}`);

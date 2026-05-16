@@ -9,7 +9,7 @@
 
 import { Bot } from "grammy";
 import { spawn } from "bun";
-import { constants } from "fs";
+import { constants, existsSync } from "fs";
 import { writeFile, mkdir, readFile, unlink, access, open, chmod, rm } from "fs/promises";
 import { join, dirname, basename, extname } from "path";
 import { homedir } from "os";
@@ -74,7 +74,10 @@ import {
 } from "./telegram-response.ts";
 import {
   TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
-  isTelegramPollingConflictError,
+  classifyTelegramPollingConflictError,
+  formatTelegramPollingConflictHint,
+  formatTelegramPollingConflictLog,
+  shouldEscalateTelegramPollingConflict,
 } from "./telegram-polling.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "./arch-check.ts";
@@ -1876,24 +1879,42 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function startTelegramPolling(): Promise<void> {
+  let conflictAttempts = 0;
+  let firstConflictAt = 0;
+  const claudePluginEnvPath = join(homedir(), ".claude", "channels", "telegram", ".env");
+
   for (;;) {
     try {
       await bot.start({
         onStart: () => {
-          console.log("Bot is running!");
+          console.log("Bot polling loop started.");
           console.log(
-            `[telegram] long polling owner: claude-telegram-relay pid=${process.pid}`,
+            `[telegram] long polling attempt: claude-telegram-relay pid=${process.pid}`,
           );
         },
       });
       return;
     } catch (err) {
-      if (!isTelegramPollingConflictError(err)) throw err;
+      const diagnosis = classifyTelegramPollingConflictError(err);
+      if (!diagnosis) throw err;
 
+      conflictAttempts += 1;
+      if (firstConflictAt === 0) firstConflictAt = Date.now();
+      const pluginEnvExists = existsSync(claudePluginEnvPath);
       console.error(
-        `[bot] Telegram getUpdates conflict; another poller is using this bot token. ` +
-        `Retrying in ${TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS}ms.`,
+        formatTelegramPollingConflictLog({
+          diagnosis,
+          attempt: conflictAttempts,
+          elapsedMs: Date.now() - firstConflictAt,
+          pid: process.pid,
+          retryDelayMs: TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
+          lockFile: LOCK_FILE,
+          pluginEnvExists,
+        }),
       );
+      if (shouldEscalateTelegramPollingConflict(conflictAttempts)) {
+        console.error(formatTelegramPollingConflictHint({ diagnosis, pluginEnvExists }));
+      }
       await sleep(TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS);
     }
   }
