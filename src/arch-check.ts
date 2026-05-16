@@ -56,9 +56,9 @@ export function isRosettaProcess(): boolean {
 /**
  * Checks bun (process.execPath) and claude (claudePath).
  * hasWarnings is true when any binary is x86_64 OR currentProcessRosetta.
- * ASYNC.
+ * SYNCHRONOUS.
  */
-export async function checkRelayBinaries(claudePath: string): Promise<ArchReport> {
+export function checkRelayBinaries(claudePath: string): ArchReport {
   const currentProcessRosetta = isRosettaProcess();
 
   const bunArch = getBinaryArch(process.execPath);

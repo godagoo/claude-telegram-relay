@@ -1,4 +1,4 @@
-import { expect, test, spyOn, afterEach } from "bun:test";
+import { expect, test, spyOn } from "bun:test";
 import {
   getBinaryArch,
   isRosettaProcess,
@@ -89,24 +89,24 @@ test("isRosettaProcess returns false when sysctl fails", () => {
   expect(result).toBe(false);
 });
 
-test("checkRelayBinaries hasWarnings false when all arm64", async () => {
+test("checkRelayBinaries hasWarnings false when all arm64", () => {
   const spy = spyOn(Bun, "spawnSync")
     .mockReturnValueOnce(mockResult("0\n"))                              // isRosettaProcess sysctl
     .mockReturnValueOnce(mockResult("/path: Mach-O 64-bit executable arm64")) // bun arch
     .mockReturnValueOnce(mockResult("/path: Mach-O 64-bit executable arm64")); // claude arch
-  const report = await checkRelayBinaries("/usr/local/bin/claude");
+  const report = checkRelayBinaries("/usr/local/bin/claude");
   spy.mockRestore();
   expect(report.hasWarnings).toBe(false);
   expect(report.bun.arch).toBe("arm64");
   expect(report.claude.arch).toBe("arm64");
 });
 
-test("checkRelayBinaries hasWarnings true when bun is x86_64", async () => {
+test("checkRelayBinaries hasWarnings true when bun is x86_64", () => {
   const spy = spyOn(Bun, "spawnSync")
     .mockReturnValueOnce(mockResult("0\n"))                              // isRosettaProcess sysctl
     .mockReturnValueOnce(mockResult("/path: Mach-O 64-bit executable x86_64")) // bun arch
     .mockReturnValueOnce(mockResult("/path: Mach-O 64-bit executable arm64")); // claude arch
-  const report = await checkRelayBinaries("/usr/local/bin/claude");
+  const report = checkRelayBinaries("/usr/local/bin/claude");
   spy.mockRestore();
   expect(report.hasWarnings).toBe(true);
   expect(report.bun.rosettaWarning).toBe(true);
