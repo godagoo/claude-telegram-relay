@@ -1746,3 +1746,18 @@
   automatic placement when the latest decoded thread message is already from
   the user. That is safer than inventing a new follow-up to an already answered
   thread.
+
+## 2026-05-17 — Clear stale iPhone handoffs before every new draft attempt
+
+- Live issue: after Jacqueline's draft was written to `latest.json`, a later
+  Nater command fell through the non-draft path and then failed the first
+  fixed draft run because a decoded Messages row contained a null byte. During
+  both failures, `latest.json` still pointed at Jacqueline, so ClaudeDraft
+  reopened the wrong compose even though Telegram showed a new Nater draft.
+- Fix pattern: as soon as the relay recognizes a new iMessage placement
+  request, delete the old CloudDocs `latest.json` before Claude runs. If the
+  new request fails, ClaudeDraft should find no stale handoff rather than a
+  previous recipient/body.
+- Also sanitize decoded iMessage text for null/control bytes before injecting
+  it into the Claude CLI prompt. Bun refuses spawn args containing null bytes,
+  so raw `attributedBody` extraction must never feed `\0` into `callClaude`.

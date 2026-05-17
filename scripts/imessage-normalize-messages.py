@@ -33,6 +33,7 @@ CLASS_MARKERS = (
 
 def _clean_text(value: str) -> str:
     value = value.replace("\ufffc", " ")
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
 

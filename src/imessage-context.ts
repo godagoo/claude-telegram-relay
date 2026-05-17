@@ -124,7 +124,7 @@ const RELATIONSHIP_CONTACT_RE =
 const MULTI_RELATIONSHIP_CONTACT_RE =
   /\b(?:[Ww]ith|[Tt]o|[Ff]or|[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\s+(?:and|&)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
 const COMMAND_POSITION_CONTACT_RE =
-  /^\s*(?:(?:[Pp]lease|[Pp]ls|[Cc]an you|[Cc]ould you|[Ww]ould you)\s+)?(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[a-z][a-z'\-]{1,30}(?:\s+[a-z][a-z'\-]{1,30}){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|with|about|letting|telling)\b))/;
+  /^\s*(?:(?:[Oo]k(?:ay)?|[Aa]lright|[Ss]ure)[,.\s]+)?(?:(?:[Pp]lease|[Pp]ls|[Cc]an you|[Cc]ould you|[Ww]ould you)\s+)?(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[a-z][a-z'\-]{1,30}(?:\s+[a-z][a-z'\-]{1,30}){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|with|about|letting|telling)\b))/;
 
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();

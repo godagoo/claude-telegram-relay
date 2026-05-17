@@ -938,6 +938,18 @@ bot.on("message:text", async (ctx) => {
         `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length} render_context=${shouldInjectContext} placement=${wantsIMessagePlacement}`,
       );
     }
+    if (wantsIMessagePlacement) {
+      const clearDraft = await clearICloudDriveDraft();
+      if (clearDraft.ok) {
+        console.log(
+          `[imessage-draft] cleared stale iCloud handoff before new placement request path=${clearDraft.path ?? "unknown"}`,
+        );
+      } else {
+        console.error(
+          `[imessage-draft] failed to clear stale iCloud handoff before new placement request: ${clearDraft.error ?? "unknown error"}`,
+        );
+      }
+    }
     const recentBlock = renderRecentTurnsPlain(recentTurns, MAX_RECENT_TURNS_RENDERED, {
       suppressStaleIMessageFailures: Boolean(imessageContextResult),
     });

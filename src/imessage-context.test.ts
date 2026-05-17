@@ -274,6 +274,20 @@ test("command-position lowercase names trigger direct drafts", () => {
   });
 });
 
+test("command-position drafts allow short conversational lead-ins", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Okay, text Nater saying looking forward to our next fire",
+    ),
+  ).toEqual({
+    contact: "Nater",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "looking forward to our next fire",
+  });
+});
+
 test("message and ping command-position recipients trigger direct drafts", () => {
   expect(
     extractIMessageDraftRequest("Message Peggy saying thanks"),
@@ -523,6 +537,14 @@ test("iMessage normalizer decodes attributedBody rows before stale text rows", a
       associated_message_type: 0,
     },
     {
+      id: 4,
+      sender: "me",
+      ts: "2026-05-17 09:59:30",
+      text: "\u0000All good bro",
+      attributed_body_hex: "",
+      associated_message_type: 0,
+    },
+    {
       id: 2,
       sender: "me",
       ts: "2026-05-17 09:59:00",
@@ -545,7 +567,7 @@ test("iMessage normalizer decodes attributedBody rows before stale text rows", a
       "python3",
       join(PROJECT_ROOT, "scripts", "imessage-normalize-messages.py"),
       "+15555550123",
-      "2",
+      "3",
     ],
     {
       stdin: "pipe",
@@ -568,6 +590,7 @@ test("iMessage normalizer decodes attributedBody rows before stale text rows", a
   const parsed = JSON.parse(stdout);
   expect(parsed.messages.map((m: { text: string }) => m.text)).toEqual([
     current,
+    "All good bro",
     "Older plain text",
   ]);
 });
