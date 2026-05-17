@@ -1583,3 +1583,31 @@
   semantics. A dormant safety module with a slightly different state path will
   pass unit tests and then fail when wired into launchd. Also avoid logging raw
   iMessage recipients when an allowlist is missing; the failure reason is enough.
+
+## 2026-05-17 — Contact alias override for AddressBook / chat.db mismatches
+
+- The contact resolver can confidently return the wrong number when the
+  user's AddressBook and Messages.app diverge. Live failure 2026-05-17:
+  every `Text dad saying heading to London` resolved to `+16048741365`
+  (AddressBook contact "Dad", primary phone) which has zero messages in
+  `chat.db`; the phone William actually messages his father on is
+  `+16043154583`, stored in AddressBook under contact "Mom" (shared
+  household phone, 726 messages with the nickname "Billy"). The chat
+  context fetch then returned empty on every attempt, the relay
+  short-circuited to "use the literal command body" because `directBody`
+  was set and `wantsContext` was false, never called Claude (`claude_ms=0`),
+  and the iCloud handoff wrote a draft to the wrong number.
+- Fix: `~/.claude-relay/contact-aliases.json` is consulted BEFORE the
+  AddressBook lookup in `scripts/resolve-contact.py`. Format is a flat
+  JSON object mapping lowercased alias to phone-or-email. Direct
+  identifiers (a phone or email typed at Telegram) skip the file
+  entirely. Phone values are normalized to E.164 on load. Malformed or
+  missing files are silently ignored so the AddressBook fallback path
+  keeps working for unknown aliases.
+- The default path is overridable via `RELAY_CONTACT_ALIASES_PATH`.
+  Tests in `src/imessage-contact-alias.test.ts` use a temp file so they
+  are independent of the user's real production alias map.
+- Open follow-up: the relay's Telegram reply for a draft should surface
+  the resolved phone, so the user catches a wrong number BEFORE running
+  ClaudeDraft. Today the reply is just "Run ClaudeDraft in Shortcuts on
+  your iPhone." with no indication of which handle the draft will go to.
