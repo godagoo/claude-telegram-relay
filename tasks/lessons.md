@@ -1383,6 +1383,12 @@
   file must not change the user-facing response for every Telegram draft.
   `setup:verify` already fails on that artifact, which is the correct place to
   surface the pending-install problem.
+- 2026-05-17 correction: if the phone has just lost/deleted all shortcuts and
+  the fixed `ClaudeDraft.shortcut` install artifact is present, a plain "Run
+  ClaudeDraft" status is misleading because the iPhone target may not exist.
+  Surface `phone_shortcut_install_pending` with the exact Files -> iCloud Drive
+  -> `ClaudeDraft.shortcut` install/replace instruction until the artifact is
+  removed after a real iPhone compose-body verification.
 - Do not expose `shortcuts://run-shortcut?...` in Telegram copy. Telegram
   rejects custom schemes in inline keyboards and does not make custom-scheme
   message text a reliable trigger. Keep the runtime wording simple:

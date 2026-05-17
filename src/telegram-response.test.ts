@@ -25,6 +25,13 @@ test("prepareTelegramResponseText applies fallback and phone handoff formatting"
   ).toBe("heading to London\n\nDrafting to dad (+16048092405). Run ClaudeDraft in Shortcuts on your iPhone.");
   expect(
     prepareTelegramResponseText(
+      "heading to London\n\nClaudeDraft is not installed on your iPhone yet. Open Files > iCloud Drive > ClaudeDraft.shortcut, tap Replace or Add Shortcut, then run ClaudeDraft. Draft target: dad (+16048092405).",
+    ),
+  ).toBe(
+    "heading to London\n\nClaudeDraft is not installed on your iPhone yet. Open Files > iCloud Drive > ClaudeDraft.shortcut, tap Replace or Add Shortcut, then run ClaudeDraft. Draft target: dad (+16048092405).",
+  );
+  expect(
+    prepareTelegramResponseText(
       "Phone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
   ).toBe("Run ClaudeDraft in Shortcuts on your iPhone.");

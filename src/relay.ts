@@ -70,6 +70,7 @@ import {
   type DecisionRecord,
 } from "./decision-log.ts";
 import {
+  shortcutInstallPath,
   writeICloudDriveDraft,
 } from "./icloud-drive-draft.ts";
 import {
@@ -1147,11 +1148,16 @@ bot.on("message:text", async (ctx) => {
             }
             // iCloud Drive succeeded, but that only prepares the Shortcut input.
             // It is not proof the iPhone compose box is populated.
-            imessageDraftStatus = "phone_handoff_ready";
+            const shortcutInstallPending = existsSync(shortcutInstallPath());
+            imessageDraftStatus = shortcutInstallPending
+              ? "phone_shortcut_install_pending"
+              : "phone_handoff_ready";
             imessageDraftMode = "icloud_drive_file";
             assistantText = rebuildAroundDraftBlock(
               assistantText,
-              `${body}\n\nPhone handoff ready for ${contactLabel} (${resolved}): ${handoff.shortcutUrl}`,
+              shortcutInstallPending
+                ? `${body}\n\nClaudeDraft is not installed on your iPhone yet. Open Files > iCloud Drive > ClaudeDraft.shortcut, tap Replace or Add Shortcut, then run ClaudeDraft. Draft target: ${contactLabel} (${resolved}).`
+                : `${body}\n\nPhone handoff ready for ${contactLabel} (${resolved}): ${handoff.shortcutUrl}`,
             );
           } else {
             placement = await placeIMessageDraft(PROJECT_ROOT, target, body);
