@@ -28,3 +28,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Git worktrees (created by superpowers:using-git-worktrees)
+.worktrees/
