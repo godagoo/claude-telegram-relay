@@ -1558,3 +1558,28 @@
 - Do not advertise tools Claude cannot actually use. If normal Telegram turns
   pass no Bash tool, the prompt must not tell Claude to call email or message
   helper scripts.
+
+## 2026-05-17 - Draft-router as the single outbound chokepoint
+
+- `src/draft-router.ts` is the architectural place for outbound safety. Two
+  draft-only acceptance properties hold by test:
+    1. em-dash gate refuses to emit text containing U+2014 (em-dash) or
+       U+2013 (en-dash)
+    2. iMessage recipient allowlist gate fails-closed on missing or malformed
+       allowlist file, refusing every recipient until the file exists with a
+       JSON array of approved E.164 phones / emails
+  The allowlist gate is the second layer of defense against the iOS Shortcut
+  Show-When-Run single-point-of-failure documented in
+  `docs/IMESSAGE-SHORTCUT-HANDOFF.md`. Even if that toggle ever flips OFF, the
+  relay refuses to write `latest.json` for any recipient not pre-approved.
+- The 4096-char Telegram split (paragraph then sentence then hard) and the
+  60-second "still thinking" feedback hook also live in draft-router so
+  future integrations have one place to call. The current
+  `sendTelegramResponse` in `src/telegram-response.ts` already does
+  paragraph-aware splitting; the draft-router's split is available for
+  callers that need sentence-level fallback when a Claude reply exceeds
+  4096 chars in one paragraph.
+- Draft-router must share the relay's `RELAY_DIR || HOME || "~"` fallback
+  semantics. A dormant safety module with a slightly different state path will
+  pass unit tests and then fail when wired into launchd. Also avoid logging raw
+  iMessage recipients when an allowlist is missing; the failure reason is enough.
