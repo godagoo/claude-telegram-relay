@@ -16,6 +16,7 @@ import { homedir } from "os";
 import { randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { splitPromptForClaudeCli } from "./prompt-split.ts";
 import { transcribe } from "./transcribe.ts";
 import {
   ANESTHESIA_CORPUS_INSTRUCTIONS,
@@ -493,7 +494,12 @@ async function callClaude(
   prompt: string,
   options?: { resume?: boolean; allowedTools?: string[]; addDirs?: string[]; cwd?: string }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
+  const { systemPrompt, userPrompt } = splitPromptForClaudeCli(prompt);
+  const args = [CLAUDE_PATH, "-p", userPrompt];
+
+  if (systemPrompt) {
+    args.push("--append-system-prompt", systemPrompt);
+  }
 
   // Resume previous session if available and requested
   if (CLAUDE_RESUME_ENABLED && options?.resume && session.sessionId) {
@@ -509,7 +515,7 @@ async function callClaude(
   }
   args.push("--output-format", "json");
 
-  console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`Calling Claude: ${userPrompt.substring(0, 80)}...`);
 
   try {
     const proc = spawn(args, {
