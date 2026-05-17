@@ -210,6 +210,59 @@ def _pick_most_recently_messaged(candidates: list[str]) -> str:
     return best
 
 
+ALIAS_FILE_DEFAULT = Path.home() / ".claude-relay" / "contact-aliases.json"
+
+
+def _alias_file_path() -> Path:
+    override = os.environ.get("RELAY_CONTACT_ALIASES_PATH", "").strip()
+    if override:
+        return Path(override)
+    return ALIAS_FILE_DEFAULT
+
+
+def load_aliases() -> dict[str, str]:
+    """Return a case-insensitive alias -> identifier map.
+
+    The file is consulted BEFORE AddressBook lookup. It exists so the user
+    can correct mismatches between contact-card data and the chat.db handle
+    they actually message on (e.g. "Dad" -> +16048092405 when their
+    AddressBook "Dad" card holds a different phone that has no message
+    history). The file is optional; a missing or malformed file is silently
+    ignored and the AddressBook lookup proceeds.
+
+    Format (JSON object, keys lowercased before lookup):
+      {
+        "dad": "+16048092405",
+        "mom": "+16043154583",
+        "natalie": "natalie@example.com"
+      }
+    """
+    path = _alias_file_path()
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        ident = value.strip()
+        if not ident:
+            continue
+        if DIRECT_PHONE_RE.match(ident):
+            ident = normalize_phone(ident)
+        elif not DIRECT_EMAIL_RE.match(ident):
+            # Reject non-identifier values silently; aliases must point at
+            # something Messages.app can address.
+            continue
+        out[key.strip().lower()] = ident
+    return out
+
+
 def resolve(query: str, contacts: list[dict] | None = None) -> str:
     q = query.strip()
     if not q:
@@ -220,6 +273,15 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
         return q
 
     q_lower = q.lower()
+
+    # 0a. User-curated alias overrides win over every AddressBook source.
+    # This is the escape hatch for AddressBook/chat.db mismatches the
+    # resolver cannot disambiguate on its own (e.g. a parent's shared
+    # household phone stored under one parent's contact card while the
+    # user verbally refers to it by the other parent's name).
+    aliases = load_aliases()
+    if q_lower in aliases:
+        return aliases[q_lower]
 
     if contacts is None:
         contacts = collect_contacts()

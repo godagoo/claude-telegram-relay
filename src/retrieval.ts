@@ -7,6 +7,7 @@ import { Database } from "bun:sqlite";
 import { accessSync, constants } from "fs";
 import { homedir } from "os";
 import { basename, dirname, join } from "path";
+import { isAnesthesiaCorpusQuery } from "./anesthesia-corpus";
 import { BOOKS, BOOK_KEY_SET, CATALOG_BOOK_LIST } from "./books";
 
 const DB_PATH = process.env.INDEXER_DB
@@ -271,6 +272,7 @@ function prepareFtsQuery(query: string): {
   scopePatterns: string[];
   contentTokens: string[];
   bookScoped: boolean;
+  corpusScoped: boolean;
 } {
   const tokens = queryTokens(query);
   const bookScopes = [...new Set(
@@ -279,10 +281,11 @@ function prepareFtsQuery(query: string): {
       .flatMap((token) => BOOK_PATH_FILTERS[token] ?? []),
   )];
   const contentTokens = tokens.filter((token) => !FTS_BOOK_FILTER_TOKENS.has(token));
+  const corpusScoped = bookScopes.length === 0 && isAnesthesiaCorpusQuery(query);
   const scopePatterns =
     bookScopes.length > 0
       ? bookScopes
-      : isBroadTextbookQuery(query)
+      : isBroadTextbookQuery(query) || corpusScoped
         ? TEXTBOOK_MARKDOWN_ROOTS.map((root) => root + "%")
         : SCOPE_PATTERNS;
 
@@ -291,6 +294,7 @@ function prepareFtsQuery(query: string): {
     scopePatterns,
     contentTokens,
     bookScoped: bookScopes.length > 0,
+    corpusScoped,
   };
 }
 
@@ -408,8 +412,11 @@ export async function search(query: string, k = 8): Promise<Hit[]> {
   let ftsHits: Hit[] = [];
   if (ftsQuery.match) {
     ftsHits = await runScopedFts(safe, ftsQuery.match, ftsQuery.scopePatterns, safeK);
-    if (ftsHits.length === 0 && ftsQuery.bookScoped) {
-      for (const relaxed of relaxedBookQueries(ftsQuery.contentTokens)) {
+    if (ftsHits.length === 0 && (ftsQuery.bookScoped || ftsQuery.corpusScoped)) {
+      const relaxedQueries = ftsQuery.bookScoped
+        ? relaxedBookQueries(ftsQuery.contentTokens)
+        : relaxedCorpusQueries(ftsQuery.contentTokens);
+      for (const relaxed of relaxedQueries) {
         ftsHits = await runScopedFts(safe, relaxed, ftsQuery.scopePatterns, safeK);
         if (ftsHits.length > 0) break;
       }
@@ -482,6 +489,20 @@ function relaxedBookQueries(contentTokens: string[]): string[] {
     if (!out.includes(pair)) out.push(pair);
   }
   return out;
+}
+
+function relaxedCorpusQueries(contentTokens: string[]): string[] {
+  if (contentTokens.length <= 2) return [];
+  const out: string[] = [];
+  const anchor = contentTokens[0];
+  for (const token of contentTokens.slice(1)) {
+    const pair = `${anchor} ${token}`;
+    if (!out.includes(pair)) out.push(pair);
+  }
+  for (const pair of relaxedBookQueries(contentTokens)) {
+    if (!out.includes(pair)) out.push(pair);
+  }
+  return out.slice(0, 8);
 }
 
 function isBroadTextbookInventoryQuery(query: string): boolean {
@@ -606,6 +627,7 @@ export const __test__prepareFtsQuery = prepareFtsQuery;
 export const __test__rerankFtsHits = rerankFtsHits;
 export const __test__isBroadTextbookInventoryQuery = isBroadTextbookInventoryQuery;
 export const __test__relaxedBookQueries = relaxedBookQueries;
+export const __test__relaxedCorpusQueries = relaxedCorpusQueries;
 export const __test__preflightFtsWorker = preflightFtsWorker;
 
 async function searchPathAnchors(query: string, k: number): Promise<Hit[]> {

@@ -31,6 +31,15 @@ const checks = [
       "/Downloads/anes-textbooks-markdown/miller10/",
     ],
   },
+  {
+    message: "Rocuronium dosing and onset for RSI adult vs pediatric",
+    expectedQuery: '"rocuronium" "pediatric" "dosing" "adult" "onset"',
+    maxWallMs: 8000,
+    expectedPathFragments: [
+      "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/",
+      "/Downloads/anes-textbooks-markdown/",
+    ],
+  },
 ];
 
 for (const check of checks) {

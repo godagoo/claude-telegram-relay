@@ -55,6 +55,12 @@ test("drops conversational say/says/said words from textbook questions", () => {
   ).toBe('"miller" "indications" "arterial" "line"');
 });
 
+test("builds a bounded query for generic anesthesia corpus questions", () => {
+  expect(
+    buildSearchQuery("Rocuronium dosing and onset for RSI adult vs pediatric", []),
+  ).toBe('"rocuronium" "pediatric" "dosing" "adult" "onset"');
+});
+
 test("still skips broad single-token searches without context", () => {
   expect(buildSearchQuery("Search through your index", [])).toBe("");
 });

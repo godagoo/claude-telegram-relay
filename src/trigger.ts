@@ -5,6 +5,8 @@
 
 import { BOOK_TRIGGER_PATTERN } from "./books";
 
+export { isAnesthesiaCorpusQuery } from "./anesthesia-corpus";
+
 const BOOK_REFERENCE = new RegExp(
   `\\b(textbooks?|anesthesia textbook|${BOOK_TRIGGER_PATTERN})\\b`,
   "i",

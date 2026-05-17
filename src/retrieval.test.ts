@@ -6,6 +6,7 @@ import {
   __test__isBroadTextbookInventoryQuery,
   __test__prepareFtsQuery,
   __test__relaxedBookQueries,
+  __test__relaxedCorpusQueries,
   __test__rerankFtsHits,
   type Hit,
 } from "./retrieval";
@@ -103,6 +104,25 @@ test("broad textbook FTS is scoped to converted textbook markdown", () => {
   expect(prepared.scopePatterns).toContain(
     `${process.env.HOME}/Downloads/anes-textbooks-markdown/%`,
   );
+});
+
+test("anesthesia-domain FTS is scoped to converted textbook markdown", () => {
+  const prepared = __test__prepareFtsQuery("rocuronium pediatric dosing adult onset");
+
+  expect(prepared.match).toBe("rocuronium pediatric dosing adult onset");
+  expect(prepared.corpusScoped).toBe(true);
+  expect(prepared.scopePatterns).toContain(
+    `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/%`,
+  );
+  expect(prepared.scopePatterns).toContain(
+    `${process.env.HOME}/Downloads/anes-textbooks-markdown/%`,
+  );
+});
+
+test("corpus-scoped fallback pairs the strongest token with later clinical terms", () => {
+  expect(
+    __test__relaxedCorpusQueries(["rocuronium", "pediatric", "dosing", "adult", "onset"]),
+  ).toContain("rocuronium onset");
 });
 
 test("bare anesthesia textbook prompts use fast catalog retrieval", () => {

@@ -1583,3 +1583,67 @@
   semantics. A dormant safety module with a slightly different state path will
   pass unit tests and then fail when wired into launchd. Also avoid logging raw
   iMessage recipients when an allowlist is missing; the failure reason is enough.
+
+## 2026-05-17 — Contact alias override for AddressBook / chat.db mismatches
+
+- The contact resolver can confidently return the wrong number when the
+  user's AddressBook and Messages.app diverge. Live failure 2026-05-17:
+  every `Text dad saying heading to London` resolved to `+16048741365`
+  (AddressBook contact "Dad", primary phone) which has zero messages in
+  `chat.db`. A first attempt incorrectly inferred that Dad should map to
+  Mom's active thread (`+16043154583`) based on chat.db volume alone. The user
+  corrected the authoritative mapping: Dad is `+16048092405`; Mom is
+  `+16043154583`. Do not infer family aliases from message counts when the
+  user supplies the actual phone numbers. The relay should make the resolved
+  handle visible before handoff so this class of mistake is obvious.
+- Fix: `~/.claude-relay/contact-aliases.json` is consulted BEFORE the
+  AddressBook lookup in `scripts/resolve-contact.py`. Format is a flat
+  JSON object mapping lowercased alias to phone-or-email. Direct
+  identifiers (a phone or email typed at Telegram) skip the file
+  entirely. Phone values are normalized to E.164 on load. Malformed or
+  missing files are silently ignored so the AddressBook fallback path
+  keeps working for unknown aliases.
+- The default path is overridable via `RELAY_CONTACT_ALIASES_PATH`.
+  Tests in `src/imessage-contact-alias.test.ts` use a temp file so they
+  are independent of the user's real production alias map.
+- Open follow-up: the relay's Telegram reply for a draft should surface
+  the resolved phone, so the user catches a wrong number BEFORE running
+  ClaudeDraft. Today the reply is just "Run ClaudeDraft in Shortcuts on
+  your iPhone." with no indication of which handle the draft will go to.
+
+## 2026-05-17 — Anesthesia prompt integration must match relay-owned retrieval
+
+- Do not paste XML prompt blocks that tell Claude to run `rg`, Bash, or search
+  tools into the Telegram relay. Ordinary text turns call Claude with no tools;
+  the relay performs deterministic FTS retrieval before Claude runs and injects
+  `RELEVANT INDEXED CONTENT` into the prompt. Advertising unavailable tools
+  causes false claims and instruction leakage.
+- Generic anesthesia-domain questions need their own retrieval gate. Book-name
+  triggers catch prompts like "What does Miller say...", but "rocuronium dosing
+  and onset for RSI" should also search the converted textbook corpus. Keep the
+  route high precision and scope those queries to the known Markdown textbook
+  roots instead of the whole Obsidian/native-memory search space.
+- If a strict AND FTS query has no hits, corpus-scoped generic medical queries
+  need a bounded relaxation pass. The first query-builder token is the strongest
+  clinical anchor after ranking; pair it with later tokens before falling back
+  to adjacent pairs.
+
+## 2026-05-17 — System/user prompt separation via Claude CLI
+
+- Concatenating the system instructions and the user message into a single
+  `-p <prompt>` argument can make Claude paraphrase its own role back as the
+  reply when retrieval scores poorly. Live failure 2026-05-17T07:17:04Z on
+  "Search for what cote says are the indications for arterial line placement"
+  returned ~190 chars of role recitation ("You are responding to William
+  directly. Use the search results above as factual grounding ...") instead
+  of the actual clinical content. `response-sanitize.ts` cannot help because
+  the leak is original prose, not a tagged block.
+- The fix is structural: pass durable rules + per-turn context to
+  `--append-system-prompt` and pass only the user message to `-p`. Split the
+  built prompt at the LAST `\nUser: ` marker so inner `User:` / `Assistant:`
+  labels inside a RECENT CONVERSATION block stay in the system half.
+- Verified by re-issuing the failing prompt through the CLI in the new shape:
+  Claude returned a real pediatric-anesthesia answer with bullet-listed
+  indications, not a role paraphrase. Helper lives in `src/prompt-split.ts`
+  so it can be unit-tested without triggering relay's top-level lock
+  acquisition.

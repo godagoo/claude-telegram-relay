@@ -517,6 +517,10 @@ assert mod.resolve("1 (604) 315-4583") == "+16043154583"
     cwd: PROJECT_ROOT,
     stdout: "pipe",
     stderr: "pipe",
+    // Point at a guaranteed-missing alias file so this test exercises the
+    // AddressBook path only and is independent of the user's real
+    // ~/.claude-relay/contact-aliases.json contents.
+    env: { ...process.env, RELAY_CONTACT_ALIASES_PATH: "/nonexistent/contact-aliases.json" },
   });
   const [stdout, stderr, codeResult] = await Promise.all([
     new Response(proc.stdout).text(),

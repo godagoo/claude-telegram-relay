@@ -16,7 +16,12 @@ import { homedir } from "os";
 import { randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { splitPromptForClaudeCli } from "./prompt-split.ts";
 import { transcribe } from "./transcribe.ts";
+import {
+  ANESTHESIA_CORPUS_INSTRUCTIONS,
+  isAnesthesiaCorpusQuery,
+} from "./anesthesia-corpus.ts";
 import {
   processMemoryIntents,
   getMemoryContext,
@@ -489,7 +494,12 @@ async function callClaude(
   prompt: string,
   options?: { resume?: boolean; allowedTools?: string[]; addDirs?: string[]; cwd?: string }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
+  const { systemPrompt, userPrompt } = splitPromptForClaudeCli(prompt);
+  const args = [CLAUDE_PATH, "-p", userPrompt];
+
+  if (systemPrompt) {
+    args.push("--append-system-prompt", systemPrompt);
+  }
 
   // Resume previous session if available and requested
   if (CLAUDE_RESUME_ENABLED && options?.resume && session.sessionId) {
@@ -505,7 +515,7 @@ async function callClaude(
   }
   args.push("--output-format", "json");
 
-  console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`Calling Claude: ${userPrompt.substring(0, 80)}...`);
 
   try {
     const proc = spawn(args, {
@@ -824,20 +834,22 @@ bot.on("message:text", async (ctx) => {
     const turnBufferSizeBefore = recentTurns.length;
     await appendTurn(chatId, { role: "user", content: text, ts });
 
-    // Trigger gating: only run FTS on referential messages.
+    // Trigger gating: run FTS for referential/project-memory messages and for
+    // anesthesia-domain questions that should consult the textbook corpus.
     const referential = isReferential(text);
+    const corpusQuery = referential || isAnesthesiaCorpusQuery(text);
     const queryContentTokens = countContentTokens(text);
-    const searchQuery = referential && retrievalAvailable
+    const searchQuery = corpusQuery && retrievalAvailable
       ? buildSearchQuery(text, recentTurns)
       : "";
     const tRetrieval0 = Date.now();
     let retrievalMs: number | undefined;
     let timeoutKind: "fts" | "claude" | undefined;
-    let retrievalError: string | undefined = referential && !retrievalAvailable
+    let retrievalError: string | undefined = corpusQuery && !retrievalAvailable
       ? `retrieval_unavailable${retrievalStartupError ? `: ${retrievalStartupError}` : ""}`
       : undefined;
     let ftsHits: Awaited<ReturnType<typeof ftsSearch>> = [];
-    if (referential && searchQuery) {
+    if (corpusQuery && searchQuery) {
       try {
         ftsHits = await ftsSearch(searchQuery, 8);
       } catch (err) {
@@ -1226,7 +1238,7 @@ bot.on("message:text", async (ctx) => {
       userText: text,
       assistantText: sendableText,
       anchoredProjects: anchoredProjectNames,
-      retrievalUsed: referential,
+      retrievalUsed: corpusQuery,
       retrievalHitCount: ftsHits.length,
     });
     if (memoryCandidate) {
@@ -1249,13 +1261,13 @@ bot.on("message:text", async (ctx) => {
       update_id: updateId,
       chat_id: chatId,
       message: text,
-      trigger_fired: referential,
+      trigger_fired: corpusQuery,
       hit_count: ftsHits.length,
       hits_summary: ftsHits.slice(0, 5).map((h) => ({
         path: h.file_path,
         sim: Number(h.display_score.toFixed(3)),
       })),
-      injected_count: referential ? Math.min(ftsHits.length, 3) : 0,
+      injected_count: corpusQuery ? Math.min(ftsHits.length, 3) : 0,
       claude_ms: claudeMs,
       total_ms: Date.now() - t0,
       error: errorMsg ?? retrievalError,
@@ -1663,6 +1675,7 @@ function buildPrompt(
     ENGLISH_ONLY_DIRECTIVE,
     "Default to concise, scannable replies: lead with the answer, prefer short bullets for multi-part technical or factual responses, and avoid long paragraphs unless the user explicitly asks for depth or nuance. Match the user's tone; this is a conversational chat, not a report.",
     "Reply in plain text. Never wrap your response in XML or HTML tags such as <response>, </response>, <answer>, or <reply>. If you have nothing useful to say, ask a clarifying question instead of returning an empty or tag-only reply.",
+    ANESTHESIA_CORPUS_INSTRUCTIONS,
     // Runtime context so the bot stops giving wrong macOS FDA advice. The
     // relay does not run from a terminal, and iMessage context prefetch no
     // longer routes through Claude. The protected-file reader is bun.
