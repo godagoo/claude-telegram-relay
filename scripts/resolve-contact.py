@@ -49,6 +49,20 @@ def is_direct_identifier(s: str) -> bool:
     return bool(DIRECT_PHONE_RE.match(s) or DIRECT_EMAIL_RE.match(s))
 
 
+def normalize_phone(phone: str) -> str:
+    """Return the Messages-friendly E.164-ish shape for AddressBook phones."""
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return ""
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if phone.strip().startswith("+"):
+        return f"+{digits}"
+    return digits
+
+
 # Each contact may have phone AND email rows; we pick the primary phone if
 # present, otherwise the primary email, otherwise the first non-empty. We
 # deduplicate per (source_db, record_id) to avoid duplicating the same person
@@ -123,7 +137,8 @@ def chosen_identifier(c: dict) -> str:
     """Prefer phone over email — Messages.app prefers iMessage to a phone
     when both are available, and most contacts have phones in this address
     book."""
-    return c["phone"] or c["email"] or ""
+    phone = normalize_phone(c["phone"])
+    return phone or c["email"] or ""
 
 
 def haystack(c: dict) -> str:
@@ -199,7 +214,9 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
     q = query.strip()
     if not q:
         return ""
-    if is_direct_identifier(q):
+    if DIRECT_PHONE_RE.match(q):
+        return normalize_phone(q)
+    if DIRECT_EMAIL_RE.match(q):
         return q
 
     q_lower = q.lower()
@@ -222,7 +239,7 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
     # bot fetched zero context for the active "Mark - Azure Landlord"
     # (+15196394490) the user actually meant. Decision log:
     # imessage_context_status=empty, imessage_context_count=0.
-    self_idents = {c["phone"] for c in contacts if _is_me_record(c)} \
+    self_idents = {chosen_identifier(c) for c in contacts if _is_me_record(c)} \
         | {c["email"] for c in contacts if _is_me_record(c)}
     self_idents.discard("")
     exact_candidates: list[str] = []

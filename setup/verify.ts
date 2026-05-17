@@ -21,11 +21,15 @@ import {
   readSignedShortcutFileActions,
   validateClaudeDraftShortcutActions,
 } from "./shortcut-verify.ts";
+import { runCommandWithTimeout } from "./process-timeout.ts";
 import { getSupabaseFeatureConfig } from "../src/supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "../src/arch-check.ts";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 const RELAY_DIR = process.env.RELAY_DIR || join(homedir(), ".claude-relay");
+const COMMAND_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 10_000;
+const LAUNCHD_PATH = `${homedir()}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
 
 // Colors
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
@@ -48,20 +52,36 @@ function warn(msg: string) { console.log(`  ${WARN} ${msg}`); warned++; }
 
 async function runCommand(
   args: string[],
-  options: { cwd?: string; env?: Record<string, string | undefined> } = {},
+  options: { cwd?: string; env?: Record<string, string | undefined>; timeoutMs?: number } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
+  const result = await runCommandWithTimeout(args, {
     cwd: options.cwd,
     env: options.env,
+    timeoutMs: options.timeoutMs ?? COMMAND_TIMEOUT_MS,
   });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
+  return {
+    code: result.timedOut ? 124 : result.code,
+    stdout: result.stdout,
+    stderr: result.timedOut
+      ? `Command timed out after ${options.timeoutMs ?? COMMAND_TIMEOUT_MS}ms: ${args[0]}`
+      : result.stderr,
+  };
+}
+
+async function fetchJsonWithTimeout(url: string, init: RequestInit = {}): Promise<any> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    return await response.json();
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`request timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function privateDirOk(path: string): boolean {
@@ -74,15 +94,14 @@ function privateDirOk(path: string): boolean {
 }
 
 async function commandExists(cmd: string): Promise<boolean> {
-  const proc = Bun.spawn(["/bin/sh", "-lc", `command -v "$1" >/dev/null 2>&1`, "sh", cmd], {
-    stdout: "pipe",
-    stderr: "pipe",
+  const result = await runCommand(["/bin/sh", "-lc", `command -v "$1" >/dev/null 2>&1`, "sh", cmd], {
+    timeoutMs: 5_000,
   });
-  return (await proc.exited) === 0;
+  return result.code === 0;
 }
 
 async function getProcessLines(): Promise<string[] | undefined> {
-  const result = await runCommand(["/bin/ps", "axww", "-o", "pid=,command="]);
+  const result = await runCommand(["/bin/ps", "axww", "-o", "pid=,etime=,command="]);
   if (result.code !== 0) return undefined;
   return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
 }
@@ -139,8 +158,7 @@ async function main() {
     fail("TELEGRAM_BOT_TOKEN not set");
   } else {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
-      const data = await res.json() as any;
+      const data = await fetchJsonWithTimeout(`https://api.telegram.org/bot${token}/getMe`);
       if (data.ok) {
         telegramTokenValid = true;
         pass(`Bot: @${data.result.username}`);
@@ -192,8 +210,7 @@ async function main() {
 
   if (telegramTokenValid) {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`);
-      const data = await res.json() as any;
+      const data = await fetchJsonWithTimeout(`https://api.telegram.org/bot${token}/getWebhookInfo`);
       const webhookUrl = typeof data?.result?.url === "string" ? data.result.url : "";
       const pendingCount = Number.isInteger(data?.result?.pending_update_count)
         ? data.result.pending_update_count
@@ -234,6 +251,7 @@ async function main() {
       try {
         const res = await fetch(`${supaUrl}/rest/v1/${table}?select=*&limit=1`, {
           headers: { apikey: supaKey, Authorization: `Bearer ${supaKey}` },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         });
         res.status === 200 ? pass(`Table "${table}" OK`) : fail(`Table "${table}": ${res.status}`);
       } catch (e: any) {
@@ -248,6 +266,7 @@ async function main() {
       try {
         const res = await fetch(`${supaUrl}/rest/v1/${table}?select=*&limit=1`, {
           headers: { apikey: supaKey, Authorization: `Bearer ${supaKey}` },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         });
         if (res.status === 200) pass(`Optional table "${table}" OK`);
         else warn(`Optional table "${table}" unavailable: ${res.status}`);
@@ -261,9 +280,28 @@ async function main() {
   if (process.platform === "darwin") {
     console.log(`\n${bold("  Services (launchd)")}`);
     for (const label of ["com.claude.telegram-relay", "com.claude.smart-checkin", "com.claude.morning-briefing"]) {
-      const proc = Bun.spawn(["launchctl", "list", label], { stdout: "pipe", stderr: "pipe" });
-      const code = await proc.exited;
-      code === 0 ? pass(`${label} loaded`) : warn(`${label} not loaded`);
+      const result = await runCommand(["launchctl", "list", label], { timeoutMs: 5_000 });
+      result.code === 0 ? pass(`${label} loaded`) : warn(`${label} not loaded`);
+    }
+
+    const launchdPrint = await runCommand(
+      ["launchctl", "print", `gui/${process.getuid()}/com.claude.telegram-relay`],
+      { timeoutMs: 5_000 },
+    );
+    if (launchdPrint.code === 0) {
+      const stdoutPath = launchdPrint.stdout.match(/^\s*stdout path = (.+)$/m)?.[1]?.trim();
+      const stderrPath = launchdPrint.stdout.match(/^\s*stderr path = (.+)$/m)?.[1]?.trim();
+      if (stdoutPath) pass(`Relay launchd stdout log: ${stdoutPath}`);
+      if (stderrPath) pass(`Relay launchd stderr log: ${stderrPath}`);
+      const repoLogsDir = join(PROJECT_ROOT, "logs");
+      if (
+        (stdoutPath && !stdoutPath.startsWith(`${repoLogsDir}/`)) ||
+        (stderrPath && !stderrPath.startsWith(`${repoLogsDir}/`))
+      ) {
+        warn(`Launchd writes active logs outside repo logs/: ${join(RELAY_DIR, "logs")}`);
+      }
+    } else {
+      warn(`Could not inspect relay launchd log paths: ${launchdPrint.stderr.trim() || launchdPrint.stdout.trim() || `exit ${launchdPrint.code}`}`);
     }
 
     const serviceProcessLines = processLines || await getProcessLines();
@@ -278,6 +316,13 @@ async function main() {
         pass("Exactly one local relay process found");
       } else {
         warn("No local relay process found");
+      }
+
+      const claudeShells = serviceProcessLines.filter((line) =>
+        /\bclaude --dangerously-skip-permissions\b/.test(line)
+      );
+      if (claudeShells.length > 0) {
+        warn(`Long-lived Claude Code shell process found (${claudeShells.length}); not the launchd relay`);
       }
 
       const lockPath = join(RELAY_DIR, "bot.lock");
@@ -357,7 +402,7 @@ async function main() {
     // If RELAY_PYTHON is set, use it — it pins the interpreter across Terminal/launchd
     // PATH differences. Otherwise default to python3 on the launchd-style PATH.
     const pinnedPython = env.RELAY_PYTHON || "";
-    const launchdPath = `${homedir()}/.bun/bin:/usr/local/bin:/usr/bin:/bin`;
+    const launchdPath = LAUNCHD_PATH;
     const resolverEnv = { ...process.env, PATH: launchdPath, HOME: homedir() };
     const effectivePython = pinnedPython || "python3";
 
@@ -391,11 +436,11 @@ async function main() {
       }
     }
 
-    const launchdPythonCmd = pinnedPython
-      ? `${pinnedPython} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")'`
-      : `command -v python3 && python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")'`;
+    const pythonVersionCode = "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')";
     const launchdPython = await runCommand(
-      ["/bin/sh", "-c", launchdPythonCmd],
+      pinnedPython
+        ? [pinnedPython, "-c", pythonVersionCode]
+        : ["/bin/sh", "-c", `command -v python3 && python3 -c ${JSON.stringify(pythonVersionCode)}`],
       { env: resolverEnv },
     );
     if (launchdPython.code === 0) {

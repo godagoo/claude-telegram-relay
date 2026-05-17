@@ -5,6 +5,7 @@ import {
   __test__filterPathAnchorRows,
   __test__isBroadTextbookInventoryQuery,
   __test__prepareFtsQuery,
+  __test__relaxedBookQueries,
   __test__rerankFtsHits,
   type Hit,
 } from "./retrieval";
@@ -66,27 +67,42 @@ test("book tokens become path filters instead of required FTS terms", () => {
   const prepared = __test__prepareFtsQuery("miller indications arterial line");
 
   expect(prepared.match).toBe("indications arterial line");
-  expect(prepared.scopePatterns).toEqual([
+  expect(prepared.scopePatterns).toContain(
     `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/miller10/%`,
-  ]);
+  );
+  expect(prepared.scopePatterns).toContain(
+    `${process.env.HOME}/Downloads/anes-textbooks-markdown/miller10/%`,
+  );
 });
 
 test("book-filtered FTS refuses broad single-token content queries", () => {
   const prepared = __test__prepareFtsQuery("miller anesthesia");
 
   expect(prepared.match).toBe("");
-  expect(prepared.scopePatterns).toEqual([
+  expect(prepared.scopePatterns).toContain(
     `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/miller10/%`,
-  ]);
+  );
+  expect(prepared.scopePatterns).toContain(
+    `${process.env.HOME}/Downloads/anes-textbooks-markdown/miller10/%`,
+  );
+});
+
+test("book-scoped fallback relaxes long clinical queries to adjacent pairs", () => {
+  expect(
+    __test__relaxedBookQueries(["indications", "arterial", "line"]),
+  ).toEqual(["arterial line", "indications arterial"]);
 });
 
 test("broad textbook FTS is scoped to converted textbook markdown", () => {
   const prepared = __test__prepareFtsQuery("anesthesia textbook");
 
   expect(prepared.match).toBe("anesthesia textbook");
-  expect(prepared.scopePatterns).toEqual([
+  expect(prepared.scopePatterns).toContain(
     `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/%`,
-  ]);
+  );
+  expect(prepared.scopePatterns).toContain(
+    `${process.env.HOME}/Downloads/anes-textbooks-markdown/%`,
+  );
 });
 
 test("bare anesthesia textbook prompts use fast catalog retrieval", () => {
@@ -119,6 +135,33 @@ test("FTS content hits outrank skipped path fallback hits", () => {
   expect(__test__combineHits([ftsHit], [pathHit], 2).map((hit) => hit.file_path)).toEqual([
     ftsHit.file_path,
     pathHit.file_path,
+  ]);
+});
+
+test("path fallback contributes at most floor(k / 2) hits after FTS hits", () => {
+  const ftsHit: Hit = {
+    chunk_id: 1,
+    file_path: `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/miller10/pages/page_1195.md`,
+    content: "adequate intravenous access, an arterial line is paramount",
+    chunk_index: 0,
+    rank_score: -0.1,
+    display_score: 0.1,
+    score: 0.1,
+  };
+  const pathHits: Hit[] = [1, 2, 3].map((n) => ({
+    chunk_id: -n,
+    file_path: `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/Miller_Barash/Miller ${n}.pdf`,
+    content: "Indexed file path match. extraction_status=skipped; chunk_count=0",
+    chunk_index: 0,
+    rank_score: -1,
+    display_score: 1,
+    score: 1,
+  }));
+
+  expect(__test__combineHits([ftsHit], pathHits, 4).map((hit) => hit.chunk_id)).toEqual([
+    1,
+    -1,
+    -2,
   ]);
 });
 

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { buildSearchQuery, type Turn } from "./query-builder";
+import { buildSearchQuery, ENGLISH_ONLY_DIRECTIVE, type Turn } from "./query-builder";
 
 const recentTextbookTurns: Turn[] = [
   {
@@ -22,6 +22,12 @@ const recentTextbookTurns: Turn[] = [
 test("drops retrieval-control words from FTS query", () => {
   expect(buildSearchQuery("Please continue to look for my anesthesia textbooks", [])).toBe(
     '"anesthesia" "textbooks"',
+  );
+});
+
+test("exports the exact English-only prompt directive", () => {
+  expect(ENGLISH_ONLY_DIRECTIVE).toBe(
+    "Respond in English only. If the user writes in another language, translate it internally but reply in English.",
   );
 });
 
@@ -79,16 +85,30 @@ test("topic-pivot source-redirection recovers prior clinical anchor", () => {
   ).toBe('"miller" "indications" "arterial" "line"');
 });
 
-test("topic-pivot with new clinical content does not pull in prior anchor", () => {
-  // "actually" is a pivot signal but the message still has its own clinical
-  // anchor (chestnut + anesthesia). Source-control words ("actually") drop,
-  // and the prior miller anchor is *not* merged in.
+test("topic-pivot with new clinical content still recovers prior anchor", () => {
+  // Pivot words mean the user is correcting course. Preserve the new clinical
+  // content, then recover prior-turn anchors up to the cap.
   expect(
     buildSearchQuery(
       "actually, what about chestnut anesthesia",
       millerArterialAnchor,
     ),
-  ).toBe('"chestnut" "anesthesia"');
+  ).toBe('"chestnut" "anesthesia" "miller" "indications" "arterial"');
+});
+
+test("topic pivot keeps current terms and recovers prior anchor up to cap", () => {
+  expect(
+    buildSearchQuery(
+      "Wait, different source for chestnut anesthesia",
+      millerArterialAnchor,
+    ),
+  ).toBe('"chestnut" "anesthesia" "miller" "indications" "arterial"');
+});
+
+test("split stopword sets preserve retrieval control behavior", () => {
+  expect(buildSearchQuery("Keep searching through the index for Miller arterial line", [])).toBe(
+    '"miller" "arterial" "line"',
+  );
 });
 
 // Live decision-log entry (2026-05-10T21:08:13Z): the message

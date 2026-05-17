@@ -2,14 +2,19 @@
 // Append-only JSONL log of inbound Telegram decisions plus update markers used
 // to avoid Telegram redelivery loops after crashes.
 
-import { appendFile, mkdir, readdir, unlink } from "fs/promises";
+import { appendFile, chmod, mkdir, readdir, unlink, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 
-const LOG_DIR = process.env.RELAY_LOG_DIR
-  ?? join(homedir(), ".claude-relay", "logs");
-const STATE_DIR = join(homedir(), ".claude-relay", "state");
+const RELAY_DIR = process.env.RELAY_DIR ?? join(homedir(), ".claude-relay");
+const LOG_DIR = process.env.RELAY_LOG_DIR ?? join(RELAY_DIR, "logs");
+const STATE_DIR = process.env.RELAY_STATE_DIR ?? join(RELAY_DIR, "state");
 const MARKERS_DIR = join(STATE_DIR, "updates");
+const RETAIN_DECISIONS_DAYS = Number(process.env.RETAIN_DECISIONS_DAYS ?? "30");
+
+type UpdateMarker =
+  | { status: "started"; ts: string }
+  | { status: "sent"; ts: string };
 
 export interface DecisionRecord {
   ts: string;
@@ -37,6 +42,8 @@ export interface DecisionRecord {
   imessage_context_contact?: string;
   imessage_draft_status?:
     | "placed"
+    | "phone_handoff_ready"
+    | "phone_shortcut_install_pending"
     | "markers_missing"
     | "empty_body"
     | "no_recipient"
@@ -46,7 +53,8 @@ export interface DecisionRecord {
     | "pasted"
     | "clipboard_only"
     | "new_compose"
-    | "icloud_drive_file";
+    | "icloud_drive_file"
+    | "iphone_mirror_typed";
   imessage_draft_handoff_path?: string;
   imessage_draft_body_sha256?: string;
   imessage_draft_shortcut_url?: string;
@@ -80,9 +88,20 @@ function decisionLogPath(date: string): string {
   return join(LOG_DIR, `decisions-${date}.jsonl`);
 }
 
+function decisionDateFromName(name: string): string | null {
+  const match = name.match(/^decisions-(\d{4}-\d{2}-\d{2})\.jsonl$/);
+  return match?.[1] ?? null;
+}
+
+async function ensurePrivateDir(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await chmod(path, 0o700).catch(() => undefined);
+}
+
 export async function loadSeenUpdateIds(): Promise<Set<number>> {
-  await mkdir(LOG_DIR, { recursive: true });
-  await mkdir(MARKERS_DIR, { recursive: true });
+  await ensurePrivateDir(LOG_DIR);
+  await ensurePrivateDir(STATE_DIR);
+  await ensurePrivateDir(MARKERS_DIR);
   const seen = new Set<number>();
 
   for (const date of [dateUtc(), dateUtc(-1)]) {
@@ -105,7 +124,24 @@ export async function loadSeenUpdateIds(): Promise<Set<number>> {
   try {
     for (const entry of await readdir(MARKERS_DIR)) {
       const match = entry.match(/^(\d+)\.started$/);
-      if (match) seen.add(Number(match[1]));
+      if (!match) continue;
+
+      const markerPath = join(MARKERS_DIR, entry);
+      let marker: UpdateMarker | null = null;
+      try {
+        const text = await Bun.file(markerPath).text();
+        marker = JSON.parse(text) as UpdateMarker;
+      } catch {
+        marker = null;
+      }
+
+      // A `sent` marker means Telegram already accepted the user-visible reply
+      // but the process died before the final decision JSONL was appended.
+      // Treat it as seen to avoid a duplicate reply. A `started` marker is only
+      // in-flight work; retry it after a crash instead of silently dropping it.
+      if (marker?.status === "sent") {
+        seen.add(Number(match[1]));
+      }
     }
   } catch {
     // First run.
@@ -115,8 +151,25 @@ export async function loadSeenUpdateIds(): Promise<Set<number>> {
 }
 
 export async function markUpdateStarted(updateId: number): Promise<void> {
-  await mkdir(MARKERS_DIR, { recursive: true });
-  await Bun.write(join(MARKERS_DIR, `${updateId}.started`), "");
+  await ensurePrivateDir(MARKERS_DIR);
+  const file = join(MARKERS_DIR, `${updateId}.started`);
+  await writeFile(
+    file,
+    JSON.stringify({ status: "started", ts: new Date().toISOString() }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  await chmod(file, 0o600).catch(() => undefined);
+}
+
+export async function markUpdateSent(updateId: number): Promise<void> {
+  await ensurePrivateDir(MARKERS_DIR);
+  const file = join(MARKERS_DIR, `${updateId}.started`);
+  await writeFile(
+    file,
+    JSON.stringify({ status: "sent", ts: new Date().toISOString() }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  await chmod(file, 0o600).catch(() => undefined);
 }
 
 export async function clearUpdateMarker(updateId: number): Promise<void> {
@@ -129,6 +182,32 @@ export async function clearUpdateMarker(updateId: number): Promise<void> {
 
 export async function logDecision(rec: DecisionRecord): Promise<void> {
   const file = decisionLogPath(rec.ts.slice(0, 10));
-  await mkdir(LOG_DIR, { recursive: true });
-  await appendFile(file, JSON.stringify(rec) + "\n", "utf8");
+  await ensurePrivateDir(LOG_DIR);
+  await appendFile(file, JSON.stringify(rec) + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(file, 0o600).catch(() => undefined);
+}
+
+export async function sweepOldDecisionLogs(
+  retainDays = RETAIN_DECISIONS_DAYS,
+): Promise<number> {
+  if (!Number.isFinite(retainDays) || retainDays <= 0) return 0;
+  await ensurePrivateDir(LOG_DIR);
+
+  const cutoff = new Date();
+  cutoff.setUTCHours(0, 0, 0, 0);
+  cutoff.setUTCDate(cutoff.getUTCDate() - Math.floor(retainDays));
+
+  let removed = 0;
+  for (const entry of await readdir(LOG_DIR)) {
+    const date = decisionDateFromName(entry);
+    if (!date) continue;
+    const entryDate = new Date(`${date}T00:00:00.000Z`);
+    if (entryDate >= cutoff) continue;
+    await unlink(join(LOG_DIR, entry)).catch(() => undefined);
+    removed++;
+  }
+  return removed;
 }

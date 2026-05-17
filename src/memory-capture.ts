@@ -174,6 +174,11 @@ const DRAFT_REQUEST_RE =
 
 // Triggers that classify the turn as feedback (a behavioral rule).
 const FEEDBACK_TRIGGERS: Array<{ re: RegExp; reason: string }> = [
+  {
+    re: /\b(?:please\s+)?log\s+this\b[\s\S]{0,120}\b(?:un+acceptable|wrong|bad|poor)\s+response\b/i,
+    reason: "log_unacceptable_response",
+  },
+  { re: /\bthis\s+response\s+(?:is|was)\s+(?:un+acceptable|wrong|bad|poor)\b/i, reason: "unacceptable_response" },
   { re: /\bfrom now on\b/i, reason: "from_now_on" },
   { re: /\bgoing forward\b/i, reason: "going_forward" },
   { re: /\buse this going forward\b/i, reason: "use_going_forward" },

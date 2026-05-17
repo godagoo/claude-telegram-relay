@@ -62,6 +62,9 @@ export function buildSkippedTextbookResponse(
     files,
     "",
     "So I can confirm the files exist, but I cannot quote or answer from Barash/Miller content until we fix PDF extraction for those files.",
+    "",
+    "If you already converted these to Markdown notes, reply: \"search my notes for <topic>\".",
+    "To force a textbook search anyway, reply: \"keep searching textbooks\".",
   ].join("\n");
 }
 

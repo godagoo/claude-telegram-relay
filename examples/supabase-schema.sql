@@ -1,6 +1,8 @@
--- Optional: Supabase Schema for Cloud Memory
+-- Optional: Supabase Schema for Cloud History/Search
 -- Run this in Supabase SQL Editor if you want cloud persistence
--- This enables: conversation history, semantic search, goals tracking
+-- This enables: conversation history, semantic search, and optional goals.
+-- Keep Obsidian as durable memory with MEMORY_AUTHORITY=obsidian unless you
+-- intentionally want Supabase to own durable facts/goals.
 
 -- Enable vector extension for semantic search (optional)
 CREATE EXTENSION IF NOT EXISTS vector;

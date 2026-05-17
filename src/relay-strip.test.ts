@@ -63,6 +63,12 @@ test("replaces prose em/en dashes outside code spans", () => {
   expect(r.stripped).toBe(2);
 });
 
+test("preserves em dashes inside pre and quoted blocks", () => {
+  const r = stripProseDashes("Outside — strip.\n<pre>a—b</pre>\n>>> quoted — keep");
+  expect(r.clean).toBe("Outside, strip.\n<pre>a—b</pre>\n>>> quoted — keep");
+  expect(r.stripped).toBe(1);
+});
+
 test("sanitizes memory tags, wrapper tags, and prose dashes in one pass", () => {
   const r = sanitizeClaudeResponse(
     "<response>Hello — world [REMEMBER: user likes short replies]</response>",

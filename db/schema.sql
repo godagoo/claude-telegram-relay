@@ -1,6 +1,11 @@
--- Supabase Schema for Persistent Memory
+-- Supabase Schema for Optional History/Search
 -- Run this in Supabase SQL Editor (or via Supabase MCP)
--- This enables: conversation history, semantic search, goals tracking
+-- This enables: conversation history, semantic search, and optional goals.
+--
+-- Recommended mode for this repo: keep Obsidian as the durable memory source
+-- of truth (`MEMORY_AUTHORITY=obsidian`) and use Supabase for message history
+-- plus semantic search. The `memory` table remains available only if you
+-- intentionally switch to `MEMORY_AUTHORITY=supabase`.
 --
 -- After running this, set up the embed Edge Function and database webhook
 -- so embeddings are generated automatically on every INSERT.

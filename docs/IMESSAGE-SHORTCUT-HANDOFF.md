@@ -1,16 +1,19 @@
 # iMessage iPhone Handoff (ClaudeDraft Shortcut)
 
 When the bot drafts an iMessage and a recipient resolves, the relay drops the
-draft into an iCloud file on this Mac and replies with a `shortcuts://` link.
-Tap that link on the iPhone and the iOS `ClaudeDraft` Shortcut reads the file
-and opens a pre-filled Messages compose sheet for review. **The shortcut never
-sends — only William's manual tap on the compose Send button does.**
+draft into an iCloud file on this Mac and replies with instructions to run the
+iOS `ClaudeDraft` Shortcut. Telegram does not reliably open `shortcuts://`
+custom-scheme text, so the dependable production action is: open Shortcuts on
+the iPhone and run `ClaudeDraft`. The Shortcut reads the file and opens a
+pre-filled Messages compose sheet for review. **The shortcut never sends —
+only William's manual tap on the compose Send button does.**
 
 ```
 Telegram draft request  ─►  relay resolves recipient
-                            └► writes latest.json to Shortcuts iCloud container
-                            └► Telegram reply ends with the shortcuts:// link
-iPhone (tap link)       ─►  ClaudeDraft reads latest.json
+                            └► writes latest.json to iCloud Drive
+                            └► Telegram reply tells William to run ClaudeDraft
+iPhone                  ─►  William runs ClaudeDraft from Shortcuts
+                            └► ClaudeDraft reads latest.json
                             └► Messages compose sheet appears, body pre-filled
                             └► William reviews → taps Send (or cancels)
 ```
@@ -20,11 +23,11 @@ iPhone (tap link)       ─►  ClaudeDraft reads latest.json
 Path (atomic write, `wx` + rename, mode `0600`, parent dir `0700`):
 
 ```
-~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json
+~/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json
 ```
 
 Source: [`src/icloud-drive-draft.ts`](../src/icloud-drive-draft.ts) (writer)
-and [`src/relay.ts`](../src/relay.ts) (placement block, ~line 770).
+and [`src/relay.ts`](../src/relay.ts) (placement block).
 
 Payload (always overwritten; no append, no history):
 
@@ -56,7 +59,7 @@ The chain is **5 actions** — no more, no less:
 
 | # | UI action name (action identifier) | Settings that matter |
 |---|---|---|
-| 1 | **Get File** (`is.workflow.actions.documentpicker.open`) | File: `claude-relay-drafts/latest.json` · Show File Picker **OFF** · Error If Not Found **ON**. The editor will display this as "Get file from **Shortcuts** at path..." — "Shortcuts" is the Files-app provider name for the Shortcuts iCloud container, which is exactly where the relay writes. |
+| 1 | **Get File** (`is.workflow.actions.documentpicker.open`) | File: `claude-relay-drafts/latest.json` in **iCloud Drive** · Show File Picker **OFF** · Error If Not Found **ON**. The editor must show iCloud Drive/CloudDocs, not "Shortcuts". "Shortcuts" is a separate app container on macOS and did not sync this relay's draft file to the iPhone on 2026-05-14. The filename must be exactly `latest.json`; `latest.jsoneon` is a known bad path from a stray edit. |
 | 2 | **Get Dictionary from Input** (`is.workflow.actions.detect.dictionary`) | Defaults. Parses the JSON file contents. |
 | 3 | **Get Dictionary Value** (`is.workflow.actions.getvalueforkey`) | Key: `recipient` |
 | 4 | **Get Dictionary Value** (`is.workflow.actions.getvalueforkey`) | Key: `body` |
@@ -80,12 +83,12 @@ Run from Terminal so you can observe failures without consuming the iPhone
 link. Make sure a fixture exists first:
 
 ```bash
-ls -la "$HOME/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json"
+ls -la "$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json"
 # If absent, send a draft via Telegram with a self-safe recipient
 # (e.g. "Draft a message to William saying handoff-test"); the relay writes
 # a fresh latest.json on every placement.
 
-shortcuts run ClaudeDraft
+bun run setup:run-shortcut
 ```
 
 First run only — macOS shows an OS-level prompt:
@@ -104,25 +107,58 @@ Expected after Allow Once:
 - Confirm in `~/Library/Messages/chat.db` that no new row appeared for that
   recipient during the test.
 
+The bounded verifier exits instead of leaving a stuck terminal if Shortcuts or
+Messages waits too long for UI. If it times out, close any open privacy prompt
+or compose sheet, then rerun `bun run setup:verify`.
+
 If `shortcuts run` instead exits with `Error: ... no such file`, the relay
 hasn't written `latest.json` since the last cleanup — send a Telegram draft
 request first.
 
 If it exits with `Error: The provided file path must be contained within
-the directory`, the Get File action has both a `WFFile` bookmark and a
-`WFGetFilePath` set — re-pick the file with the picker so they reconcile, or
-remove the path field entirely.
+the directory`, the Get File action has a file bookmark plus a conflicting
+`WFGetFilePath` value. A folder bookmark to `com~apple~CloudDocs/claude-relay-drafts`
+must use path `latest.json`; `claude-relay-drafts/latest.json` looks plausible
+in the editor but resolves as a missing nested path at runtime. A file bookmark
+directly to `.../latest.json` should have the path field empty.
 
-## iPhone verification (once Mac path works)
+Run `bun run setup:verify` after editing the Shortcut. The verifier reads the
+installed `ClaudeDraft` action graph and fails if the path contains
+`latest.jsoneon`, points at the Shortcuts app container, or disables Send
+Message's **Show When Run** safety toggle.
 
-1. Verify the shortcut synced: Shortcuts.app on iPhone → All Shortcuts →
-   `ClaudeDraft` appears. If not, wait ~1 min or toggle iCloud Sync off/on.
+## iPhone install and verification (once Mac path works)
+
+If the iPhone opens Messages with the correct recipient but an empty body, the
+phone still has a stale `ClaudeDraft` copy. Re-export a signed install file
+from the validated Mac shortcut:
+
+```bash
+bun run setup:export-shortcut
+```
+
+That creates:
+
+```text
+~/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut
+```
+
+Install it once from the iPhone Files app: iCloud Drive →
+`ClaudeDraft.shortcut` → Add/Replace Shortcut. The filename must be exactly
+`ClaudeDraft.shortcut`; `ClaudeDraft-install.shortcut` imports as a different
+shortcut and does not replace the relay target.
+
+Then verify:
+
+1. Shortcuts.app on iPhone → All Shortcuts → `ClaudeDraft` appears.
 2. Send a fresh draft request in Telegram (e.g. "Draft a message to William
    saying iphone-handoff-test").
-3. Tap the `shortcuts://run-shortcut?name=ClaudeDraft` link in the bot reply.
-4. First run on iPhone repeats the **Allow / Allow Once / Always Allow**
+3. Run `ClaudeDraft` from Shortcuts on the iPhone.
+4. First run on iPhone may show the **Allow / Allow Once / Always Allow**
    prompt — same answer.
 5. Messages compose sheet appears with the body. Close without sending.
+6. Delete `ClaudeDraft.shortcut` from iCloud Drive after the phone is confirmed
+   to have the fixed shortcut installed.
 
 ## Self-test fixture
 
@@ -142,12 +178,14 @@ RELAY_IMESSAGE_SHORTCUT_NAME=ClaudeDraft
 ```
 
 `RELAY_ICLOUD_DRAFT_DIR` must point inside an iCloud-synced container that
-the iOS Shortcut can read. If you point it at iCloud Drive root
-(`~/Library/Mobile Documents/com~apple~CloudDocs/...`), the Shortcut's
-`Get File` action also has to be re-pointed at iCloud Drive via a `WFFile`
-bookmark — the default "Shortcuts" provider only reads the Shortcuts
-container. Keeping both sides on the Shortcuts container is the simpler
-configuration and is the default.
+the iOS Shortcut can read. The default is the real iCloud Drive container:
+`~/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts`. The
+Shortcut's `Get File` action must be pointed at the same iCloud Drive folder.
+If it says "Get file from Shortcuts", it is reading the Shortcuts app
+container instead of the relay's default path. Once CloudDocs is confirmed,
+delete or ignore any stale
+`~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json`
+copy; it is a trap because it can look correct until it diverges.
 
 `RELAY_IMESSAGE_SHORTCUT_NAME` only matters if you also rename the iOS
 Shortcut — the relay just embeds it in the `shortcuts://` URL.
@@ -167,7 +205,7 @@ Each placement appends one row to today's
 If `imessage_draft_mode` is `"pasted"` or `"new_compose"` instead, the iCloud
 write failed and the relay fell back (see next section). If
 `imessage_draft_mode` is absent for a draft request that resolved a recipient,
-check `relay.err.log` for `[imessage-draft] Shortcuts iCloud handoff failed`
+check `relay.err.log` for `[imessage-draft] iCloud Drive handoff failed`
 — the message names the root cause (missing iCloud container, permission,
 disk).
 
@@ -189,20 +227,25 @@ anyway" — but the iPhone won't get a tappable handoff.
 - Renaming the Shortcut without setting `RELAY_IMESSAGE_SHORTCUT_NAME`.
 - Hard-coding the recipient or body in the Shortcut — they MUST come from
   `latest.json`. This is what makes the relay → phone hop work at all.
-- Pointing the Shortcut at iCloud Drive root without also setting
-  `RELAY_ICLOUD_DRAFT_DIR` to match. The relay default and the Shortcut
-  default both target the Shortcuts container; keep them aligned.
+- Pointing the Shortcut at the Shortcuts provider while the relay writes
+  iCloud Drive. The default relay path is `com~apple~CloudDocs`; keep the
+  Shortcut's Get File action aligned with that path.
 - Removing the Mac fallback path. The iCloud handoff is best-effort; the
   fallback is what keeps the relay useful when you're at the Mac and the
   cloud round-trip is unnecessary.
 
 ## Programmatic rebuild (for future automation)
 
-The macOS `shortcuts` CLI has no `create` subcommand. To rebuild ClaudeDraft
-from a script: author a binary plist with the 5 actions above, sign with
-`shortcuts sign --mode anyone --input ClaudeDraft.shortcut --output
-ClaudeDraft.shortcut` (input MUST have the `.shortcut` extension), then
-`open ClaudeDraft.shortcut` and accept the `Add Shortcut` dialog. A working
-reference plist generator with the exact magic-variable wiring lives in the
-session lessons under
-[`tasks/lessons.md` § 2026-05-13 plist+sign route](../tasks/lessons.md).
+The macOS `shortcuts` CLI has no `create` subcommand. Use the repo exporter
+instead:
+
+```bash
+bun run setup:export-shortcut
+```
+
+It reads the installed Mac `ClaudeDraft` actions, validates the five-action
+chain, wraps the actions in a proper workflow plist, signs the file with
+`shortcuts sign`, writes `ClaudeDraft.shortcut` to iCloud Drive, then validates
+the signed output. A raw `ZSHORTCUTACTIONS.ZDATA` array is not enough; passing
+that directly to `shortcuts sign` can crash Apple's CLI because the signer
+expects a workflow dictionary, not a top-level array.

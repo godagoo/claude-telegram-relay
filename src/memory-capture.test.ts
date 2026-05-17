@@ -79,6 +79,20 @@ test("don't say X again with relay-output quote → relay feedback", () => {
   expect(c!.confidence).toBe("high");
 });
 
+test("'log this as an unacceptable response' → relay feedback", () => {
+  const c = classifyMemoryCandidate({
+    userText: "Please log this again as an unnacceptable response",
+    assistantText: "Logged.",
+    anchoredProjects: [],
+    retrievalUsed: false,
+    retrievalHitCount: 0,
+  });
+  expect(c).not.toBeNull();
+  expect(c!.kind).toBe("feedback");
+  expect(c!.project).toBe("claude-telegram-relay");
+  expect(c!.reason.startsWith("feedback-trigger:log_unacceptable_response:")).toBe(true);
+});
+
 // ---------------------------------------------------------------------------
 // 3. "Remember Peggy is the cleaner" — user fact, pending lane.
 // ---------------------------------------------------------------------------

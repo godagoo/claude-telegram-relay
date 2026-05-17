@@ -25,6 +25,8 @@ test("returns deterministic response for skipped textbook path hits", () => {
   expect(response).toContain("I found the textbook files");
   expect(response).toContain("Barash 9.pdf");
   expect(response).toContain("cannot quote or answer");
+  expect(response).toContain('search my notes for <topic>');
+  expect(response).toContain('keep searching textbooks');
 });
 
 test("does not intercept non-textbook retrieval", () => {

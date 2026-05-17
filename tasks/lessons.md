@@ -1474,3 +1474,48 @@
   count, elapsed seconds, retry delay, PID, lock path, plugin config presence,
   local process count, and webhook status. Never print the token, token hash,
   or full Telegram API URL.
+
+## 2026-05-16 — Shortcut smoke tests must be bounded
+
+- Do not tell operators to run `shortcuts run ClaudeDraft` directly from a
+  Claude Code shell. The command can remain alive while macOS waits on a
+  Shortcuts privacy prompt or a Messages compose sheet, leaving the terminal in
+  a false "shell still running" state even when the relay is healthy. Use the
+  bounded `bun run setup:run-shortcut` wrapper so the test process is killed on
+  timeout and the operator gets a concrete cleanup instruction.
+- Verifiers must be self-bounded. `setup:verify` should not rely on an external
+  Claude Code watchdog to break stuck subprocesses or network checks. Wrap
+  `launchctl`, `sqlite3`, `plutil`, `aea`, Python probes, and HTTP checks with
+  explicit timeouts so one blocked local service cannot pin the whole terminal.
+- Command-position iMessage requests need higher precedence than generic
+  `to/with` scans. `Text Mark saying heading to London` means recipient Mark
+  and body "heading to London"; a later regex must not reinterpret `to London`
+  inside the body as the recipient.
+- Strip every historical Shortcut handoff label from Telegram-visible text.
+  Both `Phone handoff ready: shortcuts://...` and `Open on iPhone:
+  shortcuts://...` are internal relay control lines, not user-facing copy.
+- Claude CLI nonzero exits are errors, not assistant replies. Throw them back
+  to the Telegram handler so decision logs carry `error=claude_exit_*` instead
+  of persisting "Claude CLI failed..." as if it were a normal model response.
+
+## 2026-05-17 — Compass relay audit integration
+
+- Implement high-risk relay fixes before broad add-ons. Supabase dual-memory,
+  Gmail REST drafts, WhatsApp links, voice replies, and scheduled jobs need
+  credentialed acceptance tests and draft-only safety checks; do not bolt them
+  onto the hot Telegram path in the same sweep as runtime bug fixes.
+- A topic-pivot phrase is metadata, not content. Drop pivot/source words such
+  as `wait`, `different`, and `source`, keep the user's new clinical terms,
+  and recover prior user anchors up to the FTS token cap.
+- Claude subprocess timeouts should use Bun's native `timeout` and
+  `killSignal` support. Manual `AbortController` plus process-tree
+  SIGTERM/SIGKILL escalation is more code and less deterministic.
+- FTS worker preflight is a soft startup health probe. Route it through the
+  same worker as real retrieval, cache the result, and keep startup moving on
+  a 250 ms cold-start timeout while preserving real per-query worker failures.
+- Feedback-capture commands like "log this as an unacceptable response" should
+  never spend a full Claude turn. A deterministic acknowledgement plus the
+  existing memory-capture writer is the correct fast path.
+- Do not advertise tools Claude cannot actually use. If normal Telegram turns
+  pass no Bash tool, the prompt must not tell Claude to call email or message
+  helper scripts.

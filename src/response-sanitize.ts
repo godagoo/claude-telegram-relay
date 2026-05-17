@@ -42,7 +42,9 @@ export function stripWrapperTags(text: string): { clean: string; stripped: numbe
 
 export function stripProseDashes(text: string): { clean: string; stripped: number } {
   let stripped = 0;
-  const parts = text.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
+  const parts = text.split(
+    /(```[\s\S]*?```|`[^`\n]*`|<pre\b[\s\S]*?<\/pre>|^>>>[^\n]*(?:\n>>>[^\n]*)*)/gim,
+  );
   const clean = parts
     .map((part, index) => {
       if (index % 2 === 1) return part;

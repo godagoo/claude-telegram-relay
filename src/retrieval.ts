@@ -24,12 +24,16 @@ const PATH_FALLBACK_ROOTS = [
 ];
 
 const FTS_TIMEOUT_MS = Number(process.env.FTS_TIMEOUT_MS ?? "8000");
+const FTS_PREFLIGHT_TIMEOUT_MS = Number(process.env.FTS_PREFLIGHT_TIMEOUT_MS ?? "250");
 const PATH_FALLBACK_CANDIDATE_LIMIT = 200;
-const TEXTBOOK_MARKDOWN_ROOT =
-  join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown") + "/";
-const TEXTBOOK_CATALOG_PATH = TEXTBOOK_MARKDOWN_ROOT + "_catalog";
+const TEXTBOOK_MARKDOWN_ROOTS = [
+  join(homedir(), "Desktop", "Exam_Prep", "Textbooks", "anes-textbooks-markdown") + "/",
+  join(homedir(), "Downloads", "anes-textbooks-markdown") + "/",
+];
+const TEXTBOOK_CATALOG_PATH = TEXTBOOK_MARKDOWN_ROOTS[0] + "_catalog";
 
 let _db: Database | null = null;
+let ftsPreflight: Promise<void> | null = null;
 
 function getDb(): Database {
   if (!_db) {
@@ -135,11 +139,13 @@ export async function preflight(): Promise<void> {
     .get() as { v: string };
   console.log("[preflight] sqlite:", ver.v);
 
-  const hits = await search('"personal" "stack" "architecture"', 1);
+  await preflightFtsWorker();
+
+  const hits = await search('"anesthesia" "textbook"', 1);
   if (hits.length === 0) {
-    throw new Error("preflight: FTS returned 0 hits for stable architecture probe");
+    throw new Error("preflight: FTS returned 0 hits for anesthesia textbook catalog probe");
   }
-  console.log("[preflight] FTS sanity: architecture probe returns hits");
+  console.log("[preflight] FTS sanity: textbook catalog probe returns hits");
 }
 
 export interface Hit {
@@ -197,10 +203,10 @@ SELECT c.id AS id,
  LIMIT ?
 `;
 
-const BOOK_PATH_FILTERS: Record<string, string> = Object.fromEntries(
+const BOOK_PATH_FILTERS: Record<string, string[]> = Object.fromEntries(
   BOOKS.map((book) => [
     book.key,
-    join(TEXTBOOK_MARKDOWN_ROOT, book.pathSegment) + "/%",
+    TEXTBOOK_MARKDOWN_ROOTS.map((root) => join(root, book.pathSegment) + "/%"),
   ]),
 );
 
@@ -263,24 +269,28 @@ function queryTokens(query: string): string[] {
 function prepareFtsQuery(query: string): {
   match: string;
   scopePatterns: string[];
+  contentTokens: string[];
+  bookScoped: boolean;
 } {
   const tokens = queryTokens(query);
   const bookScopes = [...new Set(
     tokens
       .filter((token) => FTS_BOOK_FILTER_TOKENS.has(token))
-      .map((token) => BOOK_PATH_FILTERS[token]),
+      .flatMap((token) => BOOK_PATH_FILTERS[token] ?? []),
   )];
   const contentTokens = tokens.filter((token) => !FTS_BOOK_FILTER_TOKENS.has(token));
   const scopePatterns =
     bookScopes.length > 0
       ? bookScopes
       : isBroadTextbookQuery(query)
-        ? [TEXTBOOK_MARKDOWN_ROOT + "%"]
+        ? TEXTBOOK_MARKDOWN_ROOTS.map((root) => root + "%")
         : SCOPE_PATTERNS;
 
   return {
     match: contentTokens.length >= 2 ? contentTokens.join(" ") : "",
     scopePatterns,
+    contentTokens,
+    bookScoped: bookScopes.length > 0,
   };
 }
 
@@ -346,6 +356,45 @@ async function runFtsInWorker(
   });
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function preflightFtsWorker(): Promise<void> {
+  ftsPreflight ??= withTimeout(
+    runFtsInWorker("SELECT COUNT(*) AS n FROM chunks LIMIT 1", []),
+    FTS_PREFLIGHT_TIMEOUT_MS,
+    `preflight: FTS worker probe exceeded ${FTS_PREFLIGHT_TIMEOUT_MS}ms`,
+  ).then(({ rows, ms }) => {
+    const row = rows[0] as { n?: number } | undefined;
+    if (typeof row?.n !== "number") {
+      throw new Error("preflight: FTS worker probe returned no count");
+    }
+    console.log(`[preflight] FTS worker probe: chunks=${row.n} ms=${ms}`);
+  }).catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith("preflight: FTS worker probe exceeded")) {
+      console.error(`[preflight] ${message}; continuing with lazy per-query worker checks`);
+      return;
+    }
+    ftsPreflight = null;
+    throw err;
+  });
+  await ftsPreflight;
+}
+
 export async function search(query: string, k = 8): Promise<Hit[]> {
   const safe = sanitizeFtsQuery(query);
   if (!safe) return [];
@@ -358,14 +407,20 @@ export async function search(query: string, k = 8): Promise<Hit[]> {
   const ftsQuery = prepareFtsQuery(safe);
   let ftsHits: Hit[] = [];
   if (ftsQuery.match) {
-    const params = [ftsQuery.match, ...ftsQuery.scopePatterns, ...DENY_PATTERNS, safeK];
-    const sql = SEARCH_SQL.replace(SCOPE_CLAUSE, "(" + ftsQuery.scopePatterns.map(() => "f.path LIKE ?").join(" OR ") + ")");
-    const { rows } = await runFtsInWorker(sql, params);
-    ftsHits = rerankFtsHits(safe, (rows as RetrievedRow[]).map(toHit));
+    ftsHits = await runScopedFts(safe, ftsQuery.match, ftsQuery.scopePatterns, safeK);
+    if (ftsHits.length === 0 && ftsQuery.bookScoped) {
+      for (const relaxed of relaxedBookQueries(ftsQuery.contentTokens)) {
+        ftsHits = await runScopedFts(safe, relaxed, ftsQuery.scopePatterns, safeK);
+        if (ftsHits.length > 0) break;
+      }
+    }
   }
   let pathHits: Hit[] = [];
   try {
-    pathHits = await searchPathAnchors(safe, safeK);
+    const pathFallbackLimit = Math.floor(safeK / 2);
+    pathHits = pathFallbackLimit > 0
+      ? await searchPathAnchors(safe, pathFallbackLimit)
+      : [];
   } catch (err) {
     console.error(
       "[retrieval] path fallback failed:",
@@ -378,12 +433,22 @@ export async function search(query: string, k = 8): Promise<Hit[]> {
 function combineHits(ftsHits: Hit[], pathHits: Hit[], k: number): Hit[] {
   const combined: Hit[] = [];
   const seen = new Set<number>();
+  const pathLimit = Math.floor(Math.max(1, k | 0) / 2);
+  let pathAdded = 0;
 
-  for (const hit of [...ftsHits, ...pathHits]) {
+  for (const hit of ftsHits) {
     if (seen.has(hit.chunk_id)) continue;
     seen.add(hit.chunk_id);
     combined.push(hit);
     if (combined.length >= k) break;
+  }
+
+  for (const hit of pathHits) {
+    if (combined.length >= k || pathAdded >= pathLimit) break;
+    if (seen.has(hit.chunk_id)) continue;
+    seen.add(hit.chunk_id);
+    pathAdded++;
+    combined.push(hit);
   }
 
   return combined;
@@ -392,6 +457,31 @@ function combineHits(ftsHits: Hit[], pathHits: Hit[], k: number): Hit[] {
 function isBroadTextbookQuery(query: string): boolean {
   const tokens = new Set(queryTokens(query));
   return tokens.has("textbook") || tokens.has("textbooks");
+}
+
+async function runScopedFts(
+  originalQuery: string,
+  match: string,
+  scopePatterns: string[],
+  k: number,
+): Promise<Hit[]> {
+  const params = [match, ...scopePatterns, ...DENY_PATTERNS, k];
+  const sql = SEARCH_SQL.replace(
+    SCOPE_CLAUSE,
+    "(" + scopePatterns.map(() => "f.path LIKE ?").join(" OR ") + ")",
+  );
+  const { rows } = await runFtsInWorker(sql, params);
+  return rerankFtsHits(originalQuery, (rows as RetrievedRow[]).map(toHit));
+}
+
+function relaxedBookQueries(contentTokens: string[]): string[] {
+  if (contentTokens.length <= 2) return [];
+  const out: string[] = [];
+  for (let i = contentTokens.length - 2; i >= 0; i--) {
+    const pair = contentTokens.slice(i, i + 2).join(" ");
+    if (!out.includes(pair)) out.push(pair);
+  }
+  return out;
 }
 
 function isBroadTextbookInventoryQuery(query: string): boolean {
@@ -424,7 +514,7 @@ function textbookCatalogHits(k: number): Hit[] {
 }
 
 function isConvertedTextbookPath(path: string): boolean {
-  return path.startsWith(TEXTBOOK_MARKDOWN_ROOT);
+  return TEXTBOOK_MARKDOWN_ROOTS.some((root) => path.startsWith(root));
 }
 
 function textbookFrontMatterPenalty(hit: Hit): number {
@@ -515,6 +605,8 @@ export const __test__combineHits = combineHits;
 export const __test__prepareFtsQuery = prepareFtsQuery;
 export const __test__rerankFtsHits = rerankFtsHits;
 export const __test__isBroadTextbookInventoryQuery = isBroadTextbookInventoryQuery;
+export const __test__relaxedBookQueries = relaxedBookQueries;
+export const __test__preflightFtsWorker = preflightFtsWorker;
 
 async function searchPathAnchors(query: string, k: number): Promise<Hit[]> {
   const tokens = pathTokensFromQuery(query);

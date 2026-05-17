@@ -5,19 +5,31 @@ const checks = [
   {
     message: "Anesthesia textbook",
     expectedQuery: '"anesthesia" "textbook"',
-    expectedPathFragment: "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/_catalog",
+    maxWallMs: 1000,
+    expectedPathFragments: [
+      "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/_catalog",
+      "/Downloads/anes-textbooks-markdown/_catalog",
+    ],
     forbiddenFirstContent: "Front matter",
   },
   {
     message: "Please continue to look for my anesthesia textbooks",
     expectedQuery: '"anesthesia" "textbooks"',
-    expectedPathFragment: "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/_catalog",
+    maxWallMs: 1000,
+    expectedPathFragments: [
+      "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/_catalog",
+      "/Downloads/anes-textbooks-markdown/_catalog",
+    ],
     forbiddenFirstContent: "Front matter",
   },
   {
     message: "What does miller say are the indications for an arterial line?",
     expectedQuery: '"miller" "indications" "arterial" "line"',
-    expectedPathFragment: "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/miller10/",
+    maxWallMs: 5000,
+    expectedPathFragments: [
+      "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/miller10/",
+      "/Downloads/anes-textbooks-markdown/miller10/",
+    ],
   },
 ];
 
@@ -40,7 +52,7 @@ for (const check of checks) {
   const hits = await search(query, 5);
   const elapsed = Date.now() - t0;
   const expectedHits = hits.filter((hit) =>
-    hit.file_path.includes(check.expectedPathFragment)
+    check.expectedPathFragments.some((fragment) => hit.file_path.includes(fragment))
   );
 
   console.log(
@@ -63,8 +75,14 @@ for (const check of checks) {
     throw new Error(`no expected textbook hits for ${query}`);
   }
 
+  if (elapsed > check.maxWallMs) {
+    throw new Error(
+      `textbook retrieval exceeded wall clock cap for ${query}: ${elapsed}ms > ${check.maxWallMs}ms`,
+    );
+  }
+
   if (
-    check.expectedPathFragment.includes("anes-textbooks-markdown") &&
+    check.expectedPathFragments.some((fragment) => fragment.includes("anes-textbooks-markdown")) &&
     expectedHits[0].content.includes("extraction_status=skipped")
   ) {
     throw new Error(`converted textbook hit was displaced by skipped path fallback for ${query}`);

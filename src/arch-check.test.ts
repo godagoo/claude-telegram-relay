@@ -67,6 +67,7 @@ test("isRosettaProcess returns true when sysctl reports 1", () => {
     mockResult("1\n")
   );
   const result = isRosettaProcess();
+  expect((spy.mock.calls[0]?.[0] as any)?.cmd[0]).toBe("/usr/sbin/sysctl");
   spy.mockRestore();
   expect(result).toBe(true);
 });

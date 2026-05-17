@@ -123,6 +123,8 @@ const RELATIONSHIP_CONTACT_RE =
   /\b(?:[Ww]ith|[Tt]o|[Ff]or)\s+(?:(?:my|our|the)\s+)?(mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b|\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
 const MULTI_RELATIONSHIP_CONTACT_RE =
   /\b(?:[Ww]ith|[Tt]o|[Ff]or|[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\s+(?:and|&)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
+const COMMAND_POSITION_CONTACT_RE =
+  /\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|with|about|letting|telling)\b))/;
 
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();
@@ -135,6 +137,7 @@ function hasDraftVerbAndType(message: string): boolean {
   if (isPastDraftReference(message)) return false;
   if (SELF_DRAFT_INTENT_RE.test(message)) return true;
   if (IMPLICIT_MESSAGE_VERB_RE.test(m)) return true;
+  if (COMMAND_POSITION_CONTACT_RE.test(message)) return true;
   return DRAFT_VERB_RE.test(m) && MESSAGE_TYPE_RE.test(m);
 }
 
@@ -266,14 +269,17 @@ export function extractIMessageDraftRequest(
   // as a three-word "proper noun" — case-insensitive [A-Z] matches lowercase.
   // The email branch stays case-insensitive via explicit [A-Za-z].
   const relationship = message.match(RELATIONSHIP_CONTACT_RE);
-  const explicit = relationship ? null : message.match(
+  const commandPosition = relationship ? null : message.match(COMMAND_POSITION_CONTACT_RE);
+  const explicit = relationship || commandPosition ? null : message.match(
     /\b(?:[Ww]ith|[Tt]o)\s+([+()\-\d\s]{7,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/,
   );
-  if (!explicit && !relationship) return null;
+  if (!explicit && !relationship && !commandPosition) return null;
 
   const contact = explicit
     ? cleanContact(explicit[1])
-    : normalizeRelationshipContact(relationship![1] || relationship![2]);
+    : commandPosition
+      ? cleanContact(commandPosition[1])
+      : normalizeRelationshipContact(relationship![1] || relationship![2]);
   if (!contact) return null;
 
   const m = message.toLowerCase();

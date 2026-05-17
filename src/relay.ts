@@ -29,7 +29,12 @@ import {
   renderAnchoredContext,
 } from "./project-anchors.ts";
 import { isReferential } from "./trigger.ts";
-import { buildSearchQuery, countContentTokens, type Turn } from "./query-builder.ts";
+import {
+  buildSearchQuery,
+  countContentTokens,
+  ENGLISH_ONLY_DIRECTIVE,
+  type Turn,
+} from "./query-builder.ts";
 import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
 import { sanitizeClaudeResponse } from "./response-sanitize.ts";
@@ -37,6 +42,7 @@ import {
   extractIMessageDraftRequest,
   fetchIMessageContext,
   renderIMessageContext,
+  type IMessageContextResult,
 } from "./imessage-context.ts";
 import {
   DRAFT_MARKER_CLOSE,
@@ -55,6 +61,7 @@ import {
   logDecision,
   markUpdateStarted,
   markUpdateSent,
+  sweepOldDecisionLogs,
   type DecisionRecord,
 } from "./decision-log.ts";
 import {
@@ -101,7 +108,7 @@ const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_CWD = process.env.PROJECT_DIR || process.env.RELAY_CWD || PROJECT_ROOT;
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 const CLAUDE_TIMEOUT_MS = positiveIntEnv("CLAUDE_TIMEOUT_MS", 90_000);
-const KILL_GRACE_MS = 10_000;
+const SESSION_TIMEOUT_ROTATE = process.env.SESSION_TIMEOUT_ROTATE !== "0";
 const MAX_PROMPT_CHARS = 120_000;
 const MAX_RECENT_TURNS_RENDERED = 6;
 const CLAUDE_RESUME_ENABLED = process.env.CLAUDE_RESUME === "1";
@@ -118,6 +125,7 @@ const SESSION_FILE = join(RELAY_DIR, "session.json");
 
 interface SessionState {
   sessionId: string | null;
+  createdAt?: string;
   lastActivity: string;
 }
 
@@ -130,6 +138,12 @@ function positiveIntEnv(name: string, fallback: number): number {
 
 function isUnsetPlaceholder(value: string): boolean {
   return !value.trim() || /^your_/i.test(value.trim());
+}
+
+function isDirectMessageIdentifier(value: string): boolean {
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(trimmed) ||
+    /^\+?[()\-\d\s]{7,}$/.test(trimmed);
 }
 
 async function ensurePrivateDir(path: string): Promise<void> {
@@ -159,16 +173,25 @@ async function loadSession(): Promise<SessionState> {
 }
 
 async function saveSession(state: SessionState): Promise<void> {
-  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2));
+  await ensurePrivateDir(RELAY_DIR);
+  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(SESSION_FILE, 0o600).catch(() => undefined);
 }
 
 let session = await loadSession();
 
 async function resetClaudeSession(reason: string): Promise<void> {
-  if (!session.sessionId) return;
   console.log(`[session] reset Claude session: ${reason}`);
   session = { sessionId: null, lastActivity: new Date().toISOString() };
   await unlink(SESSION_FILE).catch(() => undefined);
+}
+
+async function rotateClaudeSessionAfterTimeout(): Promise<void> {
+  if (!SESSION_TIMEOUT_ROTATE) return;
+  await resetClaudeSession("claude_timeout");
 }
 
 // ============================================================
@@ -430,55 +453,36 @@ function buildClaudeEnv(): Record<string, string> {
   return env;
 }
 
-async function descendantPids(rootPid: number): Promise<number[]> {
-  const proc = spawn(["/bin/ps", "-axo", "pid=,ppid="], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const output = await new Response(proc.stdout).text();
-  await proc.exited;
-
-  const children = new Map<number, number[]>();
-  for (const line of output.split("\n")) {
-    const [pidRaw, ppidRaw] = line.trim().split(/\s+/);
-    const pid = Number(pidRaw);
-    const ppid = Number(ppidRaw);
-    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
-    const list = children.get(ppid) ?? [];
-    list.push(pid);
-    children.set(ppid, list);
-  }
-
-  const out: number[] = [];
-  const stack = [...(children.get(rootPid) ?? [])];
-  while (stack.length > 0) {
-    const pid = stack.pop()!;
-    out.push(pid);
-    stack.push(...(children.get(pid) ?? []));
-  }
-  return out;
-}
-
-async function killProcessTree(rootPid: number, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
-  const pids = await descendantPids(rootPid).catch(() => []);
-  for (const pid of pids.reverse()) {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // Already exited or not owned by this process.
-    }
-  }
-  try {
-    process.kill(rootPid, signal);
-  } catch {
-    // Already exited.
-  }
-}
-
 function sanitizeStderr(stderr: string): string {
   return stderr
     .replace(/(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|TELEGRAM_BOT_TOKEN)=\S+/g, "$1=[redacted]")
     .slice(0, 4000);
+}
+
+function parseClaudeCliOutput(output: string): { text: string; sessionId?: string } {
+  const trimmed = output.trim();
+  if (!trimmed) return { text: "" };
+
+  try {
+    const data = JSON.parse(trimmed) as Record<string, unknown>;
+    const sessionId =
+      typeof data.session_id === "string"
+        ? data.session_id
+        : typeof data.sessionId === "string"
+          ? data.sessionId
+          : undefined;
+    const text =
+      typeof data.result === "string"
+        ? data.result
+        : typeof data.content === "string"
+          ? data.content
+          : typeof data.message === "string"
+            ? data.message
+            : trimmed;
+    return { text: text.trim(), sessionId };
+  } catch {
+    return { text: trimmed };
+  }
 }
 
 async function callClaude(
@@ -499,75 +503,59 @@ async function callClaude(
   for (const dir of options?.addDirs ?? []) {
     args.push("--add-dir", dir);
   }
-  args.push("--output-format", "text");
+  args.push("--output-format", "json");
 
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
 
-  const ac = new AbortController();
-  let timedOut = false;
-  const proc = spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
-    cwd: options?.cwd ?? RELAY_CWD,
-    env: buildClaudeEnv(),
-    signal: ac.signal,
-  });
-
-  const sigTermTimer = setTimeout(() => {
-    if (proc.exitCode === null) {
-      timedOut = true;
-      console.error(`[callClaude] timeout after ${CLAUDE_TIMEOUT_MS}ms, sending SIGTERM`);
-      ac.abort();
-      void killProcessTree(proc.pid, "SIGTERM");
-    }
-  }, CLAUDE_TIMEOUT_MS);
-
-  const sigKillTimer = setTimeout(() => {
-    if (proc.exitCode === null) {
-      console.error("[callClaude] grace expired, sending SIGKILL");
-      void killProcessTree(proc.pid, "SIGKILL");
-    }
-  }, CLAUDE_TIMEOUT_MS + KILL_GRACE_MS);
-
   try {
+    const proc = spawn(args, {
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: options?.cwd ?? RELAY_CWD,
+      env: buildClaudeEnv(),
+      timeout: CLAUDE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+
     const [output, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
 
-    if (timedOut || ac.signal.aborted) {
+    const signalCode = (proc as { signalCode?: string | null }).signalCode;
+    if (signalCode === "SIGKILL") {
+      await rotateClaudeSessionAfterTimeout();
       throw new Error(`claude_timeout_${CLAUDE_TIMEOUT_MS}ms`);
     }
 
     if (exitCode !== 0) {
-      console.error("Claude error:", sanitizeStderr(stderr || `exit_code=${exitCode}`));
-      return "Claude CLI failed before producing a reply. Check relay logs.";
+      const sanitized = sanitizeStderr(stderr || `exit_code=${exitCode}`);
+      console.error("Claude error:", sanitized);
+      throw new Error(`claude_exit_${exitCode}: ${sanitized}`);
     }
 
-    if (CLAUDE_RESUME_ENABLED) {
-      // Extract session ID from output if present (for --resume). Default
-      // relay mode intentionally avoids --resume and relies on the bounded
-      // RECENT CONVERSATION block instead; that prevents poisoned Claude
-      // session state from recurring across Telegram turns.
-      const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
-      if (sessionMatch) {
-        session.sessionId = sessionMatch[1];
-        session.lastActivity = new Date().toISOString();
-        await saveSession(session);
+    const parsed = parseClaudeCliOutput(output);
+    if (CLAUDE_RESUME_ENABLED && parsed.sessionId) {
+      if (!session.createdAt || session.sessionId !== parsed.sessionId) {
+        session.createdAt = new Date().toISOString();
       }
+      session.sessionId = parsed.sessionId;
+      session.lastActivity = new Date().toISOString();
+      await saveSession(session);
     }
 
-    return output.trim();
+    return parsed.text;
   } catch (error) {
-    if (timedOut || String((error as Error).message).startsWith("claude_timeout_")) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("claude_timeout_")) {
       throw new Error(`claude_timeout_${CLAUDE_TIMEOUT_MS}ms`);
     }
+    if (message.startsWith("claude_exit_")) {
+      throw new Error(message);
+    }
     console.error("Spawn error:", error);
-    return `Error: Could not run Claude CLI`;
-  } finally {
-    clearTimeout(sigTermTimer);
-    clearTimeout(sigKillTimer);
+    throw new Error(`claude_spawn_failed: ${message}`);
   }
 }
 
@@ -735,31 +723,16 @@ async function downloadTelegramFile(
 // Concrete reframes for the 90s timeout. "Try a narrower request" was flagged
 // as unactionable (see feedback_timeout_message_unhelpful.md). Pick suggestions
 // that match the shape of the user's question so the next attempt has a path.
-function buildTimeoutFallback(userMessage: string): string {
-  const m = userMessage.toLowerCase();
+function buildTimeoutFallback(_userMessage: string): string {
   const sec = Math.round(CLAUDE_TIMEOUT_MS / 1000);
-  const opener = `That ran past ${sec} seconds so I stopped it.`;
+  return `Claude timed out at ${sec}s. Started a fresh session. Please re-send your request.`;
+}
 
-  const suggestions: string[] = [];
-  const looksBroad = /\b(everything|all|whole|optimize|improve|best (way|pathway|approach)|tell me about|explain (your|the))\b/.test(m);
-  const looksMultiPart = / and | plus | also |\?.+\?/.test(userMessage) || userMessage.split("?").length > 2;
-  const looksTextbook = /\b(barash|miller|cote|chestnut|fleisher|stoelting|textbook|anesthesia)\b/.test(m);
-
-  if (looksTextbook) {
-    suggestions.push("Name the book and a single topic, e.g. \"In Miller, what's the indication for an arterial line?\"");
-  }
-  if (looksMultiPart) {
-    suggestions.push("Split the question into two shorter messages.");
-  }
-  if (looksBroad) {
-    suggestions.push("Pick one specific subtopic instead of the whole area.");
-  }
-  if (suggestions.length === 0) {
-    suggestions.push("Try one specific subtopic, name a source, or split it into two messages.");
-  }
-
-  const bullets = suggestions.map((s) => `• ${s}`).join("\n");
-  return `${opener}\n\nTry one of:\n${bullets}`;
+function shouldAcknowledgeFeedbackWithoutClaude(userMessage: string): boolean {
+  return (
+    /\b(?:please\s+)?log\s+this\b[\s\S]{0,120}\b(?:un+acceptable|wrong|bad|poor)\s+response\b/i.test(userMessage) ||
+    /\bthis\s+response\s+(?:is|was)\s+(?:un+acceptable|wrong|bad|poor)\b/i.test(userMessage)
+  );
 }
 
 interface PostClaudeResult {
@@ -885,12 +858,28 @@ bot.on("message:text", async (ctx) => {
     // Placement defaults to TRUE for any iMessage/text/SMS draft so the user
     // doesn't have to repeat "directly in the iMessage box" each time.
     const draftRequest = extractIMessageDraftRequest(text);
-    const imessageContextResult = draftRequest
-      ? await fetchIMessageContext(PROJECT_ROOT, {
+    const directResolvedRecipient =
+      draftRequest?.directBody &&
+      !draftRequest.wantsContext &&
+      isDirectMessageIdentifier(draftRequest.contact)
+        ? draftRequest.contact
+        : undefined;
+    const imessageContextResult: IMessageContextResult | null = directResolvedRecipient
+      ? {
+          request: {
+            contact: draftRequest!.contact,
+            limit: draftRequest!.contextLimit,
+          },
+          status: "empty",
+          messages: [],
+          resolvedRecipient: directResolvedRecipient,
+        }
+      : draftRequest
+        ? await fetchIMessageContext(PROJECT_ROOT, {
           contact: draftRequest.contact,
           limit: draftRequest.contextLimit,
         })
-      : null;
+        : null;
     const wantsIMessagePlacement = draftRequest?.wantsPlacement ?? false;
     // Inject thread context whenever there is a result and no direct body.
     // Previously this was gated to status === "found", which silently dropped
@@ -988,6 +977,8 @@ bot.on("message:text", async (ctx) => {
     } else if (shouldClarifyMissingIMessageBody) {
       const contactLabel = draftRequest?.contact ?? "that contact";
       assistantText = `I couldn't find a Messages thread for ${contactLabel}, and I don't have the message body yet. Send me the phone/email plus what you want it to say.`;
+    } else if (shouldAcknowledgeFeedbackWithoutClaude(text)) {
+      assistantText = "Logged.";
     } else {
       try {
         const raw = await callClaude(enrichedPrompt, { resume: true });
@@ -1669,6 +1660,7 @@ function buildPrompt(
 
   const parts = [
     "You are a personal AI assistant responding via Telegram.",
+    ENGLISH_ONLY_DIRECTIVE,
     "Default to concise, scannable replies: lead with the answer, prefer short bullets for multi-part technical or factual responses, and avoid long paragraphs unless the user explicitly asks for depth or nuance. Match the user's tone; this is a conversational chat, not a report.",
     "Reply in plain text. Never wrap your response in XML or HTML tags such as <response>, </response>, <answer>, or <reply>. If you have nothing useful to say, ask a clarifying question instead of returning an empty or tag-only reply.",
     // Runtime context so the bot stops giving wrong macOS FDA advice. The
@@ -1690,8 +1682,7 @@ function buildPrompt(
     "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage or email REPLY to someone, work from the injected context. For iMessage, the relay always attempts to fetch the thread before you run — the result appears as an 'IMESSAGE CONTEXT FOR <name>' block above. If the block says messages were found, use them. If the block says the thread was not found or context could not be read, draft from the user's description as best you can — do NOT ask the user for a phone number, prior messages, or any other clarifying information. Do not claim you lack iMessage access; the relay owns that lookup. For email replies, ask the user to paste the most recent thread only if no context was supplied at all.",
     "Context cleanup rule (hard): never save the fetched context to a local file. The read helper streams JSON to stdout; consume it in your working memory only. Do NOT write context to ~/Projects/claude-telegram-relay/data/ or anywhere else on disk. If you find an existing cached context file from a prior session (e.g. data/mom-imessages.json), delete it after use rather than reusing it. The user's machine is the source of truth; re-read fresh from chat.db each time rather than caching.",
     "iMessage handling is deterministic in this runtime. The relay reads thread context before you run and places drafts after you run (using the marker pattern described below when relevant). Do NOT attempt to call scripts/imessage-thread.sh or scripts/draft-imessage.sh yourself; in headless mode you have no Bash approval surface and the call will surface as a confusing 'blocked for approval' message to the user. Just respond in text and use the markers when asked to place a draft.",
-    "For email drafts, you may use one helper via Bash:",
-    "- scripts/draft-email.sh TO SUBJECT (body on stdin). Opens the user's default mail client with a new draft pre-filled. Example: `printf '%s' \"Body...\" | scripts/draft-email.sh wregan599@gmail.com \"Subject line\"`. After running, say only: \"Email draft is open in your mail client.\"",
+    "For email drafts in this runtime, produce the draft text only. Do NOT call scripts/draft-email.sh or any mail client helper; ordinary Telegram turns do not expose Bash tools.",
     // Durable writing-style rules for any outgoing draft the user will send
     // under his own name. Source of truth (verbatim) lives at
     //   ~/ObsidianVault/02-Cross-Project/writing_style_for_william.md
@@ -1828,6 +1819,15 @@ async function runStartupPreflight(): Promise<void> {
       "[relay] retrieval preflight failed; will retry indexed retrieval per request:",
       retrievalStartupError,
     );
+  }
+
+  try {
+    const removed = await sweepOldDecisionLogs();
+    if (removed > 0) {
+      console.log(`[preflight] removed ${removed} old decision log(s)`);
+    }
+  } catch (err) {
+    console.error("[preflight] decision log sweep failed:", err instanceof Error ? err.message : String(err));
   }
 
   const watcher = Bun.spawnSync({ cmd: ["pgrep", "-f", "watcher.py"] });

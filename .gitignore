@@ -31,3 +31,13 @@ Thumbs.db
 
 # Git worktrees (created by superpowers:using-git-worktrees)
 .worktrees/
+
+# Python bytecode (relay scripts)
+__pycache__/
+*.pyc
+
+# Playwright artifacts
+.playwright-mcp/
+
+# npm-side lockfile (project uses Bun; npm lockfile is auto-generated noise)
+package-lock.json

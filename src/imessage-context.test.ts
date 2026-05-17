@@ -250,6 +250,48 @@ test("direct draft body strips placement-only phrasing", () => {
   });
 });
 
+test("command-position proper names win over body text that contains 'to <place>'", () => {
+  expect(
+    extractIMessageDraftRequest("Text Mark saying heading to London"),
+  ).toEqual({
+    contact: "Mark",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "heading to London",
+  });
+});
+
+test("message and ping command-position recipients trigger direct drafts", () => {
+  expect(
+    extractIMessageDraftRequest("Message Peggy saying thanks"),
+  ).toMatchObject({
+    contact: "Peggy",
+    directBody: "thanks",
+  });
+  expect(
+    extractIMessageDraftRequest("Ping Conor saying hi"),
+  ).toMatchObject({
+    contact: "Conor",
+    directBody: "hi",
+  });
+});
+
+test("command-position direct phone and email recipients trigger direct drafts", () => {
+  expect(
+    extractIMessageDraftRequest("Text +1 (555) 555-0123 saying hello"),
+  ).toMatchObject({
+    contact: "+1 (555) 555-0123",
+    directBody: "hello",
+  });
+  expect(
+    extractIMessageDraftRequest("Message william@example.com saying hello"),
+  ).toMatchObject({
+    contact: "william@example.com",
+    directBody: "hello",
+  });
+});
+
 test("'with <contact>' is treated as a recipient, not a draft body", () => {
   expect(
     extractIMessageDraftRequest("Draft an iMessage with Peggy"),

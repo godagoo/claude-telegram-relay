@@ -6,6 +6,7 @@ import {
   defaultICloudDriveDraftDir,
   ICLOUD_DRIVE_DRAFT_FILE_NAME,
 } from "../src/icloud-drive-draft.ts";
+import { runCommandWithTimeout } from "./process-timeout.ts";
 
 const DOCUMENT_PICKER_ACTION = "is.workflow.actions.documentpicker.open";
 const DICTIONARY_ACTION = "is.workflow.actions.detect.dictionary";
@@ -91,13 +92,14 @@ function sqlQuote(value: string): string {
 }
 
 async function run(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
+  const result = await runCommandWithTimeout(args, { timeoutMs: 10_000 });
+  return {
+    code: result.timedOut ? 124 : result.code,
+    stdout: result.stdout,
+    stderr: result.timedOut
+      ? `Command timed out after 10000ms: ${args[0]}`
+      : result.stderr,
+  };
 }
 
 async function readWorkflowActionsPlist(plistPath: string): Promise<ShortcutReadResult> {
