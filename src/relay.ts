@@ -70,6 +70,7 @@ import {
   type DecisionRecord,
 } from "./decision-log.ts";
 import {
+  clearICloudDriveDraft,
   shortcutInstallPath,
   writeICloudDriveDraft,
 } from "./icloud-drive-draft.ts";
@@ -746,6 +747,22 @@ function shouldAcknowledgeFeedbackWithoutClaude(userMessage: string): boolean {
   );
 }
 
+function shouldDeclineAlreadyAnsweredLastMessageDraft(
+  text: string,
+  imessageContextResult: IMessageContextResult | null,
+  draftRequest: ReturnType<typeof extractIMessageDraftRequest>,
+): boolean {
+  if (!draftRequest?.wantsPlacement || draftRequest.directBody) return false;
+  if (imessageContextResult?.status !== "found") return false;
+  if (imessageContextResult.messages[0]?.sender !== "me") return false;
+
+  const asksForLastMessageReply =
+    /\b(?:reply|respond)\b[\s\S]{0,80}\blast\s+(?:message|text|imessage|sms|one)\b/i.test(text) ||
+    /\blast\s+(?:message|text|imessage|sms|one)\b[\s\S]{0,80}\b(?:reply|respond)\b/i.test(text);
+
+  return asksForLastMessageReply;
+}
+
 interface PostClaudeResult {
   text: string;
   memoryTagsStripped: number;
@@ -966,10 +983,17 @@ bot.on("message:text", async (ctx) => {
       !hasThreadContextForDrafting
         ? draftRequest.directBody
         : undefined;
+    const alreadyAnsweredLastMessageDraft =
+      shouldDeclineAlreadyAnsweredLastMessageDraft(
+        text,
+        imessageContextResult,
+        draftRequest,
+      );
     const shouldClarifyMissingIMessageBody =
       wantsIMessagePlacement &&
       Boolean(draftRequest) &&
       !directIMessageBody &&
+      !alreadyAnsweredLastMessageDraft &&
       !draftRequest?.wantsContext &&
       imessageContextResult?.status !== "found" &&
       !imessageContextResult?.resolvedRecipient;
@@ -1002,6 +1026,24 @@ bot.on("message:text", async (ctx) => {
       assistantText = deterministicCatalogResponse;
     } else if (directIMessageBody) {
       assistantText = `${DRAFT_MARKER_OPEN}\n${directIMessageBody}\n${DRAFT_MARKER_CLOSE}`;
+    } else if (alreadyAnsweredLastMessageDraft) {
+      const contactLabel = draftRequest?.contact ?? "that contact";
+      const latestText = imessageContextResult?.messages[0]?.text
+        ?.replace(/\s+/g, " ")
+        .trim();
+      const clearDraft = await clearICloudDriveDraft();
+      if (clearDraft.ok) {
+        console.log(
+          `[imessage-draft] cleared stale iCloud handoff after already-answered last-message request path=${clearDraft.path ?? "unknown"}`,
+        );
+      } else {
+        console.error(
+          `[imessage-draft] failed to clear stale iCloud handoff after already-answered request: ${clearDraft.error ?? "unknown error"}`,
+        );
+      }
+      assistantText = latestText
+        ? `The latest message I can see in ${contactLabel}'s thread is already from you: "${latestText}". I did not open a new draft. Tell me what you want to add if you still want a follow up.`
+        : `The latest message I can see in ${contactLabel}'s thread is already from you. I did not open a new draft. Tell me what you want to add if you still want a follow up.`;
     } else if (shouldClarifyMissingIMessageBody) {
       const contactLabel = draftRequest?.contact ?? "that contact";
       assistantText = `I couldn't find a Messages thread for ${contactLabel}, and I don't have the message body yet. Send me the phone/email plus what you want it to say.`;
@@ -1059,7 +1101,11 @@ bot.on("message:text", async (ctx) => {
     if (shouldClarifyMissingIMessageBody) {
       imessageDraftStatus = "no_recipient";
     }
-    if (wantsIMessagePlacement && !shouldClarifyMissingIMessageBody) {
+    if (
+      wantsIMessagePlacement &&
+      !shouldClarifyMissingIMessageBody &&
+      !alreadyAnsweredLastMessageDraft
+    ) {
       const body = extractDraftBody(assistantText);
       const resolved = imessageContextResult?.resolvedRecipient;
       const contactLabel =

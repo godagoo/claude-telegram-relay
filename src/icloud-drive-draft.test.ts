@@ -1,8 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
+import { existsSync } from "fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import {
+  clearICloudDriveDraft,
   defaultICloudDriveRoot,
   defaultICloudDriveDraftDir,
   isCloudDocsDraftDir,
@@ -163,4 +165,29 @@ test("latest.json is owner-readable only on write", async () => {
   expect(result.ok).toBe(true);
   const mode = (await stat(join(dir, "latest.json"))).mode & 0o777;
   expect(mode).toBe(0o600);
+});
+
+test("clears latest.json to prevent stale shortcut handoff reuse", async () => {
+  const dir = await tempDraftDir();
+  const result = await writeICloudDriveDraft({
+    recipient: "+15198545324",
+    recipientLabel: "William",
+    body: "stale body",
+  }, { dir, cloudDocsRoot: tempCloudDocsRootFor(dir) });
+
+  expect(result.ok).toBe(true);
+  expect(existsSync(join(dir, "latest.json"))).toBe(true);
+
+  const cleared = await clearICloudDriveDraft({
+    dir,
+    cloudDocsRoot: tempCloudDocsRootFor(dir),
+  });
+  expect(cleared.ok).toBe(true);
+  expect(existsSync(join(dir, "latest.json"))).toBe(false);
+
+  const clearedAgain = await clearICloudDriveDraft({
+    dir,
+    cloudDocsRoot: tempCloudDocsRootFor(dir),
+  });
+  expect(clearedAgain.ok).toBe(true);
 });

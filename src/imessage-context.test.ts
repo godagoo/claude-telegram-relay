@@ -505,6 +505,73 @@ test("imessage-thread helper rejects non-numeric LIMIT before touching chat.db",
   expect(stderr).toContain("LIMIT must be a positive integer");
 });
 
+test("iMessage normalizer decodes attributedBody rows before stale text rows", async () => {
+  const current = "Fresh current body";
+  const bodyHex = Buffer.concat([
+    Buffer.from("prefix NSString", "utf8"),
+    Buffer.from([0x01, 0x94, 0x84, 0x01, 0x2b, Buffer.byteLength(current)]),
+    Buffer.from(current, "utf8"),
+    Buffer.from([0x86]),
+  ]).toString("hex");
+  const rows = [
+    {
+      id: 3,
+      sender: "them",
+      ts: "2026-05-17 10:00:00",
+      text: "",
+      attributed_body_hex: bodyHex,
+      associated_message_type: 0,
+    },
+    {
+      id: 2,
+      sender: "me",
+      ts: "2026-05-17 09:59:00",
+      text: "Loved a message",
+      attributed_body_hex: "",
+      associated_message_type: 2000,
+    },
+    {
+      id: 1,
+      sender: "me",
+      ts: "2025-10-17 10:00:00",
+      text: "Older plain text",
+      attributed_body_hex: "",
+      associated_message_type: 0,
+    },
+  ];
+
+  const proc = Bun.spawn(
+    [
+      "python3",
+      join(PROJECT_ROOT, "scripts", "imessage-normalize-messages.py"),
+      "+15555550123",
+      "2",
+    ],
+    {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: PROJECT_ROOT,
+      env: { ...process.env },
+    },
+  );
+  proc.stdin?.write(JSON.stringify(rows));
+  await proc.stdin?.end();
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  expect(stderr).toBe("");
+  expect(code).toBe(0);
+  const parsed = JSON.parse(stdout);
+  expect(parsed.messages.map((m: { text: string }) => m.text)).toEqual([
+    current,
+    "Older plain text",
+  ]);
+});
+
 test("contact resolver normalizes formatted AddressBook phone numbers", async () => {
   const code = `
 import importlib.util

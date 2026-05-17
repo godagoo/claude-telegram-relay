@@ -277,6 +277,10 @@ if [[ -z "$RESOLVED_RECIPIENT" ]]; then
 fi
 
 SQL_CHAT_IDENTIFIERS="$(chat_identifier_candidates_sql "$RESOLVED_RECIPIENT")"
+QUERY_LIMIT=$(( LIMIT * 4 ))
+if (( QUERY_LIMIT > 150 )); then
+  QUERY_LIMIT=150
+fi
 
 SQL_MESSAGES="$(cat <<SQL
 .mode json
@@ -284,15 +288,19 @@ SELECT
   m.ROWID AS id,
   CASE WHEN m.is_from_me = 1 THEN 'me' ELSE 'them' END AS sender,
   datetime(m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') AS ts,
-  m.text
+  COALESCE(m.text, '') AS text,
+  hex(m.attributedBody) AS attributed_body_hex,
+  COALESCE(m.associated_message_type, 0) AS associated_message_type
 FROM message m
 JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
 JOIN chat c ON c.ROWID = cmj.chat_id
 WHERE c.chat_identifier IN ($SQL_CHAT_IDENTIFIERS)
-  AND m.text IS NOT NULL
-  AND m.text != ''
+  AND (
+    (m.text IS NOT NULL AND m.text != '')
+    OR m.attributedBody IS NOT NULL
+  )
 ORDER BY m.date DESC
-LIMIT $LIMIT;
+LIMIT $QUERY_LIMIT;
 SQL
 )"
 MESSAGES_JSON="$(sqlite_query_or_exit "$SQL_MESSAGES")"
@@ -301,4 +309,5 @@ MESSAGES_JSON="$(sqlite_query_or_exit "$SQL_MESSAGES")"
 # the envelope is always valid JSON.
 [[ -z "$MESSAGES_JSON" ]] && MESSAGES_JSON='[]'
 
-printf '{"resolved":%s,"messages":%s}\n' "$(json_string "$RESOLVED_RECIPIENT")" "$MESSAGES_JSON"
+NORMALIZER="$(cd "$(dirname "$0")" && pwd)/imessage-normalize-messages.py"
+printf "%s" "$MESSAGES_JSON" | "$PYTHON3" "$NORMALIZER" "$RESOLVED_RECIPIENT" "$LIMIT"

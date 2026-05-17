@@ -20,6 +20,12 @@ export interface ICloudDriveDraftResult {
   error?: string;
 }
 
+export interface ClearICloudDriveDraftResult {
+  ok: boolean;
+  path?: string;
+  error?: string;
+}
+
 export function defaultICloudDriveDraftDir(): string {
   return process.env.RELAY_ICLOUD_DRAFT_DIR
     ?? join(
@@ -128,4 +134,35 @@ export async function writeICloudDriveDraft(
     shortcutUrl: shortcutRunUrl(options.shortcutName),
     bodySha256,
   };
+}
+
+export async function clearICloudDriveDraft(
+  options: { dir?: string; cloudDocsRoot?: string } = {},
+): Promise<ClearICloudDriveDraftResult> {
+  const dir = options.dir ?? defaultICloudDriveDraftDir();
+  const cloudDocsRoot = options.cloudDocsRoot ?? defaultICloudDriveRoot();
+
+  if (!isCloudDocsDraftDir(dir, cloudDocsRoot)) {
+    return { ok: false, error: `icloud_drive_draft_dir_not_clouddocs:${dir}` };
+  }
+
+  const target = join(dir, ICLOUD_DRIVE_DRAFT_FILE_NAME);
+  try {
+    await unlink(target);
+    return { ok: true, path: target };
+  } catch (err) {
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code?: string }).code === "ENOENT"
+    ) {
+      return { ok: true, path: target };
+    }
+    return {
+      ok: false,
+      path: target,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }

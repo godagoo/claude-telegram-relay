@@ -1730,3 +1730,19 @@
 - Keep the direct-body bypass only for direct phone/email recipients or runtime
   failures where no safe thread can be read. That preserves a deterministic
   fallback while preventing ordinary named-contact drafts from skipping context.
+
+## 2026-05-17 — Modern Messages rows store text in `attributedBody`
+
+- Live issue: `Respond to Conor's last message` drafted `ha might need a full
+  neuro exam at this point` because the context helper filtered on
+  `message.text IS NOT NULL`. Current Conor rows in `chat.db` had NULL
+  `message.text` with the visible body inside `message.attributedBody`, so the
+  relay skipped April 2026 context and fell back to an October 2025 message:
+  `May have to check his reflexes`.
+- Any iMessage context reader must decode `attributedBody` before deciding the
+  thread is stale or empty. Also skip tapback rows (`associated_message_type`
+  nonzero) so "Loved ..." reactions do not masquerade as real message bodies.
+- For vague commands like `reply/respond to <person>'s last message`, decline
+  automatic placement when the latest decoded thread message is already from
+  the user. That is safer than inventing a new follow-up to an already answered
+  thread.
