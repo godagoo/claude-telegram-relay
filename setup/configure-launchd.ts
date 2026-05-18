@@ -8,9 +8,10 @@
  */
 
 import { writeFile } from "fs/promises";
-import { chmodSync, existsSync, mkdirSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
+import { generateRelayPlist, type RelayPlistOptions } from "./launchd-plist.ts";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 const HOME = homedir();
@@ -27,29 +28,32 @@ const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const PASS = green("✓");
 const FAIL = red("✗");
 
-function xmlEscape(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-// Find bun path
+// Find bun path; resolve to realpath so the launchd job points at the
+// concrete versioned binary rather than the ~/.bun/bin/bun symlink, which
+// is what TCC/FDA grants attach to.
 async function findBun(): Promise<string> {
   const candidates = [
     join(HOME, ".bun", "bin", "bun"),
     "/usr/local/bin/bun",
     "/opt/homebrew/bin/bun",
   ];
+  let resolved = "";
   for (const p of candidates) {
-    if (existsSync(p)) return p;
+    if (existsSync(p)) {
+      resolved = p;
+      break;
+    }
   }
-  // Fallback: which bun
-  const proc = Bun.spawn(["which", "bun"], { stdout: "pipe" });
-  const out = await new Response(proc.stdout).text();
-  return out.trim() || "bun";
+  if (!resolved) {
+    const proc = Bun.spawn(["which", "bun"], { stdout: "pipe" });
+    const out = await new Response(proc.stdout).text();
+    resolved = out.trim() || "bun";
+  }
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 function generatePlist(opts: {
@@ -58,74 +62,32 @@ function generatePlist(opts: {
   keepAlive: boolean;
   calendarIntervals?: { Hour: number; Minute: number }[];
 }): string {
-  const bunPath = findBunSync;
-  const string = (value: string) => `<string>${xmlEscape(value)}</string>`;
+  const env: Record<string, string> = {
+    PATH: `${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+    HOME,
+    RELAY_DIR,
+    RELAY_LOG_DIR: LOGS_DIR,
+    CLAUDE_PATH: `${HOME}/.local/bin/claude`,
+    CLAUDE_TIMEOUT_MS: "90000",
+    CLAUDE_RESUME: "0",
+  };
+  if (process.env.RELAY_PYTHON) env.RELAY_PYTHON = process.env.RELAY_PYTHON;
 
-  let scheduling = "";
-  if (opts.calendarIntervals) {
-    scheduling = `
-    <key>StartCalendarInterval</key>
-    <array>${opts.calendarIntervals
-      .map(
-        (ci) => `
-        <dict>
-            <key>Hour</key>
-            <integer>${ci.Hour}</integer>
-            <key>Minute</key>
-            <integer>${ci.Minute}</integer>
-        </dict>`
-      )
-      .join("")}
-    </array>`;
-  }
+  const baseOptions: RelayPlistOptions = {
+    label: opts.label,
+    script: opts.script,
+    bunRealpath: findBunSync,
+    projectRoot: PROJECT_ROOT,
+    home: HOME,
+    logsDir: LOGS_DIR,
+    env,
+    keepAlive: opts.keepAlive ? { successfulExit: false, crashed: true } : false,
+    throttleInterval: 30,
+    exitTimeOut: 20,
+    calendarIntervals: opts.calendarIntervals,
+  };
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    ${string(opts.label)}
-
-    <key>ProgramArguments</key>
-    <array>
-        ${string(bunPath)}
-        ${string("run")}
-        ${string(opts.script)}
-    </array>
-
-    <key>WorkingDirectory</key>
-    ${string(PROJECT_ROOT)}
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        ${string(`${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`)}
-        <key>HOME</key>
-        ${string(HOME)}
-        <key>CLAUDE_PATH</key>
-        ${string(`${HOME}/.local/bin/claude`)}
-        <key>CLAUDE_TIMEOUT_MS</key>
-        ${string("90000")}
-        <key>CLAUDE_RESUME</key>
-        ${string("0")}
-    </dict>
-${opts.keepAlive ? `
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-` : ""}${scheduling}
-    <key>StandardOutPath</key>
-    ${string(`${LOGS_DIR}/${opts.label}.log`)}
-
-    <key>StandardErrorPath</key>
-    ${string(`${LOGS_DIR}/${opts.label}.error.log`)}
-</dict>
-</plist>`;
+  return generateRelayPlist(baseOptions);
 }
 
 let findBunSync = "";
@@ -178,9 +140,22 @@ async function unloadExistingService(
   config: ServiceConfig,
   plistPath: string,
 ): Promise<boolean> {
-  // `launchctl unload <plist>` only unloads the job registered from that exact
-  // path. Remove by label first so stale jobs loaded from an older plist path
-  // cannot survive and compete for Telegram polling.
+  // Try the modern `launchctl bootout` first; fall back to the legacy
+  // remove + unload path so older macOS versions and stale jobs registered
+  // from a different plist path still get cleaned up.
+  const uid = process.getuid?.() ?? -1;
+  if (uid >= 0) {
+    const bootout = Bun.spawn(
+      ["launchctl", "bootout", `gui/${uid}/${config.label}`],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const bootoutErr = await new Response(bootout.stderr).text();
+    const bootoutCode = await bootout.exited;
+    if (bootoutCode !== 0 && !isBenignUnloadMiss(bootoutErr)) {
+      // fall through to legacy path
+    }
+  }
+
   const remove = Bun.spawn(["launchctl", "remove", config.label], {
     stdout: "pipe",
     stderr: "pipe",
@@ -243,17 +218,37 @@ async function installService(name: string, config: ServiceConfig): Promise<bool
   if (!(await lintPlist(plistPath))) return false;
   if (!(await unloadExistingService(config, plistPath))) return false;
 
-  // Load
-  const load = Bun.spawn(["launchctl", "load", plistPath], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const loadErr = await new Response(load.stderr).text();
-  const loadCode = await load.exited;
+  // Prefer `launchctl bootstrap`; fall back to legacy `load` on older macOS
+  // or when bootstrap isn't permitted from this shell context.
+  const uid = process.getuid?.() ?? -1;
+  let loaded = false;
+  if (uid >= 0) {
+    const bootstrap = Bun.spawn(
+      ["launchctl", "bootstrap", `gui/${uid}`, plistPath],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const bootstrapErr = await new Response(bootstrap.stderr).text();
+    const bootstrapCode = await bootstrap.exited;
+    if (bootstrapCode === 0) {
+      loaded = true;
+    } else if (!bootstrapErr.includes("Bootstrap failed") && !bootstrapErr.includes("Operation not permitted")) {
+      // surface the bootstrap error before falling back so it isn't silently swallowed
+      console.log(`  ${dim("(bootstrap failed; falling back to legacy load)")} ${bootstrapErr.trim()}`);
+    }
+  }
 
-  if (loadCode !== 0) {
-    console.log(`  ${FAIL} Failed to load: ${loadErr.trim()}`);
-    return false;
+  if (!loaded) {
+    const load = Bun.spawn(["launchctl", "load", plistPath], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const loadErr = await new Response(load.stderr).text();
+    const loadCode = await load.exited;
+
+    if (loadCode !== 0) {
+      console.log(`  ${FAIL} Failed to load: ${loadErr.trim()}`);
+      return false;
+    }
   }
 
   console.log(`  ${PASS} Loaded — ${config.description}`);
