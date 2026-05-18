@@ -323,9 +323,10 @@ function toHit(row: RetrievedRow): Hit {
   };
 }
 
-async function runFtsInWorker(
+export async function runFtsInWorker(
   sql: string,
   params: unknown[],
+  timeoutMs: number = FTS_TIMEOUT_MS,
 ): Promise<{ rows: unknown[]; ms: number }> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./fts-worker.ts", import.meta.url).href);
@@ -336,8 +337,8 @@ async function runFtsInWorker(
       } catch {
         // Already gone.
       }
-      reject(new Error(`fts_timeout_${FTS_TIMEOUT_MS}ms`));
-    }, FTS_TIMEOUT_MS);
+      reject(new Error(`fts_timeout_${timeoutMs}ms`));
+    }, timeoutMs);
 
     worker.onmessage = (event: MessageEvent) => {
       clearTimeout(timer);
