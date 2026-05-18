@@ -101,6 +101,7 @@ import {
   acquireTokenLock,
   isLiveRelayPid,
   releaseTokenLock,
+  startTokenLockHeartbeat,
   tokenLockPath,
 } from "./token-lock.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
@@ -220,8 +221,14 @@ const RELAY_HOST = process.env.RELAY_HOST || os.hostname();
 
 let releaseLockOnExit: () => Promise<void> = async () => undefined;
 let stopBotOnExit: () => Promise<void> = async () => undefined;
+let stopLockHeartbeat: () => void = () => undefined;
 
 async function shutdown(reason: string, code = 0): Promise<void> {
+  try {
+    stopLockHeartbeat();
+  } catch (err) {
+    console.error(`[shutdown] heartbeat stop failed (${reason}):`, err);
+  }
   try {
     await stopBotOnExit();
   } catch (err) {
@@ -374,6 +381,11 @@ async function saveMessage(
     releaseLockOnExit = async () => {
       await releaseTokenLock({ token: BOT_TOKEN, pid: process.pid, baseDir: RELAY_DIR });
     };
+    stopLockHeartbeat = startTokenLockHeartbeat({
+      token: BOT_TOKEN,
+      pid: process.pid,
+      baseDir: RELAY_DIR,
+    });
   }
 }
 

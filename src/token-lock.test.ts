@@ -5,8 +5,12 @@ import { join } from "path";
 import {
   acquireTokenLock,
   heartbeatTokenLock,
+  isLockStaleByAge,
   readTokenLock,
   releaseTokenLock,
+  startTokenLockHeartbeat,
+  TOKEN_LOCK_DEFAULT_HEARTBEAT_MS,
+  TOKEN_LOCK_DEFAULT_STALE_AGE_MS,
   tokenHash,
   tokenLockPath,
   type TokenLockPayload,
@@ -112,7 +116,7 @@ describe("acquireTokenLock", () => {
     expect(raw).not.toContain("AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   });
 
-  test("refuses to acquire when the existing holder PID is a live relay", async () => {
+  test("refuses to acquire when the existing holder PID is a live relay with a fresh heartbeat", async () => {
     const path = tokenLockPath(FAKE_TOKEN, tempDir);
     mkdirSync(join(tempDir, "locks"), { recursive: true });
     writeFileSync(
@@ -123,7 +127,7 @@ describe("acquireTokenLock", () => {
         host: FAKE_HOST,
         pid: 99999,
         started_at: "2026-05-18T09:00:00.000Z",
-        heartbeat_at: "2026-05-18T09:00:00.000Z",
+        heartbeat_at: "2026-05-18T09:59:55.000Z",
       } satisfies TokenLockPayload),
     );
 
@@ -314,5 +318,142 @@ describe("readTokenLock", () => {
     writeFileSync(path, "garbage");
     const payload = await readTokenLock({ token: FAKE_TOKEN, baseDir: tempDir });
     expect(payload).toBeNull();
+  });
+});
+
+describe("isLockStaleByAge", () => {
+  const sample: TokenLockPayload = {
+    schema_version: 1,
+    token_hash: tokenHash(FAKE_TOKEN),
+    host: FAKE_HOST,
+    pid: 100,
+    started_at: "2026-05-18T10:00:00.000Z",
+    heartbeat_at: "2026-05-18T10:00:00.000Z",
+  };
+
+  test("returns false when heartbeat is fresher than the threshold", () => {
+    expect(
+      isLockStaleByAge(sample, new Date("2026-05-18T10:00:30Z"), 120_000),
+    ).toBe(false);
+  });
+
+  test("returns true when heartbeat is older than the threshold", () => {
+    expect(
+      isLockStaleByAge(sample, new Date("2026-05-18T10:05:00Z"), 120_000),
+    ).toBe(true);
+  });
+
+  test("treats an unparseable heartbeat_at as stale", () => {
+    const bad = { ...sample, heartbeat_at: "not a date" };
+    expect(isLockStaleByAge(bad, new Date(), 120_000)).toBe(true);
+  });
+
+  test("default constants are sensible: heartbeat < stale age", () => {
+    expect(TOKEN_LOCK_DEFAULT_HEARTBEAT_MS).toBeGreaterThan(0);
+    expect(TOKEN_LOCK_DEFAULT_STALE_AGE_MS).toBeGreaterThan(
+      TOKEN_LOCK_DEFAULT_HEARTBEAT_MS,
+    );
+  });
+});
+
+describe("acquireTokenLock with stale-by-age", () => {
+  test("takes over when heartbeat is stale even if PID is alive", async () => {
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        schema_version: 1,
+        token_hash: tokenHash(FAKE_TOKEN),
+        host: FAKE_HOST,
+        pid: 99999,
+        started_at: "2026-05-18T09:00:00.000Z",
+        heartbeat_at: "2026-05-18T09:00:00.000Z",
+      } satisfies TokenLockPayload),
+    );
+
+    const result = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 11111,
+      now: new Date("2026-05-18T10:00:00Z"),
+      baseDir: tempDir,
+      isLiveRelay: () => true,
+      maxHeartbeatAgeMs: 60_000,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("refuses when heartbeat is fresh and PID is alive", async () => {
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        schema_version: 1,
+        token_hash: tokenHash(FAKE_TOKEN),
+        host: FAKE_HOST,
+        pid: 99999,
+        started_at: "2026-05-18T09:00:00.000Z",
+        heartbeat_at: "2026-05-18T09:59:55.000Z",
+      } satisfies TokenLockPayload),
+    );
+
+    const result = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 11111,
+      now: new Date("2026-05-18T10:00:00Z"),
+      baseDir: tempDir,
+      isLiveRelay: () => true,
+      maxHeartbeatAgeMs: 60_000,
+    });
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("startTokenLockHeartbeat", () => {
+  test("updates heartbeat_at on every interval tick", async () => {
+    const t0 = new Date("2026-05-18T10:00:00Z");
+    const acquired = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 12345,
+      now: t0,
+      baseDir: tempDir,
+      isLiveRelay: () => false,
+    });
+    expect(acquired.ok).toBe(true);
+    if (!acquired.ok) return;
+
+    let now = t0;
+    const stop = startTokenLockHeartbeat({
+      token: FAKE_TOKEN,
+      pid: 12345,
+      baseDir: tempDir,
+      intervalMs: 10,
+      now: () => now,
+    });
+
+    // Advance simulated time and let the interval fire a few times.
+    await new Promise((r) => setTimeout(r, 30));
+    now = new Date("2026-05-18T10:00:00.030Z");
+    await new Promise((r) => setTimeout(r, 30));
+
+    stop();
+
+    const payload = JSON.parse(readFileSync(acquired.path, "utf8")) as TokenLockPayload;
+    expect(payload.heartbeat_at).not.toBe(t0.toISOString());
+  });
+
+  test("stop function makes the heartbeat idempotent (safe to call twice)", () => {
+    const stop = startTokenLockHeartbeat({
+      token: FAKE_TOKEN,
+      pid: 12345,
+      baseDir: tempDir,
+      intervalMs: 1_000,
+    });
+    stop();
+    expect(() => stop()).not.toThrow();
   });
 });

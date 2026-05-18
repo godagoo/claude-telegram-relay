@@ -17,6 +17,8 @@ import { homedir } from "os";
 import { join } from "path";
 
 export const TOKEN_LOCK_SCHEMA_VERSION = 1;
+export const TOKEN_LOCK_DEFAULT_HEARTBEAT_MS = 30_000;
+export const TOKEN_LOCK_DEFAULT_STALE_AGE_MS = 120_000;
 
 export interface TokenLockPayload {
   schema_version: typeof TOKEN_LOCK_SCHEMA_VERSION;
@@ -83,6 +85,16 @@ async function readPayloadOrNull(path: string): Promise<TokenLockPayload | null>
   }
 }
 
+export function isLockStaleByAge(
+  payload: TokenLockPayload,
+  now: Date,
+  maxAgeMs: number,
+): boolean {
+  const heartbeat = Date.parse(payload.heartbeat_at);
+  if (!Number.isFinite(heartbeat)) return true;
+  return now.getTime() - heartbeat > maxAgeMs;
+}
+
 export async function acquireTokenLock(input: {
   token: string;
   host: string;
@@ -90,12 +102,19 @@ export async function acquireTokenLock(input: {
   now: Date;
   baseDir?: string;
   isLiveRelay: (pid: number) => boolean;
+  maxHeartbeatAgeMs?: number;
 }): Promise<AcquireTokenLockResult> {
   const path = tokenLockPath(input.token, input.baseDir);
+  const maxAgeMs = input.maxHeartbeatAgeMs ?? TOKEN_LOCK_DEFAULT_STALE_AGE_MS;
 
   if (existsSync(path)) {
     const existing = await readPayloadOrNull(path);
-    if (existing && input.isLiveRelay(existing.pid) && existing.pid !== input.pid) {
+    if (
+      existing &&
+      input.isLiveRelay(existing.pid) &&
+      existing.pid !== input.pid &&
+      !isLockStaleByAge(existing, input.now, maxAgeMs)
+    ) {
       return { ok: false, reason: "held_by_live_relay", holder: existing, path };
     }
   }
@@ -140,6 +159,42 @@ export async function heartbeatTokenLock(input: {
   if (!existing || existing.pid !== input.pid) return;
   const next: TokenLockPayload = { ...existing, heartbeat_at: input.now.toISOString() };
   await writePayloadAtomic(path, next);
+}
+
+/**
+ * Starts a setInterval that periodically rewrites heartbeat_at on the lock
+ * file. Returns a stop function that clears the interval. Calling stop()
+ * more than once is safe. `now` is injectable for tests.
+ */
+export function startTokenLockHeartbeat(input: {
+  token: string;
+  pid: number;
+  baseDir?: string;
+  intervalMs?: number;
+  now?: () => Date;
+}): () => void {
+  const intervalMs = input.intervalMs ?? TOKEN_LOCK_DEFAULT_HEARTBEAT_MS;
+  const nowFn = input.now ?? (() => new Date());
+  let stopped = false;
+  const handle = setInterval(() => {
+    if (stopped) return;
+    heartbeatTokenLock({
+      token: input.token,
+      pid: input.pid,
+      baseDir: input.baseDir,
+      now: nowFn(),
+    }).catch(() => undefined);
+  }, intervalMs);
+  // Don't keep the event loop alive for the heartbeat alone — let normal
+  // shutdown paths drive the process exit.
+  if (typeof (handle as { unref?: () => void }).unref === "function") {
+    (handle as { unref: () => void }).unref();
+  }
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(handle);
+  };
 }
 
 export async function readTokenLock(input: {
