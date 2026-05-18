@@ -16,7 +16,7 @@ import { homedir } from "os";
 import { randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { splitPromptForClaudeCli } from "./prompt-split.ts";
+import { buildClaudeCliArgs } from "./claude-cli-args.ts";
 import { transcribe } from "./transcribe.ts";
 import {
   ANESTHESIA_CORPUS_INSTRUCTIONS,
@@ -496,26 +496,16 @@ async function callClaude(
   prompt: string,
   options?: { resume?: boolean; allowedTools?: string[]; addDirs?: string[]; cwd?: string }
 ): Promise<string> {
-  const { systemPrompt, userPrompt } = splitPromptForClaudeCli(prompt);
-  const args = [CLAUDE_PATH, "-p", userPrompt];
-
-  if (systemPrompt) {
-    args.push("--append-system-prompt", systemPrompt);
-  }
-
-  // Resume previous session if available and requested
-  if (CLAUDE_RESUME_ENABLED && options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
-  }
-
-  if (!CLAUDE_RESUME_ENABLED) {
-    args.push("--no-session-persistence");
-  }
-  args.push("--tools", (options?.allowedTools ?? []).join(","));
-  for (const dir of options?.addDirs ?? []) {
-    args.push("--add-dir", dir);
-  }
-  args.push("--output-format", "json");
+  const args = buildClaudeCliArgs({
+    claudePath: CLAUDE_PATH,
+    prompt,
+    allowedTools: options?.allowedTools ?? [],
+    addDirs: options?.addDirs ?? [],
+    resume: options?.resume === true,
+    resumeEnabled: CLAUDE_RESUME_ENABLED,
+    sessionId: session.sessionId,
+  });
+  const userPrompt = args[2] ?? "";
 
   console.log(`Calling Claude: ${userPrompt.substring(0, 80)}...`);
 

@@ -7,6 +7,7 @@
 
 import { spawn } from "bun";
 import { join } from "path";
+import { sanitizeSpawnArg } from "./sanitize-spawn-arg.ts";
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 20;
@@ -405,7 +406,7 @@ export function renderIMessageContext(result: IMessageContextResult): string {
   if (result.status === "found") {
     const chronological = [...result.messages].reverse();
     const lines = chronological.map((m) =>
-      `- ${m.ts} ${m.sender}: ${m.text.replace(/\s+/g, " ").trim()}`
+      `- ${m.ts} ${m.sender}: ${sanitizeSpawnArg(m.text).replace(/\s+/g, " ").trim()}`
     );
     return [
       `IMESSAGE CONTEXT FOR ${request.contact} (last ${result.messages.length} messages):`,

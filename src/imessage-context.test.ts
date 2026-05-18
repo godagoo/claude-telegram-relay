@@ -487,6 +487,24 @@ test("renders found context without telling Claude access failed", () => {
   expect(rendered).toContain("Do not claim you lacked iMessage access");
 });
 
+test("strips NUL and other unsafe control characters from rendered context", () => {
+  const result: IMessageContextResult = {
+    request: { contact: "Bro", limit: 10 },
+    status: "found",
+    messages: [
+      { id: 1, sender: "me", ts: "2026-05-15 09:00:00", text: " All good bro, can do!" },
+      { id: 2, sender: "them", ts: "2026-05-15 09:01:00", text: "ok sounds great" },
+    ],
+  };
+
+  const rendered = renderIMessageContext(result);
+  expect(rendered).not.toContain(" ");
+  expect(rendered).not.toContain("");
+  expect(rendered).not.toContain("");
+  expect(rendered).toContain("me: All good bro, can do!");
+  expect(rendered).toContain("them: ok sounds great");
+});
+
 test("renders empty lookup as contact mismatch, not FDA failure", () => {
   const result: IMessageContextResult = {
     request: { contact: "Peggy", limit: 10 },
