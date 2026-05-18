@@ -13,6 +13,7 @@
     "test:supabase": "bun run setup/test-supabase.ts",
     "test:voice": "bun run setup/test-voice.ts",
     "setup:launchd": "bun run setup/configure-launchd.ts",
+    "setup:wrapper": "bun run setup/configure-wrapper.ts",
     "setup:services": "bun run setup/configure-services.ts",
     "setup:export-shortcut": "bun run setup/export-claudedraft-shortcut.ts",
     "setup:run-shortcut": "bun run setup/run-claudedraft-shortcut.ts",

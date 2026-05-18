@@ -20,6 +20,12 @@ export interface RelayPlistOptions {
   throttleInterval?: number;
   exitTimeOut?: number;
   calendarIntervals?: { Hour: number; Minute: number }[];
+  // Optional wrapper: when both are provided, the launchd job execs the
+  // wrapper executable directly and tags the AssociatedBundleIdentifiers so
+  // TCC/FDA attaches to the wrapper bundle rather than the versioned Bun
+  // realpath in ProgramArguments[0].
+  wrapperExecutablePath?: string;
+  wrapperBundleId?: string;
 }
 
 function xmlEscape(value: string): string {
@@ -54,6 +60,7 @@ function renderCalendarIntervals(intervals: { Hour: number; Minute: number }[]):
 }
 
 export function generateRelayPlist(opts: RelayPlistOptions): string {
+  const useWrapper = Boolean(opts.wrapperExecutablePath && opts.wrapperBundleId);
   const lines: string[] = [];
   lines.push('<?xml version="1.0" encoding="UTF-8"?>');
   lines.push(
@@ -63,9 +70,19 @@ export function generateRelayPlist(opts: RelayPlistOptions): string {
   lines.push("<dict>");
   lines.push(`    <key>Label</key>\n    ${stringTag(opts.label)}`);
   lines.push("");
-  lines.push(
-    `    <key>ProgramArguments</key>\n    <array>\n        ${stringTag(opts.bunRealpath)}\n        ${stringTag("run")}\n        ${stringTag(opts.script)}\n    </array>`,
-  );
+  if (useWrapper) {
+    lines.push(
+      `    <key>ProgramArguments</key>\n    <array>\n        ${stringTag(opts.wrapperExecutablePath as string)}\n    </array>`,
+    );
+    lines.push("");
+    lines.push(
+      `    <key>AssociatedBundleIdentifiers</key>\n    ${stringTag(opts.wrapperBundleId as string)}`,
+    );
+  } else {
+    lines.push(
+      `    <key>ProgramArguments</key>\n    <array>\n        ${stringTag(opts.bunRealpath)}\n        ${stringTag("run")}\n        ${stringTag(opts.script)}\n    </array>`,
+    );
+  }
   lines.push("");
   lines.push(`    <key>WorkingDirectory</key>\n    ${stringTag(opts.projectRoot)}`);
   lines.push("");

@@ -80,6 +80,26 @@ describe("generateRelayPlist", () => {
     expect(plist).not.toContain("AT&T Notes");
   });
 
+  test("wrapper mode points ProgramArguments at the wrapper executable and tags the bundle ID", () => {
+    const plist = generateRelayPlist({
+      ...baseOptions,
+      wrapperExecutablePath: "/Users/x/Applications/ClaudeRelay.app/Contents/MacOS/ClaudeRelay",
+      wrapperBundleId: "com.claude.telegram-relay-wrapper",
+    });
+    expect(plist).toContain(
+      "<string>/Users/x/Applications/ClaudeRelay.app/Contents/MacOS/ClaudeRelay</string>",
+    );
+    expect(plist).not.toContain("<string>run</string>");
+    expect(plist).toContain(
+      "<key>AssociatedBundleIdentifiers</key>\n    <string>com.claude.telegram-relay-wrapper</string>",
+    );
+  });
+
+  test("non-wrapper mode does not emit AssociatedBundleIdentifiers", () => {
+    const plist = generateRelayPlist(baseOptions);
+    expect(plist).not.toContain("AssociatedBundleIdentifiers");
+  });
+
   test("scheduled jobs (no keepAlive) get StartCalendarInterval and no Throttle/Exit policy", () => {
     const plist = generateRelayPlist({
       ...baseOptions,

@@ -481,11 +481,24 @@ async function main() {
       // PLAN.md section 3: surface the FDA responsible binary/bundle
       // explicitly so the user can grant FDA without guessing. Reports the
       // wrapper bundle ID when present, the realpath otherwise.
-      const wrapperBundleId = env.RELAY_FDA_BUNDLE_ID || "";
+      const wrapperAppRoot = process.env.RELAY_WRAPPER_APP_ROOT ||
+        join(homedir(), "Applications", "ClaudeRelay.app");
+      const wrapperExecPath = join(wrapperAppRoot, "Contents", "MacOS", "ClaudeRelay");
+      const wrapperInfoPath = join(wrapperAppRoot, "Contents", "Info.plist");
+      const wrapperInstalled = existsSync(wrapperExecPath) && existsSync(wrapperInfoPath);
+      const wrapperBundleId = wrapperInstalled
+        ? "com.claude.telegram-relay-wrapper"
+        : env.RELAY_FDA_BUNDLE_ID || "";
       const fdaTarget = wrapperBundleId
-        ? `${wrapperBundleId} (wrapper bundle)`
+        ? `${wrapperBundleId} (wrapper at ${wrapperAppRoot})`
         : currentRealpath;
       pass(`FDA responsible target: ${fdaTarget}`);
+      if (!wrapperInstalled) {
+        warn(
+          `ClaudeRelay wrapper not installed at ${wrapperAppRoot}. ` +
+          "Run: bun run setup:wrapper to make FDA stable across Bun upgrades.",
+        );
+      }
       pass(`Launchd label: com.claude.telegram-relay`);
       pass(`Active relay PID count: ${relayProcessCount}`);
     } else {
