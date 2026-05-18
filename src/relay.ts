@@ -18,6 +18,7 @@ import { randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { buildClaudeCliArgs } from "./claude-cli-args.ts";
+import { redactBotToken } from "./redact-token.ts";
 import { transcribe } from "./transcribe.ts";
 import {
   ANESTHESIA_CORPUS_INSTRUCTIONS,
@@ -490,9 +491,10 @@ function buildClaudeEnv(): Record<string, string> {
 }
 
 function sanitizeStderr(stderr: string): string {
-  return stderr
-    .replace(/(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|TELEGRAM_BOT_TOKEN)=\S+/g, "$1=[redacted]")
-    .slice(0, 4000);
+  return redactBotToken(
+    stderr.replace(/(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|TELEGRAM_BOT_TOKEN)=\S+/g, "$1=[redacted]"),
+    BOT_TOKEN,
+  ).slice(0, 4000);
 }
 
 function parseClaudeCliOutput(output: string): { text: string; sessionId?: string } {
@@ -709,7 +711,15 @@ async function downloadTelegramFile(
   }
 
   const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${args.filePath}`;
-  const response = await fetch(url);
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (err) {
+    // fetch errors can include the full URL (with the bot token) in
+    // err.message; redact before rethrowing so the relay log never leaks it.
+    const safe = redactBotToken(err instanceof Error ? err.message : String(err), BOT_TOKEN);
+    throw new Error(`telegram_${args.kind}_download_fetch_failed: ${safe}`);
+  }
   if (!response.ok) {
     throw new Error(`telegram_${args.kind}_download_http_${response.status}`);
   }

@@ -19,6 +19,7 @@ import {
   validateICloudDriveDraftPayload,
 } from "../src/icloud-drive-draft.ts";
 import { tokenLockPath } from "../src/token-lock.ts";
+import { redactBotToken } from "../src/redact-token.ts";
 import {
   bunRealpathDriftCheck,
   parseLaunchdPlistJson,
@@ -171,10 +172,10 @@ async function main() {
         telegramTokenValid = true;
         pass(`Bot: @${data.result.username}`);
       } else {
-        fail(`Invalid token: ${data.description}`);
+        fail(`Invalid token: ${redactBotToken(String(data.description ?? ""), token)}`);
       }
     } catch (e: any) {
-      fail(`Telegram API unreachable: ${e.message}`);
+      fail(`Telegram API unreachable: ${redactBotToken(e.message, token)}`);
     }
   }
 
@@ -224,7 +225,7 @@ async function main() {
         ? data.result.pending_update_count
         : 0;
       if (!data.ok) {
-        warn(`Telegram getWebhookInfo failed: ${data.description || "unknown error"}`);
+        warn(`Telegram getWebhookInfo failed: ${redactBotToken(String(data.description ?? "unknown error"), token)}`);
       } else if (webhookUrl) {
         fail(
           "Telegram webhook is configured for this bot token; getUpdates polling will conflict. " +
@@ -234,7 +235,7 @@ async function main() {
         pass(`Telegram webhook inactive; pending updates: ${pendingCount}`);
       }
     } catch (e: any) {
-      warn(`Telegram getWebhookInfo unreachable: ${e.message}`);
+      warn(`Telegram getWebhookInfo unreachable: ${redactBotToken(e.message, token)}`);
     }
   }
 

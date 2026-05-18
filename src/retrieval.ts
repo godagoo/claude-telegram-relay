@@ -144,7 +144,14 @@ export async function preflight(): Promise<void> {
 
   const hits = await search('"anesthesia" "textbook"', 1);
   if (hits.length === 0) {
-    throw new Error("preflight: FTS returned 0 hits for anesthesia textbook catalog probe");
+    // PLAN.md section 5: zero-hit preflight is a warning, not fatal. A user
+    // without the anesthesia corpus indexed should not see the relay crash;
+    // they just lose textbook retrieval until they index.
+    console.warn(
+      "[preflight] FTS returned 0 hits for the anesthesia textbook catalog probe. " +
+      "Textbook retrieval is degraded until the corpus is reindexed.",
+    );
+    return;
   }
   console.log("[preflight] FTS sanity: textbook catalog probe returns hits");
 }

@@ -7,6 +7,7 @@
  */
 
 import { join, dirname } from "path";
+import { redactBotToken } from "../src/redact-token.ts";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 
@@ -71,14 +72,14 @@ async function main() {
 
     if (!meData.ok) {
       console.log(`  ${FAIL} Invalid bot token`);
-      console.log(`      ${dim(meData.description || "Check your token with @BotFather")}`);
+      console.log(`      ${dim(redactBotToken(meData.description || "Check your token with @BotFather", token))}`);
       process.exit(1);
     }
 
     console.log(`  ${PASS} Bot: @${meData.result.username} (${meData.result.first_name})`);
   } catch (err: any) {
     console.log(`  ${FAIL} Could not reach Telegram API`);
-    console.log(`      ${dim(err.message)}`);
+    console.log(`      ${dim(redactBotToken(err.message, token))}`);
     process.exit(1);
   }
 
@@ -101,7 +102,7 @@ async function main() {
         console.log(`      ${dim("Make sure you've started a conversation with your bot first.")}`);
         console.log(`      ${dim("Open Telegram, find your bot, and send /start")}`);
       } else {
-        console.log(`  ${FAIL} Send failed: ${msgData.description}`);
+        console.log(`  ${FAIL} Send failed: ${redactBotToken(msgData.description, token)}`);
       }
       process.exit(1);
     }
@@ -109,7 +110,7 @@ async function main() {
     console.log(`  ${PASS} Test message sent! Check your Telegram.`);
   } catch (err: any) {
     console.log(`  ${FAIL} Could not send message`);
-    console.log(`      ${dim(err.message)}`);
+    console.log(`      ${dim(redactBotToken(err.message, token))}`);
     process.exit(1);
   }
 
