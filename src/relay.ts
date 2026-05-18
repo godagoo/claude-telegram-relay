@@ -1240,16 +1240,22 @@ bot.on("message:text", async (ctx) => {
             }
             // iCloud Drive succeeded, but that only prepares the Shortcut input.
             // It is not proof the iPhone compose box is populated.
-            const shortcutInstallPending = existsSync(shortcutInstallPath());
+            const shortcutInstallPending =
+              existsSync(shortcutInstallPath()) ||
+              existsSync(shortcutInstallPath().replace(/\.shortcut$/, "-install.shortcut"));
             imessageDraftStatus = shortcutInstallPending
               ? "phone_shortcut_install_pending"
               : "phone_handoff_ready";
             imessageDraftMode = "icloud_drive_file";
+            // On success the body alone is the user-visible reply. The
+            // phone_handoff_ready state lives only in the decision log;
+            // surfacing a "Run ClaudeDraft..." footer in Telegram trained
+            // William to dismiss every reply as housekeeping.
             assistantText = rebuildAroundDraftBlock(
               assistantText,
               shortcutInstallPending
                 ? `${body}\n\nClaudeDraft is not installed on your iPhone yet. Open Files > iCloud Drive > ClaudeDraft.shortcut, tap Replace or Add Shortcut, then run ClaudeDraft. Draft target: ${contactLabel} (${resolved}).`
-                : `${body}\n\nPhone handoff ready for ${contactLabel} (${resolved}): ${handoff.shortcutUrl}`,
+                : body,
             );
           } else {
             placement = await placeIMessageDraft(PROJECT_ROOT, target, body);

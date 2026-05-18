@@ -1,10 +1,25 @@
 import { createHash, randomUUID } from "crypto";
 import { chmod, mkdir, open, rename, stat, unlink } from "fs/promises";
+import { hostname } from "os";
 import { homedir } from "os";
 import { join, resolve, sep } from "path";
 
 export const DEFAULT_SHORTCUT_NAME = "ClaudeDraft";
 export const ICLOUD_DRIVE_DRAFT_FILE_NAME = "latest.json";
+export const ICLOUD_DRIVE_DRAFT_SCHEMA_VERSION = 2;
+export const ICLOUD_DRIVE_DRAFT_DEFAULT_TTL_MS = 10 * 60 * 1000;
+
+export interface ICloudDriveDraftPayload {
+  schema_version: typeof ICLOUD_DRIVE_DRAFT_SCHEMA_VERSION;
+  draft_id: string;
+  writer_host: string;
+  created_at: string;
+  expires_at: string;
+  recipient: string;
+  recipient_label: string;
+  body: string;
+  body_sha256: string;
+}
 
 export interface ICloudDriveDraftInput {
   recipient: string;
@@ -69,7 +84,15 @@ export function shortcutRunUrl(
 
 export async function writeICloudDriveDraft(
   input: ICloudDriveDraftInput,
-  options: { dir?: string; now?: Date; shortcutName?: string; cloudDocsRoot?: string } = {},
+  options: {
+    dir?: string;
+    now?: Date;
+    shortcutName?: string;
+    cloudDocsRoot?: string;
+    writerHost?: string;
+    draftId?: string;
+    ttlMs?: number;
+  } = {},
 ): Promise<ICloudDriveDraftResult> {
   const dir = options.dir ?? defaultICloudDriveDraftDir();
   const cloudDocsRoot = options.cloudDocsRoot ?? defaultICloudDriveRoot();
@@ -88,11 +111,18 @@ export async function writeICloudDriveDraft(
   }
 
   const bodySha256 = createHash("sha256").update(input.body, "utf8").digest("hex");
-  const payload = {
+  const createdAt = options.now ?? new Date();
+  const ttlMs = options.ttlMs ?? ICLOUD_DRIVE_DRAFT_DEFAULT_TTL_MS;
+  const expiresAt = new Date(createdAt.getTime() + ttlMs);
+  const payload: ICloudDriveDraftPayload = {
+    schema_version: ICLOUD_DRIVE_DRAFT_SCHEMA_VERSION,
+    draft_id: options.draftId ?? randomUUID(),
+    writer_host: options.writerHost ?? hostname(),
+    created_at: createdAt.toISOString(),
+    expires_at: expiresAt.toISOString(),
     recipient: input.recipient,
     recipient_label: input.recipientLabel,
     body: input.body,
-    ts: (options.now ?? new Date()).toISOString(),
     body_sha256: bodySha256,
   };
 
@@ -165,4 +195,55 @@ export async function clearICloudDriveDraft(
       error: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+export interface ValidateICloudDriveDraftPayloadResult {
+  ok: boolean;
+  errors: string[];
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed);
+}
+
+export function validateICloudDriveDraftPayload(
+  payload: unknown,
+  options: { now: Date },
+): ValidateICloudDriveDraftPayloadResult {
+  const errors: string[] = [];
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, errors: ["draft payload is not an object"] };
+  }
+  const p = payload as Partial<ICloudDriveDraftPayload> & Record<string, unknown>;
+
+  if (p.schema_version !== ICLOUD_DRIVE_DRAFT_SCHEMA_VERSION) {
+    errors.push(
+      `unsupported schema_version: expected ${ICLOUD_DRIVE_DRAFT_SCHEMA_VERSION}, got ${String(p.schema_version)}`,
+    );
+  }
+  for (const field of ["draft_id", "writer_host", "recipient", "recipient_label", "body"] as const) {
+    if (typeof p[field] !== "string" || !(p[field] as string).length) {
+      errors.push(`missing or empty ${field}`);
+    }
+  }
+  if (!isIsoTimestamp(p.created_at)) errors.push("created_at is not an ISO timestamp");
+  if (!isIsoTimestamp(p.expires_at)) errors.push("expires_at is not an ISO timestamp");
+
+  const bodySha = typeof p.body_sha256 === "string" ? p.body_sha256 : "";
+  if (!/^[a-f0-9]{64}$/.test(bodySha)) {
+    errors.push("body_sha256 is not a 64-char lowercase hex string");
+  } else if (typeof p.body === "string") {
+    const recomputed = createHash("sha256").update(p.body, "utf8").digest("hex");
+    if (recomputed !== bodySha) {
+      errors.push("body_sha256 does not match sha256(body)");
+    }
+  }
+
+  if (isIsoTimestamp(p.expires_at) && Date.parse(p.expires_at) <= options.now.getTime()) {
+    errors.push(`draft expired at ${p.expires_at}`);
+  }
+
+  return { ok: errors.length === 0, errors };
 }

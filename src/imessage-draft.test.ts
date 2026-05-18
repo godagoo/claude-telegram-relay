@@ -243,48 +243,43 @@ test("NEW_COMPOSE_SENTINEL is the documented '?' character", () => {
   expect(NEW_COMPOSE_SENTINEL).toBe("?");
 });
 
-test("phone handoff formatting keeps Shortcuts handoff Telegram-safe", () => {
+test("phone handoff formatting strips the handoff line and leaves the body visible", () => {
   const formatted = formatPhoneHandoffForTelegram(
     "Here's the draft for Mark:\n\nHey Mark, sounds good.\n\nPhone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft\n",
   );
 
-  expect(formatted).toBe(
-    "Here's the draft for Mark:\n\nHey Mark, sounds good.\n\nRun ClaudeDraft in Shortcuts on your iPhone.",
-  );
+  expect(formatted).toBe("Here's the draft for Mark:\n\nHey Mark, sounds good.");
   expect(formatted).not.toContain("Phone handoff ready:");
   expect(formatted).not.toContain("shortcuts://run-shortcut?name=ClaudeDraft");
+  expect(formatted).not.toContain("Run ClaudeDraft in Shortcuts");
 });
 
-test("phone handoff formatting surfaces the resolved recipient", () => {
+test("phone handoff formatting strips the recipient-tagged handoff line too", () => {
   const formatted = formatPhoneHandoffForTelegram(
     "heading to London\n\nPhone handoff ready for dad (+16048092405): shortcuts://run-shortcut?name=ClaudeDraft\n",
   );
 
-  expect(formatted).toBe(
-    "heading to London\n\nDrafting to dad (+16048092405). Run ClaudeDraft in Shortcuts on your iPhone.",
-  );
+  expect(formatted).toBe("heading to London");
   expect(formatted).not.toContain("Phone handoff ready:");
-  expect(formatted).not.toContain("shortcuts://run-shortcut?name=ClaudeDraft");
+  expect(formatted).not.toContain("Run ClaudeDraft in Shortcuts");
 });
 
-test("phone handoff formatting strips legacy Open on iPhone handoff line", () => {
+test("phone handoff formatting strips the legacy Open on iPhone line", () => {
   const formatted = formatPhoneHandoffForTelegram(
     "Here's the draft for Mark:\n\nHey Mark, sounds good.\n\nOpen on iPhone: shortcuts://run-shortcut?name=ClaudeDraft\n",
   );
 
-  expect(formatted).toBe(
-    "Here's the draft for Mark:\n\nHey Mark, sounds good.\n\nRun ClaudeDraft in Shortcuts on your iPhone.",
-  );
+  expect(formatted).toBe("Here's the draft for Mark:\n\nHey Mark, sounds good.");
   expect(formatted).not.toContain("Open on iPhone:");
-  expect(formatted).not.toContain("shortcuts://run-shortcut?name=ClaudeDraft");
+  expect(formatted).not.toContain("Run ClaudeDraft in Shortcuts");
 });
 
-test("phone handoff formatting returns only fallback when no draft text remains", () => {
+test("phone handoff formatting returns empty string when nothing remains", () => {
   expect(
     formatPhoneHandoffForTelegram(
       "Phone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("Run ClaudeDraft in Shortcuts on your iPhone.");
+  ).toBe("");
 });
 
 test("phone handoff formatting leaves ordinary chatbot draft text alone", () => {

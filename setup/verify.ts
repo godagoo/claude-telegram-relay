@@ -15,6 +15,7 @@ import {
   defaultICloudDriveDraftDir,
   ICLOUD_DRIVE_DRAFT_FILE_NAME,
   isCloudDocsDraftDir,
+  validateICloudDriveDraftPayload,
 } from "../src/icloud-drive-draft.ts";
 import {
   readInstalledShortcutActions,
@@ -384,10 +385,12 @@ async function main() {
     if (existsSync(draftPath)) {
       try {
         const payload = JSON.parse(await Bun.file(draftPath).text()) as Record<string, unknown>;
-        typeof payload.recipient === "string" && typeof payload.body === "string" &&
-          typeof payload.ts === "string" && /^[a-f0-9]{64}$/.test(String(payload.body_sha256 ?? ""))
-          ? pass("Latest iCloud draft payload shape OK")
-          : fail("Latest iCloud draft payload is missing recipient/body/ts/body_sha256");
+        const validation = validateICloudDriveDraftPayload(payload, { now: new Date() });
+        if (validation.ok) {
+          pass("Latest iCloud draft payload validates (schema, sha256, not expired)");
+        } else {
+          for (const error of validation.errors) fail(`Latest iCloud draft: ${error}`);
+        }
       } catch (e: any) {
         fail(`Latest iCloud draft is not valid JSON: ${e.message}`);
       }

@@ -180,16 +180,10 @@ export function rebuildAroundDraftBlock(
 export function formatPhoneHandoffForTelegram(response: string): string {
   const match = response.match(PHONE_HANDOFF_LINE_RE);
   if (!match) return response;
-
-  const stripped = response.replace(PHONE_HANDOFF_LINE_RE, "\n\n").trim();
-  const target = match[1]?.trim();
-  const instruction = target
-    ? `Drafting to ${target}. Run ClaudeDraft in Shortcuts on your iPhone.`
-    : "Run ClaudeDraft in Shortcuts on your iPhone.";
-
-  return stripped.length > 0
-    ? `${stripped}\n\n${instruction}`
-    : instruction;
+  // Strip the internal handoff line but do not append a "Run ClaudeDraft on
+  // your iPhone" instruction. The draft body itself is the actionable content;
+  // phone_handoff_ready remains an internal decision-log state only.
+  return response.replace(PHONE_HANDOFF_LINE_RE, "\n\n").trim();
 }
 
 /**
