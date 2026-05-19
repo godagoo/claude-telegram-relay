@@ -267,6 +267,22 @@ async function installService(name: string, config: ServiceConfig): Promise<bool
   }
 
   console.log(`  ${PASS} Loaded — ${config.description}`);
+
+  // Record the Bun realpath baseline so setup:verify can detect drift
+  // without writing during a verification run.
+  if (config.label === "com.claude.telegram-relay") {
+    try {
+      const bunRealpath = findBunSync;
+      const stateDir = join(RELAY_DIR, "state");
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      const fs = await import("fs");
+      fs.writeFileSync(join(stateDir, "bun-realpath"), bunRealpath, "utf8");
+      console.log(`  ${PASS} Recorded Bun realpath baseline: ${bunRealpath}`);
+    } catch (err) {
+      console.log(`  ${dim("(realpath baseline write failed; verify will warn)")} ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   return true;
 }
 

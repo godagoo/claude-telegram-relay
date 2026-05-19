@@ -455,8 +455,9 @@ async function main() {
       warn(`No chat.db at ${chatDbPath}; FDA probe skipped`);
     }
 
-    // Bun realpath stability — record current realpath under
-    // ~/.claude-relay/state/bun-realpath and fail when it drifts.
+    // Bun realpath stability — verify is READ-ONLY. The recorded baseline
+    // is written by setup:launchd at install time (see configure-launchd.ts).
+    // PLAN3: "setup:verify writes... verification should be read-only."
     const bunRealpathProbe = await runCommand(["readlink", "-f", process.execPath], { timeoutMs: 5_000 });
     if (bunRealpathProbe.code === 0) {
       const currentRealpath = bunRealpathProbe.stdout.trim();
@@ -466,32 +467,50 @@ async function main() {
       if (!drift.ok && drift.drifted) {
         fail(
           `Bun realpath drifted: was ${previousRealpath}, now ${currentRealpath}. ` +
-          "Re-grant Full Disk Access to the new realpath, then update the record.",
+          "Re-grant Full Disk Access to the new realpath, then rerun: bun run setup:launchd",
+        );
+      } else if (previousRealpath === null) {
+        warn(
+          `No baseline Bun realpath recorded at ${recordPath}. ` +
+          "Run: bun run setup:launchd to record it.",
         );
       } else {
         pass(`Bun realpath stable: ${currentRealpath}`);
-        try {
-          require("fs").mkdirSync(dirname(recordPath), { recursive: true, mode: 0o700 });
-          require("fs").writeFileSync(recordPath, currentRealpath, "utf8");
-        } catch {
-          // Recording is best-effort; the check still passes for current run.
-        }
       }
 
-      // PLAN.md section 3: surface the FDA responsible binary/bundle
-      // explicitly so the user can grant FDA without guessing. Reports the
-      // wrapper bundle ID when present, the realpath otherwise.
+      // FDA responsible target comes from the installed LaunchAgent's
+      // ProgramArguments[0], not env. If it's the wrapper executable,
+      // report the bundle id. If it's bun, report the realpath. This
+      // reflects the actual TCC target launchd will use.
       const wrapperAppRoot = process.env.RELAY_WRAPPER_APP_ROOT ||
         join(homedir(), "Applications", "ClaudeRelay.app");
       const wrapperExecPath = join(wrapperAppRoot, "Contents", "MacOS", "ClaudeRelay");
       const wrapperInfoPath = join(wrapperAppRoot, "Contents", "Info.plist");
       const wrapperInstalled = existsSync(wrapperExecPath) && existsSync(wrapperInfoPath);
-      const wrapperBundleId = wrapperInstalled
-        ? "com.claude.telegram-relay-wrapper"
-        : env.RELAY_FDA_BUNDLE_ID || "";
-      const fdaTarget = wrapperBundleId
-        ? `${wrapperBundleId} (wrapper at ${wrapperAppRoot})`
-        : currentRealpath;
+
+      let fdaTarget = currentRealpath;
+      if (existsSync(plistPath)) {
+        const plutilFda = await runCommand(
+          ["plutil", "-convert", "json", "-o", "-", plistPath],
+          { timeoutMs: 5_000 },
+        );
+        if (plutilFda.code === 0) {
+          try {
+            const parsed = JSON.parse(plutilFda.stdout) as { ProgramArguments?: unknown };
+            const args = Array.isArray(parsed?.ProgramArguments)
+              ? (parsed.ProgramArguments as unknown[])
+              : [];
+            const first = typeof args[0] === "string" ? args[0] as string : "";
+            if (first === wrapperExecPath && wrapperInstalled) {
+              fdaTarget = `com.claude.telegram-relay-wrapper (wrapper at ${wrapperAppRoot})`;
+            } else if (first) {
+              fdaTarget = first;
+            }
+          } catch {
+            // fall back to realpath
+          }
+        }
+      }
       pass(`FDA responsible target: ${fdaTarget}`);
       if (!wrapperInstalled) {
         warn(

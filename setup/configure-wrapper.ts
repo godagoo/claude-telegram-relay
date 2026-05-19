@@ -63,9 +63,9 @@ function resolveBunPath(): string {
   return "bun";
 }
 
-function readPackageVersion(): string {
+async function readPackageVersion(): Promise<string> {
   try {
-    const pkg = JSON.parse(Bun.file(join(PROJECT_ROOT, "package.json")).text() as unknown as string);
+    const pkg = JSON.parse(await Bun.file(join(PROJECT_ROOT, "package.json")).text());
     return typeof pkg?.version === "string" ? pkg.version : "1.0.0";
   } catch {
     return "1.0.0";
@@ -85,7 +85,7 @@ async function main(): Promise<void> {
   console.log("");
 
   const bunRealpath = resolveBunPath();
-  const version = readPackageVersion();
+  const version = await readPackageVersion();
 
   const env: Record<string, string> = {
     HOME,
