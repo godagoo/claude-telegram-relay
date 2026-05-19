@@ -23,8 +23,6 @@ import {
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 const HOME = homedir();
-const RELAY_DIR = process.env.RELAY_DIR || join(HOME, ".claude-relay");
-const LOGS_DIR = process.env.RELAY_LOG_DIR || join(RELAY_DIR, "logs");
 const WRAPPER_APP_ROOT = process.env.RELAY_WRAPPER_APP_ROOT ||
   join(HOME, "Applications", `${WRAPPER_BUNDLE_NAME}.app`);
 
@@ -87,18 +85,6 @@ async function main(): Promise<void> {
   const bunRealpath = resolveBunPath();
   const version = await readPackageVersion();
 
-  const env: Record<string, string> = {
-    HOME,
-    PATH: `${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
-    RELAY_DIR,
-    RELAY_LOG_DIR: LOGS_DIR,
-    CLAUDE_PATH: `${HOME}/.local/bin/claude`,
-    CLAUDE_TIMEOUT_MS: process.env.CLAUDE_TIMEOUT_MS || "90000",
-    CLAUDE_RESUME: process.env.CLAUDE_RESUME || "0",
-    RELAY_FDA_BUNDLE_ID: WRAPPER_BUNDLE_ID,
-  };
-  if (process.env.RELAY_PYTHON) env.RELAY_PYTHON = process.env.RELAY_PYTHON;
-
   const contentsDir = join(WRAPPER_APP_ROOT, "Contents");
   const macosDir = join(contentsDir, "MacOS");
   mkdirSync(macosDir, { recursive: true, mode: 0o755 });
@@ -114,13 +100,38 @@ async function main(): Promise<void> {
       bunRealpath,
       projectRoot: PROJECT_ROOT,
       script: "src/relay.ts",
-      env,
-      logsDir: LOGS_DIR,
     }),
     { mode: 0o755 },
   );
   chmodSync(execPath, 0o755);
   console.log(`  ${PASS} Wrote ${execPath}`);
+
+  // Ad-hoc sign the bundle so TCC has a stable code-signing identity (cdhash)
+  // to bind grants to. Unsigned bundles get re-prompted on every change.
+  const sign = Bun.spawnSync([
+    "codesign",
+    "--sign",
+    "-",
+    "--force",
+    "--deep",
+    "--identifier",
+    WRAPPER_BUNDLE_ID,
+    WRAPPER_APP_ROOT,
+  ]);
+  if (sign.exitCode !== 0) {
+    const errText = new TextDecoder().decode(sign.stderr);
+    console.log(`  ${FAIL} codesign failed: ${errText.trim()}`);
+    process.exit(1);
+  }
+  console.log(`  ${PASS} Ad-hoc signed ${WRAPPER_APP_ROOT}`);
+
+  const verify = Bun.spawnSync(["codesign", "--verify", "--verbose", WRAPPER_APP_ROOT]);
+  if (verify.exitCode !== 0) {
+    const errText = new TextDecoder().decode(verify.stderr);
+    console.log(`  ${FAIL} codesign --verify failed: ${errText.trim()}`);
+    process.exit(1);
+  }
+  console.log(`  ${PASS} codesign --verify: bundle is valid`);
 
   console.log("");
   console.log(bold("  Next steps"));

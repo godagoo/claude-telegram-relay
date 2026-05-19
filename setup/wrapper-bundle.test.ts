@@ -32,52 +32,45 @@ describe("generateWrapperInfoPlist", () => {
 });
 
 describe("generateWrapperShellScript", () => {
-  test("execs bun against the relay script with explicit env", () => {
+  test("execs bun against the relay script with cd to project root", () => {
     const script = generateWrapperShellScript({
       bunRealpath: "/opt/homebrew/Cellar/bun/1.3.13/bin/bun",
       projectRoot: "/Users/x/Projects/claude-telegram-relay",
       script: "src/relay.ts",
-      env: {
-        HOME: "/Users/x",
-        RELAY_DIR: "/Users/x/.claude-relay",
-        RELAY_LOG_DIR: "/Users/x/.claude-relay/logs",
-        CLAUDE_PATH: "/Users/x/.local/bin/claude",
-      },
-      logsDir: "/Users/x/.claude-relay/logs",
     });
     expect(script.startsWith("#!/bin/bash")).toBe(true);
-    expect(script).toContain("export HOME='/Users/x'");
-    expect(script).toContain("export RELAY_DIR='/Users/x/.claude-relay'");
-    expect(script).toContain("export RELAY_LOG_DIR='/Users/x/.claude-relay/logs'");
-    expect(script).toContain("export CLAUDE_PATH='/Users/x/.local/bin/claude'");
+    expect(script).toContain("set -euo pipefail");
+    expect(script).toContain("cd '/Users/x/Projects/claude-telegram-relay'");
     expect(script).toContain(
       "exec '/opt/homebrew/Cellar/bun/1.3.13/bin/bun' run 'src/relay.ts'",
     );
-    expect(script).toContain("cd '/Users/x/Projects/claude-telegram-relay'");
   });
 
-  test("escapes single quotes in env values safely", () => {
+  test("is static: contains no export statements (env lives in launchd)", () => {
     const script = generateWrapperShellScript({
       bunRealpath: "/bun",
       projectRoot: "/p",
       script: "src/relay.ts",
-      env: { NOTE: "user's notes" },
-      logsDir: "/log",
     });
-    expect(script).toContain("export NOTE='user'\\''s notes'");
+    const exportLines = script.split("\n").filter((l) => l.startsWith("export "));
+    expect(exportLines).toEqual([]);
   });
 
-  test("does NOT include hardcoded PATH that hides the launchd env", () => {
+  test("escapes single quotes in path values safely", () => {
     const script = generateWrapperShellScript({
+      bunRealpath: "/bun",
+      projectRoot: "/users/o'brien/proj",
+      script: "src/relay.ts",
+    });
+    expect(script).toContain("cd '/users/o'\\''brien/proj'");
+  });
+
+  test("rerunning with identical inputs produces byte-identical output", () => {
+    const opts = {
       bunRealpath: "/bun",
       projectRoot: "/p",
       script: "src/relay.ts",
-      env: { HOME: "/h", PATH: "/usr/bin" },
-      logsDir: "/log",
-    });
-    // PATH explicitly set is allowed (it's part of env), but the wrapper must
-    // not silently override or merge — it just exports what it's given.
-    const pathLines = script.split("\n").filter((l) => l.startsWith("export PATH="));
-    expect(pathLines).toEqual(["export PATH='/usr/bin'"]);
+    } as const;
+    expect(generateWrapperShellScript(opts)).toBe(generateWrapperShellScript(opts));
   });
 });
