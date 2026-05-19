@@ -29,21 +29,46 @@ Path (atomic write, `wx` + rename, mode `0600`, parent dir `0700`):
 Source: [`src/icloud-drive-draft.ts`](../src/icloud-drive-draft.ts) (writer)
 and [`src/relay.ts`](../src/relay.ts) (placement block).
 
-Payload (always overwritten; no append, no history):
+Payload (always overwritten; no append, no history). v2 schema:
 
 ```json
 {
-  "recipient": "+15198545324",           // phone (E.164) OR email
-  "recipient_label": "William",          // display name, used in relay logs only
-  "body": "draft text",                  // plaintext; iPhone needs to read it
-  "ts": "2026-05-13T13:30:00.000Z",      // ISO 8601 UTC
-  "body_sha256": "..."                   // hex SHA-256 of body, for log correlation
+  "schema_version": 2,
+  "draft_id": "11111111-2222-3333-4444-555555555555",
+  "writer_host": "macA.local",
+  "created_at": "2026-05-13T13:30:00.000Z",
+  "expires_at": "2026-05-13T13:40:00.000Z",
+  "recipient": "+15198545324",
+  "recipient_label": "William",
+  "body": "draft text",
+  "body_sha256": "9f86d081884c7d659a2feaa0c55ad015..."
 }
 ```
 
-`recipient` accepts either a phone number or an email — Messages picks the
-right transport. `body_sha256` lets `decision-log.jsonl` rows correlate
-to the exact draft a Shortcut run consumed without ever storing the body.
+Field semantics:
+
+- `schema_version` is currently `2`. `setup:verify` fails on any other
+  version; older drafts written by previous relay builds must be cleared.
+- `draft_id` is a UUIDv4 generated per write. It lets the iPhone-side
+  log correlate to a single relay write without needing the body.
+- `writer_host` is the relay host that wrote the file. Mismatch with
+  the running relay means a stale draft synced in from a different Mac.
+- `created_at` and `expires_at` are ISO 8601 UTC. The relay defaults
+  `expires_at` to `created_at + RELAY_DRAFT_TTL_MS` (default 10 minutes).
+  `setup:verify` rejects drafts whose `expires_at` is in the past so the
+  iPhone Shortcut can't replay an old payload.
+- `recipient` accepts either a phone number or an email; Messages picks
+  the right transport.
+- `body_sha256` is the lowercase hex SHA-256 of `body`. `setup:verify`
+  recomputes the hash and rejects a payload whose `body` doesn't match.
+  This is what `decision-log.jsonl` rows correlate against — they never
+  store the body itself.
+
+Backward-compatibility note: the v1 schema used a single `ts` field instead
+of `created_at` / `expires_at` and did not include `schema_version`,
+`draft_id`, or `writer_host`. A v1 file in `latest.json` will fail
+`setup:verify` after upgrading; delete the file and let the relay rewrite
+on the next draft.
 
 ## Build the Shortcut (do this once on the Mac)
 

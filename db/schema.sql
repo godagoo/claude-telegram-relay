@@ -73,10 +73,27 @@ ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memory ENABLE ROW LEVEL SECURITY;
 ALTER TABLE logs ENABLE ROW LEVEL SECURITY;
 
--- Allow all for service role (your bot uses service key)
-CREATE POLICY "Allow all for service role" ON messages FOR ALL USING (true);
-CREATE POLICY "Allow all for service role" ON memory FOR ALL USING (true);
-CREATE POLICY "Allow all for service role" ON logs FOR ALL USING (true);
+-- Service-role only. The relay MUST be configured with a Supabase
+-- service_role key (or a key whose Postgres role is service_role) so it
+-- bypasses RLS via this policy. Anon, authenticated, and any other public
+-- role gets nothing — anonymous Telegram traffic does not exist for this
+-- daemon, and an exposed anon key must never write history.
+--
+-- The previous "Allow all for service role" / FOR ALL USING (true) policy
+-- was a misnomer: USING (true) permits every role, defeating RLS. The TO
+-- service_role clause is the actual restriction.
+DROP POLICY IF EXISTS "Allow all for service role" ON messages;
+DROP POLICY IF EXISTS "Allow all for service role" ON memory;
+DROP POLICY IF EXISTS "Allow all for service role" ON logs;
+DROP POLICY IF EXISTS "service_role full access" ON messages;
+DROP POLICY IF EXISTS "service_role full access" ON memory;
+DROP POLICY IF EXISTS "service_role full access" ON logs;
+CREATE POLICY "service_role full access" ON messages
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY "service_role full access" ON memory
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY "service_role full access" ON logs
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
 
 -- ============================================================
 -- HELPER FUNCTIONS
