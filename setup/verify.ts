@@ -373,7 +373,7 @@ async function main() {
         warn(`Long-lived Claude Code shell process found (${claudeShells.length}); not the launchd relay`);
       }
 
-      const tokenLock = token ? tokenLockPath(token, RELAY_DIR) : undefined;
+      const tokenLock = token ? tokenLockPath(token) : undefined;
       if (!tokenLock) {
         warn("Cannot check token lock without TELEGRAM_BOT_TOKEN");
       } else if (!existsSync(tokenLock)) {

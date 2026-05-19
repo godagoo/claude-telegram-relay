@@ -96,6 +96,7 @@ import {
   formatTelegramPollingConflictLog,
   shouldEscalateTelegramPollingConflict,
   shouldExitAfterTelegramPollingConflict,
+  shouldPrintConflictHint,
 } from "./telegram-polling.ts";
 import {
   acquireTokenLock,
@@ -216,7 +217,7 @@ async function rotateClaudeSessionAfterTimeout(): Promise<void> {
 // LOCK FILE (token-keyed singleton)
 // ============================================================
 
-const TOKEN_LOCK_PATH = tokenLockPath(BOT_TOKEN, RELAY_DIR);
+const TOKEN_LOCK_PATH = tokenLockPath(BOT_TOKEN);
 const RELAY_HOST = process.env.RELAY_HOST || os.hostname();
 
 let releaseLockOnExit: () => Promise<void> = async () => undefined;
@@ -339,23 +340,21 @@ async function saveMessage(
 }
 
 // Acquire token-keyed singleton lock. The lock filename is the sha256 prefix
-// of the bot token, so any second relay using the same token (even with a
-// different RELAY_DIR) sees the same lock. The raw token never lands on disk.
+// of the bot token, and the lock root is host-global (RELAY_LOCK_ROOT or
+// ~/.claude-relay/locks) — independent of RELAY_DIR, so two relays started
+// with different RELAY_DIR values still collide on the same file. The raw
+// token never lands on disk; the file holds only the hash.
 {
   const lockResult = await acquireTokenLock({
     token: BOT_TOKEN,
     host: RELAY_HOST,
     pid: process.pid,
     now: new Date(),
-    baseDir: RELAY_DIR,
-    isLiveRelay: (pid) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    },
+    // baseDir omitted → defaultLockRoot() is used.
+    // isLiveRelayPid checks BOTH process existence and that its `ps` cmdline
+    // mentions relay.ts — so a PID reused by some unrelated process won't
+    // falsely keep us out.
+    isLiveRelay: (pid) => isLiveRelayPid(pid),
   });
 
   if (!lockResult.ok) {
@@ -379,12 +378,15 @@ async function saveMessage(
     }
   } else {
     releaseLockOnExit = async () => {
-      await releaseTokenLock({ token: BOT_TOKEN, pid: process.pid, baseDir: RELAY_DIR });
+      await releaseTokenLock({
+        token: BOT_TOKEN,
+        pid: process.pid,
+        host: RELAY_HOST,
+      });
     };
     stopLockHeartbeat = startTokenLockHeartbeat({
       token: BOT_TOKEN,
       pid: process.pid,
-      baseDir: RELAY_DIR,
     });
   }
 }
@@ -2069,7 +2071,10 @@ async function startTelegramPolling(): Promise<void> {
           pluginEnvExists,
         }),
       );
-      if (shouldEscalateTelegramPollingConflict(conflictAttempts)) {
+      if (
+        shouldPrintConflictHint(conflictAttempts) ||
+        shouldEscalateTelegramPollingConflict(conflictAttempts)
+      ) {
         console.error(formatTelegramPollingConflictHint({ diagnosis, pluginEnvExists }));
       }
       if (shouldExitAfterTelegramPollingConflict(conflictAttempts)) {

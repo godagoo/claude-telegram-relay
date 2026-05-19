@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   acquireTokenLock,
+  defaultLockRoot,
   heartbeatTokenLock,
   isLockStaleByAge,
   readTokenLock,
@@ -455,5 +456,103 @@ describe("startTokenLockHeartbeat", () => {
     });
     stop();
     expect(() => stop()).not.toThrow();
+  });
+});
+
+describe("defaultLockRoot", () => {
+  test("is independent of RELAY_DIR; honors RELAY_LOCK_ROOT only", () => {
+    const original = {
+      RELAY_LOCK_ROOT: process.env.RELAY_LOCK_ROOT,
+      RELAY_DIR: process.env.RELAY_DIR,
+    };
+    try {
+      delete process.env.RELAY_LOCK_ROOT;
+      process.env.RELAY_DIR = "/tmp/forge-a-different-relay-dir";
+      const fromRelayDir = defaultLockRoot();
+      expect(fromRelayDir).not.toContain("/tmp/forge-a-different-relay-dir");
+      expect(fromRelayDir.endsWith("/.claude-relay/locks")).toBe(true);
+
+      process.env.RELAY_LOCK_ROOT = "/tmp/explicit-lock-root";
+      expect(defaultLockRoot()).toBe("/tmp/explicit-lock-root");
+    } finally {
+      if (original.RELAY_LOCK_ROOT === undefined) delete process.env.RELAY_LOCK_ROOT;
+      else process.env.RELAY_LOCK_ROOT = original.RELAY_LOCK_ROOT;
+      if (original.RELAY_DIR === undefined) delete process.env.RELAY_DIR;
+      else process.env.RELAY_DIR = original.RELAY_DIR;
+    }
+  });
+});
+
+describe("acquireTokenLock atomicity (open wx)", () => {
+  test("the second concurrent acquire fails when no stale takeover is allowed", async () => {
+    const isLiveRelay = () => true;
+    const now = new Date("2026-05-18T10:00:00Z");
+
+    const [first, second] = await Promise.all([
+      acquireTokenLock({
+        token: FAKE_TOKEN,
+        host: FAKE_HOST,
+        pid: 11111,
+        now,
+        baseDir: tempDir,
+        isLiveRelay,
+      }),
+      acquireTokenLock({
+        token: FAKE_TOKEN,
+        host: FAKE_HOST,
+        pid: 22222,
+        now,
+        baseDir: tempDir,
+        isLiveRelay: (pid) => pid !== 22222,
+      }),
+    ]);
+    const successes = [first, second].filter((r) => r.ok).length;
+    expect(successes).toBe(1);
+  });
+});
+
+describe("releaseTokenLock ownership", () => {
+  test("refuses to release when token_hash in the file does not match the caller's token", async () => {
+    const acquired = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 12345,
+      now: new Date(),
+      baseDir: tempDir,
+      isLiveRelay: () => false,
+    });
+    expect(acquired.ok).toBe(true);
+    if (!acquired.ok) return;
+
+    // Simulate a different token whose lockfile happens to share the same
+    // path (cannot occur in production since the path is keyed on the
+    // sha256 prefix, but the release path must defensively check).
+    const wrongTokenLockPath = acquired.path;
+    const payload = JSON.parse(readFileSync(wrongTokenLockPath, "utf8")) as TokenLockPayload;
+    payload.token_hash = "0".repeat(64);
+    writeFileSync(wrongTokenLockPath, JSON.stringify(payload));
+
+    await releaseTokenLock({ token: FAKE_TOKEN, pid: 12345, baseDir: tempDir });
+    expect(existsSync(wrongTokenLockPath)).toBe(true);
+  });
+
+  test("refuses to release when host in the file does not match the caller's host", async () => {
+    const acquired = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 12345,
+      now: new Date(),
+      baseDir: tempDir,
+      isLiveRelay: () => false,
+    });
+    expect(acquired.ok).toBe(true);
+    if (!acquired.ok) return;
+
+    const payload = JSON.parse(readFileSync(acquired.path, "utf8")) as TokenLockPayload;
+    payload.host = "some-other-host";
+    writeFileSync(acquired.path, JSON.stringify(payload));
+
+    await releaseTokenLock({ token: FAKE_TOKEN, pid: 12345, baseDir: tempDir, host: FAKE_HOST });
+    expect(existsSync(acquired.path)).toBe(true);
   });
 });
