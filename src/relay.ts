@@ -1219,9 +1219,13 @@ bot.on("message:text", async (ctx) => {
           const target = resolved ?? NEW_COMPOSE_SENTINEL;
           const useIPhoneMirror =
             Boolean(resolved) && shouldUseIPhoneMirrorPlacement();
+          const draftTtlMs = positiveIntEnv("RELAY_DRAFT_TTL_MS", 10 * 60 * 1000);
           const [handoff, iPhoneMirror] = await Promise.all([
             resolved
-              ? writeICloudDriveDraft({ recipient: resolved, recipientLabel: contactLabel, body })
+              ? writeICloudDriveDraft(
+                { recipient: resolved, recipientLabel: contactLabel, body },
+                { ttlMs: draftTtlMs },
+              )
               : Promise.resolve(null),
             resolved
               ? useIPhoneMirror

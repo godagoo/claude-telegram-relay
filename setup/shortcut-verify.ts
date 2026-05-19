@@ -302,25 +302,37 @@ export function validateClaudeDraftShortcutActions(
     errors.push("ClaudeDraft is missing the body dictionary lookup");
   }
 
-  // PLAN3: recipient and body lookups must read from the parsed JSON
-  // dictionary output. When WFInput is present, its OutputUUID must match
-  // the dictionary action's UUID. When WFInput is absent the Shortcuts
-  // runtime uses the previous action's output; the strict sequence check
-  // above guarantees that previous action is the dictionary parser.
+  // PLAN4: both recipient and body lookups MUST have explicit WFInput
+  // pointing at the dictionary parser. Implicit chaining (no WFInput)
+  // depends on action ordering and runtime behavior; that's too brittle a
+  // contract for the singleton iPhone draft path. Requiring explicit
+  // WFInput is unambiguous and survives the Shortcut editor reformatting
+  // the action list.
   const dictionaryUuid = dictionaryParams ? asString(dictionaryParams.UUID) : undefined;
   const checkLookupInput = (
     lookupName: string,
     lookupParams: Record<string, unknown> | undefined,
   ) => {
     if (!lookupParams) return;
-    const input = asRecord(lookupParams.WFInput);
-    if (!input) return; // implicit; relies on the sequence check
-    const inputUuid = asString(asRecord(input.Value)?.OutputUUID);
     if (!dictionaryUuid) return;
+    const input = asRecord(lookupParams.WFInput);
+    if (!input) {
+      errors.push(
+        `ClaudeDraft ${lookupName} dictionary lookup is missing WFInput; ` +
+        `it must explicitly read from the dictionary parser (${dictionaryUuid})`,
+      );
+      return;
+    }
+    const inputUuid = asString(asRecord(input.Value)?.OutputUUID);
     if (inputUuid && inputUuid !== dictionaryUuid) {
       errors.push(
         `ClaudeDraft ${lookupName} dictionary lookup WFInput points at ${inputUuid}, ` +
         `expected the dictionary parser output (${dictionaryUuid})`,
+      );
+    } else if (!inputUuid) {
+      errors.push(
+        `ClaudeDraft ${lookupName} dictionary lookup WFInput is malformed; ` +
+        `expected Value.OutputUUID pointing at ${dictionaryUuid}`,
       );
     }
   };

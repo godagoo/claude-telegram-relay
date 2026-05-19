@@ -10,7 +10,7 @@
 // The raw token is never written to disk: we store its sha256 hex hash in
 // the payload and use the first 16 hex chars in the filename.
 
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "fs/promises";
 import { existsSync, openSync, closeSync, writeFileSync } from "fs";
 import { homedir } from "os";
@@ -183,13 +183,27 @@ export async function acquireTokenLock(input: {
     }
   }
 
-  // Stale or unreadable: take over by removing and recreating atomically.
-  // If we lose the race a second time, surface that as held_by_live_relay so
-  // the caller exits cleanly and launchd retries.
+  // Stale takeover via atomic claim. The previous flow did
+  // unlink → tryAtomicCreate, which let two concurrent stale takeovers
+  // succeed: process B could unlink process A's freshly-created lock and
+  // then create its own. (PLAN4 reproduced 13 double-successes in 500
+  // attempts.) Replace with rename-to-unique-claim-path:
+  //
+  //   1. rename(path, claimPath) is POSIX-atomic. Only one process can
+  //      rename the same source file successfully; everyone else gets
+  //      ENOENT and bails out as held_by_live_relay.
+  //   2. Read the claim file and verify its content matches the stale
+  //      payload we observed. A mismatch means a third process replaced
+  //      the lock between our observation and our rename; restore it.
+  //   3. Create the new lock at the original path with O_EXCL. If a
+  //      third process slipped in and created a new lock there, we bail
+  //      out as held_by_live_relay (without touching the new lock).
+  const claimPath = `${path}.claim-${input.pid}-${randomUUID()}`;
   try {
-    await unlink(path).catch(() => undefined);
-    if (!tryAtomicCreate(path, payload)) {
-      const holder = (await readPayloadOrNull(path)) ?? {
+    await rename(path, claimPath);
+  } catch (err) {
+    if ((err as { code?: string }).code === "ENOENT") {
+      const holder = existing ?? {
         schema_version: TOKEN_LOCK_SCHEMA_VERSION,
         token_hash: tokenHash(input.token),
         host: input.host,
@@ -199,9 +213,45 @@ export async function acquireTokenLock(input: {
       } satisfies TokenLockPayload;
       return { ok: false, reason: "held_by_live_relay", holder, path };
     }
+    return { ok: false, reason: "io_error", error: err instanceof Error ? err.message : String(err) };
+  }
+
+  const claimed = await readPayloadOrNull(claimPath);
+  // If the lock was unparseable on initial read (existing === null), we
+  // don't have a baseline to verify against; just take over. Otherwise the
+  // claimed payload must match what we observed; a mismatch means a third
+  // process replaced the lock between read and rename — restore and bail.
+  const needsContentVerify = existing !== null;
+  if (needsContentVerify) {
+    const observedMatches =
+      !!claimed &&
+      claimed.pid === existing.pid &&
+      claimed.token_hash === existing.token_hash &&
+      claimed.heartbeat_at === existing.heartbeat_at;
+    if (!observedMatches) {
+      if (claimed) {
+        await rename(claimPath, path).catch(() => undefined);
+      } else {
+        await unlink(claimPath).catch(() => undefined);
+      }
+      const holder = claimed ?? existing;
+      return { ok: false, reason: "held_by_live_relay", holder, path };
+    }
+  }
+
+  try {
+    if (!tryAtomicCreate(path, payload)) {
+      // A third process created a new lock at path between our rename and
+      // our create. Their lock is valid; do not disturb it.
+      await unlink(claimPath).catch(() => undefined);
+      const holder = (await readPayloadOrNull(path)) ?? existing!;
+      return { ok: false, reason: "held_by_live_relay", holder, path };
+    }
     await chmod(path, 0o600).catch(() => undefined);
+    await unlink(claimPath).catch(() => undefined);
     return { ok: true, path, payload };
   } catch (err) {
+    await unlink(claimPath).catch(() => undefined);
     return { ok: false, reason: "io_error", error: err instanceof Error ? err.message : String(err) };
   }
 }

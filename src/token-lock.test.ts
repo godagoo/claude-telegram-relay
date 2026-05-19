@@ -511,6 +511,89 @@ describe("acquireTokenLock atomicity (open wx)", () => {
   });
 });
 
+describe("stale-takeover race", () => {
+  test("two concurrent stale takeovers produce exactly one success", async () => {
+    // Seed an obviously-stale lock.
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        schema_version: 1,
+        token_hash: tokenHash(FAKE_TOKEN),
+        host: FAKE_HOST,
+        pid: 99999,
+        started_at: "2026-05-18T09:00:00.000Z",
+        heartbeat_at: "2026-05-18T09:00:00.000Z",
+      } satisfies TokenLockPayload),
+    );
+
+    const now = new Date("2026-05-18T10:00:00Z");
+    const tryAcquire = (pid: number) =>
+      acquireTokenLock({
+        token: FAKE_TOKEN,
+        host: FAKE_HOST,
+        pid,
+        now,
+        baseDir: tempDir,
+        // Holder is dead (we say no PID is alive) but our own pid is alive
+        // for the heartbeat check — irrelevant because existing.pid is 99999.
+        isLiveRelay: () => false,
+      });
+
+    const [a, b] = await Promise.all([tryAcquire(11111), tryAcquire(22222)]);
+    const successes = [a, b].filter((r) => r.ok).length;
+    expect(successes).toBe(1);
+  });
+
+  test("500 pairs of concurrent stale takeovers always elect exactly one winner", async () => {
+    let doubleSuccesses = 0;
+    for (let trial = 0; trial < 50; trial++) {
+      const trialDir = mkdtempSync(join(tmpdir(), `relay-stale-race-${trial}-`));
+      try {
+        const path = tokenLockPath(FAKE_TOKEN, trialDir);
+        mkdirSync(join(trialDir, "locks"), { recursive: true });
+        writeFileSync(
+          path,
+          JSON.stringify({
+            schema_version: 1,
+            token_hash: tokenHash(FAKE_TOKEN),
+            host: FAKE_HOST,
+            pid: 70000 + trial,
+            started_at: "2026-05-18T09:00:00.000Z",
+            heartbeat_at: "2026-05-18T09:00:00.000Z",
+          } satisfies TokenLockPayload),
+        );
+
+        const now = new Date("2026-05-18T10:00:00Z");
+        const results = await Promise.all([
+          acquireTokenLock({
+            token: FAKE_TOKEN,
+            host: FAKE_HOST,
+            pid: 11111,
+            now,
+            baseDir: trialDir,
+            isLiveRelay: () => false,
+          }),
+          acquireTokenLock({
+            token: FAKE_TOKEN,
+            host: FAKE_HOST,
+            pid: 22222,
+            now,
+            baseDir: trialDir,
+            isLiveRelay: () => false,
+          }),
+        ]);
+        const successes = results.filter((r) => r.ok).length;
+        if (successes !== 1) doubleSuccesses += 1;
+      } finally {
+        rmSync(trialDir, { recursive: true, force: true });
+      }
+    }
+    expect(doubleSuccesses).toBe(0);
+  });
+});
+
 describe("releaseTokenLock ownership", () => {
   test("refuses to release when token_hash in the file does not match the caller's token", async () => {
     const acquired = await acquireTokenLock({

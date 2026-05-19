@@ -1,8 +1,10 @@
 /**
  * Claude Telegram Relay — Test Supabase Connection
  *
- * Verifies Supabase URL and anon key are valid, and checks if
- * required tables exist.
+ * Verifies Supabase URL and service_role key are valid, and checks if
+ * required tables exist. The env var name SUPABASE_ANON_KEY is preserved
+ * for backwards compatibility, but the configured RLS policies in
+ * db/schema.sql only grant access to service_role.
  *
  * Usage: bun run setup/test-supabase.ts
  */
@@ -63,12 +65,12 @@ async function main() {
   console.log(`  ${PASS} Supabase URL: ${url}`);
 
   // Check key
-  if (!key || key === "your_anon_key") {
-    console.log(`  ${FAIL} SUPABASE_ANON_KEY not set in .env`);
-    console.log(`      ${dim("Get it from Supabase > Project Settings > API")}`);
+  if (!key || key === "your_anon_key" || key === "your_service_role_key") {
+    console.log(`  ${FAIL} SUPABASE_ANON_KEY (service_role key) not set in .env`);
+    console.log(`      ${dim("Get the service_role key from Supabase > Project Settings > API")}`);
     process.exit(1);
   }
-  console.log(`  ${PASS} Anon key found`);
+  console.log(`  ${PASS} Service-role key found`);
 
   console.log(
     `  ${PASS} Memory authority: ${features.memoryAuthority}` +

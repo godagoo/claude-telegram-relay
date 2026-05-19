@@ -1,17 +1,23 @@
 # iMessage iPhone Handoff (ClaudeDraft Shortcut)
 
-When the bot drafts an iMessage and a recipient resolves, the relay drops the
-draft into an iCloud file on this Mac and replies with instructions to run the
-iOS `ClaudeDraft` Shortcut. Telegram does not reliably open `shortcuts://`
-custom-scheme text, so the dependable production action is: open Shortcuts on
-the iPhone and run `ClaudeDraft`. The Shortcut reads the file and opens a
-pre-filled Messages compose sheet for review. **The shortcut never sends —
-only William's manual tap on the compose Send button does.**
+When the bot drafts an iMessage and a recipient resolves, the relay writes
+the draft into an iCloud file on this Mac. The Telegram reply contains the
+draft body alone — no "Run ClaudeDraft…" footer. The internal decision-log
+state is `phone_handoff_ready`, but that label is not user-visible. On the
+iPhone, William runs the `ClaudeDraft` Shortcut on his own schedule; it
+reads `latest.json` and opens a pre-filled Messages compose sheet for
+review. **The Shortcut never sends — only William's manual tap on the
+compose Send button does.**
+
+The only time the Telegram reply mentions the Shortcut is when the relay
+detects the install file (`ClaudeDraft.shortcut` or
+`ClaudeDraft-install.shortcut`) hasn't been opened yet. That message tells
+him exactly which file to install and where to find it.
 
 ```
 Telegram draft request  ─►  relay resolves recipient
-                            └► writes latest.json to iCloud Drive
-                            └► Telegram reply tells William to run ClaudeDraft
+                            └► writes latest.json to iCloud Drive (v2 schema)
+                            └► Telegram reply is just the draft body
 iPhone                  ─►  William runs ClaudeDraft from Shortcuts
                             └► ClaudeDraft reads latest.json
                             └► Messages compose sheet appears, body pre-filled

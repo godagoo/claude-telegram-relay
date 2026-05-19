@@ -504,7 +504,16 @@ async function main() {
             if (first === wrapperExecPath && wrapperInstalled) {
               fdaTarget = `com.claude.telegram-relay-wrapper (wrapper at ${wrapperAppRoot})`;
             } else if (first) {
-              fdaTarget = first;
+              // Resolve the launchd target's realpath so the user grants
+              // FDA to the concrete versioned binary (TCC attaches to the
+              // resolved inode), not a symlink that breaks on Bun upgrades.
+              const resolved = await runCommand(["readlink", "-f", first], { timeoutMs: 5_000 });
+              const resolvedPath = resolved.code === 0 ? resolved.stdout.trim() : "";
+              if (resolvedPath && resolvedPath !== first) {
+                fdaTarget = `${resolvedPath} (launchd ProgramArguments[0]=${first})`;
+              } else {
+                fdaTarget = first;
+              }
             }
           } catch {
             // fall back to realpath
