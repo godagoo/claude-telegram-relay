@@ -430,10 +430,23 @@ async function main() {
       }
 
       const tokenLock = token ? tokenLockPath(token) : undefined;
+      const relayLive = relayProcesses.length >= 1;
       if (!tokenLock) {
         warn("Cannot check token lock without TELEGRAM_BOT_TOKEN");
       } else if (!existsSync(tokenLock)) {
-        warn(`Token lock not found at ${tokenLock}; relay may not be running`);
+        // PLAN6: when a relay is actually running and a token is
+        // configured, missing token lock is a FAIL — the relay should
+        // have created one at startup. Only warn when no relay is alive
+        // (the lock is expected to be absent during pre-cutover state).
+        if (relayLive) {
+          fail(
+            `Token lock missing at ${tokenLock} but a relay process is running. ` +
+            "Pre-PLAN-A code path that never created the new lock is still live; " +
+            "complete the cutover.",
+          );
+        } else {
+          warn(`Token lock not found at ${tokenLock}; relay may not be running`);
+        }
       } else {
         try {
           const payload = JSON.parse(readFileSync(tokenLock, "utf8")) as Record<string, unknown>;
@@ -457,10 +470,13 @@ async function main() {
         }
       }
 
-      // Legacy bot.lock should no longer exist after the token-lock cutover.
+      // Legacy bot.lock must not exist after the token-lock cutover.
+      // PLAN6: this is a hard FAIL — the file is a stale artifact from
+      // the pre-PLAN-A relay code. The operator runbook removes it
+      // before bootstrap; if it survives, the cutover wasn't completed.
       const legacyLockPath = join(RELAY_DIR, "bot.lock");
       if (existsSync(legacyLockPath)) {
-        warn(`Legacy ${legacyLockPath} still present; remove after the next launchd bootstrap`);
+        fail(`Legacy ${legacyLockPath} still present. Remove it: rm ${legacyLockPath}`);
       }
     } else {
       warn("Could not inspect local relay processes");
@@ -539,12 +555,11 @@ async function main() {
 
     pass(`FDA responsible target: ${fdaTargetDescription}`);
     if (fdaTargetWarning) warn(fdaTargetWarning);
-    if (!wrapperInstalled) {
-      warn(
-        `ClaudeRelay wrapper not installed at ${wrapperAppRoot}. ` +
-        "Run: bun run setup:wrapper to make FDA stable across Bun upgrades.",
-      );
-    }
+    // PLAN6: the shell-script wrapper is experimental — it has not been
+    // verified to bind TCC to its bundle id on this macOS version. Do not
+    // push operators toward it. The documented path is direct Bun realpath
+    // FDA, which is the same realpath we report above. The wrapper is
+    // tracked for a future native-Mach-O or SMAppService rollout.
     pass(`Launchd label: com.claude.telegram-relay`);
     pass(`Active relay PID count: ${relayProcessCount}`);
 

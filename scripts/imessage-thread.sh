@@ -17,8 +17,9 @@
 # Requires:
 #   Full Disk Access on the process that ends up running sqlite3. The relay
 #   invokes this directly from bun before Claude runs, so FDA must be granted
-#   to the resolved bun Cellar binary (`readlink -f "$(which bun)"`), not to
-#   Terminal and not to the Claude CLI.
+#   to the resolved bun Cellar binary. Find that path by running
+#   `bun run setup:verify` and reading the "FDA responsible target" line.
+#   Do NOT grant FDA to Terminal or to the Claude CLI for this relay.
 #   See docs/IMESSAGE-SETUP.md for the one-time setup.
 #
 # Output goes to the relay's local short-term context, never to a remote

@@ -223,11 +223,19 @@ copy; it is a trap because it can look correct until it diverges.
 Shortcut — the relay just embeds it in the `shortcuts://` URL.
 
 `RELAY_DRAFT_TTL_MS` controls the `expires_at` field on `latest.json`.
-Default 600000 (10 minutes). `setup:verify` and the iPhone Shortcut both
-reject drafts whose `expires_at` is in the past, so this is the upper
-bound on how long a written draft is considered live. Set higher on a
-slow-syncing iCloud connection; lower if you want stricter freshness.
-Non-numeric or non-positive values silently fall back to the default.
+Default 600000 (10 minutes). The relay writes `expires_at` whenever it
+writes a new draft, and `setup:verify` rejects payloads whose
+`expires_at` is in the past — that's the upper bound on how long a
+written draft is treated as live by the Mac-side machinery. The iPhone
+`ClaudeDraft` Shortcut itself does NOT inspect `expires_at`; it
+consumes whatever is in `latest.json` at the moment it's invoked,
+because it has no clock-aware action shape we trust to enforce a TTL.
+The relay clears `latest.json` on every new draft so a stale file is
+not typically reachable, and the user is encouraged to delete the
+file manually if they decline a draft and the next one is delayed.
+Set higher on a slow-syncing iCloud connection; lower if you want
+stricter Mac-side freshness gating. Non-numeric or non-positive
+values silently fall back to the default.
 
 ## Verifying the handoff fired (from logs, not the Mac UI)
 

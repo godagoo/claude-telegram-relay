@@ -39,10 +39,10 @@ The target binary is **`bun`** at its resolved Cellar path — not the Claude CL
 1. Find the resolved bun path:
 
    ```bash
-   readlink -f "$(which bun)"
+   bun run setup:verify
    ```
 
-   On Apple Silicon + Homebrew this is typically `/opt/homebrew/Cellar/bun/<version>/bin/bun`. On Intel + Homebrew it's `/usr/local/Cellar/bun/<version>/bin/bun`. Always use the resolved Cellar path, never the `/opt/homebrew/bin/bun` or `/usr/local/bin/bun` symlink — symlinks re-point on every `brew upgrade bun` and TCC then silently denies again.
+   Look for the line `FDA responsible target: <path>`. On Apple Silicon + Homebrew this is typically `/opt/homebrew/Cellar/bun/<version>/bin/bun`; on Intel + Homebrew it's `/usr/local/Cellar/bun/<version>/bin/bun`. Always use the resolved Cellar path, never the `/opt/homebrew/bin/bun` or `/usr/local/bin/bun` symlink — symlinks re-point on every `brew upgrade bun` and TCC then silently denies again. `setup:verify` resolves the symlink for you via `fs.promises.realpath`, which works on stock macOS unlike GNU `readlink -f`.
 
    > **macOS 28 compatibility check:** Rosetta (Intel app translation) ends in macOS 28.
    > If your `bun` binary is Intel-only, both the FDA grant and the relay itself will
@@ -87,7 +87,7 @@ If you upgrade bun (`brew upgrade bun`), a new versioned folder appears under Ce
 
 - Granting FDA to Terminal.app, iTerm, Warp, Ghostty, or any GUI shell. The relay does not run inside any of them.
 - Granting FDA to the Claude CLI binary at `~/.local/share/claude/versions/<vN>`. The iMessage context prefetch no longer routes through Claude — `src/imessage-context.ts:fetchIMessageContext` spawns the helper from bun directly. Older versions of this doc (and older relay code) DID route through Claude and instructed granting FDA there; that path is gone.
-- Granting FDA only to the symlink at `/opt/homebrew/bin/bun` or `/usr/local/bin/bun`. macOS TCC may or may not follow the symlink correctly, and any `brew upgrade bun` re-points it to a new Cellar binary that has no grant. Use the resolved Cellar path from `readlink -f`.
+- Granting FDA only to the symlink at `/opt/homebrew/bin/bun` or `/usr/local/bin/bun`. macOS TCC may or may not follow the symlink correctly, and any `brew upgrade bun` re-points it to a new Cellar binary that has no grant. Use the resolved Cellar path printed by `bun run setup:verify` (the `FDA responsible target` line).
 
 ### Privacy note
 

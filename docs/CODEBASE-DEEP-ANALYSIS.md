@@ -1153,7 +1153,7 @@ These are called as subprocesses by the relay. They live in the `scripts/` direc
 **Output:** JSON: `{ resolved: boolean, messages: [{sender, body, date}] }`
 **Timeout enforced by caller:** 8 seconds
 
-Why FDA is granted to bun specifically: The process tree is `launchd -> bun -> bash -> imessage-thread.sh -> sqlite3`. TCC (Transparency, Consent, and Control) checks the launching application, which is bun. FDA must be granted to the real bun binary at its Cellar path, found via `readlink -f "$(which bun)"`, NOT to the symlink at `/usr/local/bin/bun`.
+Why FDA is granted to bun specifically: The process tree is `launchd -> bun -> bash -> imessage-thread.sh -> sqlite3`. TCC (Transparency, Consent, and Control) checks the launching application, which is bun. FDA must be granted to the real bun binary at its Cellar path. Read the resolved path from `bun run setup:verify` (the `FDA responsible target` line), NOT the symlink at `/usr/local/bin/bun` or `/opt/homebrew/bin/bun`.
 
 ### scripts/draft-imessage.sh
 
@@ -1275,7 +1275,7 @@ The iCloud Drive handoff was placing the `shortcuts://run-shortcut?name=ClaudeDr
 
 ### Known Limitation: FDA for iMessage Context
 
-Reading iMessage thread history requires Full Disk Access for the bun binary. This must be granted manually in System Settings > Privacy & Security > Full Disk Access. The exact binary path must be found via `readlink -f "$(which bun)"` -- granting it to symlinks does not work.
+Reading iMessage thread history requires Full Disk Access for the bun binary. This must be granted manually in System Settings > Privacy & Security > Full Disk Access. Find the exact binary path by running `bun run setup:verify` and reading the `FDA responsible target` line — granting FDA to the bun symlink does not work because `brew upgrade bun` re-points the symlink to a fresh Cellar inode that has no grant.
 
 ### Known Limitation: Rosetta Compatibility
 

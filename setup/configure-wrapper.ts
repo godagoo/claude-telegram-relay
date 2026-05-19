@@ -5,6 +5,14 @@
  *
  *   bun run setup:wrapper
  *
+ * EXPERIMENTAL (PLAN6): the current wrapper is a bash launcher inside an
+ * .app bundle, ad-hoc codesigned. It has not been verified to bind TCC
+ * grants to its CFBundleIdentifier on every macOS version in the wild.
+ * The documented operator path is direct Bun realpath FDA — `bun run
+ * setup:verify` prints the path under `FDA responsible target`. The
+ * wrapper is kept opt-in for experimentation and as scaffolding for a
+ * future native Mach-O launcher or SMAppService helper.
+ *
  * After running this, grant Full Disk Access to ~/Applications/ClaudeRelay.app
  * in System Settings, then rerun `bun run setup:launchd` so the LaunchAgent
  * points at the wrapper executable.
@@ -28,6 +36,7 @@ const WRAPPER_APP_ROOT = process.env.RELAY_WRAPPER_APP_ROOT ||
 
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
+const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 
@@ -80,6 +89,10 @@ async function main(): Promise<void> {
   console.log(bold("  Configure ClaudeRelay wrapper bundle"));
   console.log(dim(`  Bundle: ${WRAPPER_APP_ROOT}`));
   console.log(dim(`  Bundle ID: ${WRAPPER_BUNDLE_ID}`));
+  console.log("");
+  console.log(`  ${yellow("Experimental")} (PLAN6): wrapper-first FDA is not yet proven on every`);
+  console.log(`  macOS version. The documented path is direct Bun realpath FDA.`);
+  console.log(`  Run ${bold("bun run setup:verify")} and grant FDA to the FDA responsible target.`);
   console.log("");
 
   const bunRealpath = resolveBunPath();
