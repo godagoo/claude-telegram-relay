@@ -594,6 +594,230 @@ describe("stale-takeover race", () => {
   });
 });
 
+describe("stale-takeover edge cases", () => {
+  test("unparseable existing + third process creating a new lock returns a non-null synthetic holder", async () => {
+    // Seed garbage at path so the initial read returns null.
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+    writeFileSync(path, "not parseable");
+
+    const thirdPayload: TokenLockPayload = {
+      schema_version: 1,
+      token_hash: tokenHash(FAKE_TOKEN),
+      host: "third-host",
+      pid: 33333,
+      started_at: "2026-05-19T10:00:00.000Z",
+      heartbeat_at: "2026-05-19T10:00:00.000Z",
+    };
+
+    const result = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 11111,
+      now: new Date("2026-05-19T10:00:00Z"),
+      baseDir: tempDir,
+      isLiveRelay: () => false,
+      _testHooks: {
+        // After our claim succeeded (path is empty), a third process slips
+        // in and creates a fresh lock at path before we get to tryAtomicCreate.
+        afterClaim: async () => {
+          mkdirSync(join(tempDir, "locks"), { recursive: true });
+          writeFileSync(path, JSON.stringify(thirdPayload));
+        },
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("held_by_live_relay");
+    if (result.reason !== "held_by_live_relay") return;
+    // Critical: holder must be non-null. With the previous `existing!`,
+    // this was a lying type-cast over a `null`.
+    expect(result.holder).not.toBeNull();
+    expect(result.holder.pid).toBe(33333);
+  });
+
+  test("unparseable existing + third process writing more garbage returns a synthetic holder", async () => {
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+    writeFileSync(path, "garbage v1");
+
+    const result = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 11111,
+      now: new Date("2026-05-19T10:00:00Z"),
+      baseDir: tempDir,
+      isLiveRelay: () => false,
+      _testHooks: {
+        afterClaim: async () => {
+          // Third process writes more garbage. readPayloadOrNull will
+          // return null for both `existing` and the post-claim read.
+          mkdirSync(join(tempDir, "locks"), { recursive: true });
+          writeFileSync(path, "garbage v2");
+        },
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("held_by_live_relay");
+    if (result.reason !== "held_by_live_relay") return;
+    expect(result.holder).not.toBeNull();
+    // Synthetic holder uses pid = -1 to mark "unknown real holder".
+    expect(result.holder.pid).toBe(-1);
+    expect(result.holder.token_hash).toBe(tokenHash(FAKE_TOKEN));
+  });
+
+  test("restore-on-mismatch puts the third process's payload back into the lockfile", async () => {
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+    const stalePayload: TokenLockPayload = {
+      schema_version: 1,
+      token_hash: tokenHash(FAKE_TOKEN),
+      host: FAKE_HOST,
+      pid: 99999,
+      started_at: "2026-05-19T09:00:00.000Z",
+      heartbeat_at: "2026-05-19T09:00:00.000Z",
+    };
+    writeFileSync(path, JSON.stringify(stalePayload));
+
+    const replacementPayload: TokenLockPayload = {
+      schema_version: 1,
+      token_hash: tokenHash(FAKE_TOKEN),
+      host: "replacement-host",
+      pid: 44444,
+      started_at: "2026-05-19T09:59:00.000Z",
+      heartbeat_at: "2026-05-19T09:59:30.000Z",
+    };
+
+    const result = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 11111,
+      now: new Date("2026-05-19T10:00:00Z"),
+      baseDir: tempDir,
+      isLiveRelay: () => false,
+      _testHooks: {
+        // Between our read of `existing` and our atomic claim rename,
+        // a third process replaces the lockfile with a fresh payload.
+        beforeClaim: async () => {
+          writeFileSync(path, JSON.stringify(replacementPayload));
+        },
+      },
+    });
+
+    // Mismatch detected. Our acquire must return held_by_live_relay and
+    // must restore the replacement payload at path.
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("held_by_live_relay");
+    if (result.reason !== "held_by_live_relay") return;
+
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as TokenLockPayload;
+    expect(onDisk.pid).toBe(replacementPayload.pid);
+    expect(onDisk.host).toBe(replacementPayload.host);
+  });
+
+  test("third-process create between claim rename and recreate leaves the third's lock untouched", async () => {
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+    const stalePayload: TokenLockPayload = {
+      schema_version: 1,
+      token_hash: tokenHash(FAKE_TOKEN),
+      host: FAKE_HOST,
+      pid: 99999,
+      started_at: "2026-05-19T09:00:00.000Z",
+      heartbeat_at: "2026-05-19T09:00:00.000Z",
+    };
+    writeFileSync(path, JSON.stringify(stalePayload));
+
+    const thirdPayload: TokenLockPayload = {
+      schema_version: 1,
+      token_hash: tokenHash(FAKE_TOKEN),
+      host: "third-host",
+      pid: 55555,
+      started_at: "2026-05-19T09:59:55.000Z",
+      heartbeat_at: "2026-05-19T09:59:55.000Z",
+    };
+
+    const result = await acquireTokenLock({
+      token: FAKE_TOKEN,
+      host: FAKE_HOST,
+      pid: 11111,
+      now: new Date("2026-05-19T10:00:00Z"),
+      baseDir: tempDir,
+      isLiveRelay: () => false,
+      _testHooks: {
+        afterClaim: async () => {
+          // After our atomic claim rename succeeded (path is empty)
+          // but before we tryAtomicCreate, a third process creates a
+          // fresh lock at path.
+          mkdirSync(join(tempDir, "locks"), { recursive: true });
+          writeFileSync(path, JSON.stringify(thirdPayload));
+        },
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("held_by_live_relay");
+    if (result.reason !== "held_by_live_relay") return;
+    expect(result.holder.pid).toBe(thirdPayload.pid);
+
+    // The third's lock must remain intact — we never overwrote it.
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as TokenLockPayload;
+    expect(onDisk.pid).toBe(thirdPayload.pid);
+    expect(onDisk.host).toBe(thirdPayload.host);
+  });
+});
+
+describe("heartbeat clobber regression", () => {
+  test("a delayed heartbeat from the old holder must not overwrite the new holder after takeover", async () => {
+    const path = tokenLockPath(FAKE_TOKEN, tempDir);
+    mkdirSync(join(tempDir, "locks"), { recursive: true });
+
+    // State at t0: A holds the lock.
+    const aPayload: TokenLockPayload = {
+      schema_version: 1,
+      token_hash: tokenHash(FAKE_TOKEN),
+      host: FAKE_HOST,
+      pid: 11111,
+      started_at: "2026-05-19T09:00:00.000Z",
+      heartbeat_at: "2026-05-19T09:00:00.000Z",
+    };
+    writeFileSync(path, JSON.stringify(aPayload));
+
+    // A's heartbeat fires. After it reads existing=A but before its
+    // atomic claim, B takes over and replaces path with B's payload.
+    const bPayload: TokenLockPayload = {
+      schema_version: 1,
+      token_hash: tokenHash(FAKE_TOKEN),
+      host: FAKE_HOST,
+      pid: 22222,
+      started_at: "2026-05-19T09:59:50.000Z",
+      heartbeat_at: "2026-05-19T09:59:50.000Z",
+    };
+
+    await heartbeatTokenLock({
+      token: FAKE_TOKEN,
+      pid: 11111,
+      now: new Date("2026-05-19T10:00:00Z"),
+      baseDir: tempDir,
+      host: FAKE_HOST,
+      _testHookAfterRead: async () => {
+        writeFileSync(path, JSON.stringify(bPayload));
+      },
+    });
+
+    // The file at path must still be B's lock, untouched.
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as TokenLockPayload;
+    expect(onDisk.pid).toBe(bPayload.pid);
+    expect(onDisk.host).toBe(bPayload.host);
+    expect(onDisk.heartbeat_at).toBe(bPayload.heartbeat_at);
+  });
+});
+
 describe("releaseTokenLock ownership", () => {
   test("refuses to release when token_hash in the file does not match the caller's token", async () => {
     const acquired = await acquireTokenLock({

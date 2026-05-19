@@ -82,6 +82,30 @@ function makePayload(input: {
   };
 }
 
+/**
+ * Build a placeholder holder payload for held_by_live_relay results when the
+ * real holder is unknown — either because the lockfile was unparseable on
+ * read, or because a third process replaced an unparseable file between
+ * our claim attempts. The pid is -1 so callers can detect "synthetic".
+ *
+ * The acquire result API requires a non-null `holder` on every
+ * `held_by_live_relay` branch; never replace this with a `null` cast.
+ */
+function makeSyntheticHolder(input: {
+  token: string;
+  host: string;
+  now: Date;
+}): TokenLockPayload {
+  return {
+    schema_version: TOKEN_LOCK_SCHEMA_VERSION,
+    token_hash: tokenHash(input.token),
+    host: input.host,
+    pid: -1,
+    started_at: input.now.toISOString(),
+    heartbeat_at: input.now.toISOString(),
+  };
+}
+
 async function writePayloadAtomic(path: string, payload: TokenLockPayload): Promise<void> {
   const dir = join(path, "..");
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -144,6 +168,15 @@ export async function acquireTokenLock(input: {
   baseDir?: string;
   isLiveRelay: (pid: number) => boolean | Promise<boolean>;
   maxHeartbeatAgeMs?: number;
+  /**
+   * Test-only hooks. Production code MUST NOT pass these. They let
+   * concurrency tests force a third process to interleave at known
+   * points without injecting threads.
+   */
+  _testHooks?: {
+    beforeClaim?: () => Promise<void> | void;
+    afterClaim?: () => Promise<void> | void;
+  };
 }): Promise<AcquireTokenLockResult> {
   const path = tokenLockPath(input.token, input.baseDir);
   const maxAgeMs = input.maxHeartbeatAgeMs ?? TOKEN_LOCK_DEFAULT_STALE_AGE_MS;
@@ -199,22 +232,20 @@ export async function acquireTokenLock(input: {
   //      third process slipped in and created a new lock there, we bail
   //      out as held_by_live_relay (without touching the new lock).
   const claimPath = `${path}.claim-${input.pid}-${randomUUID()}`;
+
+  if (input._testHooks?.beforeClaim) await input._testHooks.beforeClaim();
+
   try {
     await rename(path, claimPath);
   } catch (err) {
     if ((err as { code?: string }).code === "ENOENT") {
-      const holder = existing ?? {
-        schema_version: TOKEN_LOCK_SCHEMA_VERSION,
-        token_hash: tokenHash(input.token),
-        host: input.host,
-        pid: -1,
-        started_at: input.now.toISOString(),
-        heartbeat_at: input.now.toISOString(),
-      } satisfies TokenLockPayload;
+      const holder = existing ?? makeSyntheticHolder(input);
       return { ok: false, reason: "held_by_live_relay", holder, path };
     }
     return { ok: false, reason: "io_error", error: err instanceof Error ? err.message : String(err) };
   }
+
+  if (input._testHooks?.afterClaim) await input._testHooks.afterClaim();
 
   const claimed = await readPayloadOrNull(claimPath);
   // If the lock was unparseable on initial read (existing === null), we
@@ -242,9 +273,13 @@ export async function acquireTokenLock(input: {
   try {
     if (!tryAtomicCreate(path, payload)) {
       // A third process created a new lock at path between our rename and
-      // our create. Their lock is valid; do not disturb it.
+      // our create. Their lock is valid; do not disturb it. When their
+      // payload is unparseable (or our original `existing` was null because
+      // the file was garbage), fall back to a synthetic holder rather than
+      // smuggling a null through the API.
       await unlink(claimPath).catch(() => undefined);
-      const holder = (await readPayloadOrNull(path)) ?? existing!;
+      const holder =
+        (await readPayloadOrNull(path)) ?? existing ?? makeSyntheticHolder(input);
       return { ok: false, reason: "held_by_live_relay", holder, path };
     }
     await chmod(path, 0o600).catch(() => undefined);
@@ -279,12 +314,63 @@ export async function heartbeatTokenLock(input: {
   pid: number;
   now: Date;
   baseDir?: string;
+  host?: string;
+  /**
+   * Test-only hook. Fires after the read but before the atomic claim;
+   * lets a regression test interpose a stale-takeover write to verify
+   * the heartbeat does not clobber the new holder.
+   */
+  _testHookAfterRead?: () => Promise<void> | void;
 }): Promise<void> {
   const path = tokenLockPath(input.token, input.baseDir);
   const existing = await readPayloadOrNull(path);
   if (!existing || existing.pid !== input.pid) return;
-  const next: TokenLockPayload = { ...existing, heartbeat_at: input.now.toISOString() };
-  await writePayloadAtomic(path, next);
+  if (existing.token_hash !== tokenHash(input.token)) return;
+  if (input.host !== undefined && existing.host !== input.host) return;
+
+  if (input._testHookAfterRead) await input._testHookAfterRead();
+
+  // Atomic claim. The previous implementation did
+  // readPayloadOrNull → writePayloadAtomic (write tmp, rename tmp → path),
+  // which blindly clobbered whatever was at path at rename time. If a
+  // takeover wrote a new lock between our read and our rename, the
+  // heartbeat's rename overwrote the new holder with our stale payload.
+  // PLAN5: replace with rename-to-claim, content-verify, exclusive-create.
+  const claimPath = `${path}.heartbeat-${input.pid}-${randomUUID()}`;
+  try {
+    await rename(path, claimPath);
+  } catch (err) {
+    // ENOENT: lock no longer exists; abandon the heartbeat.
+    if ((err as { code?: string }).code === "ENOENT") return;
+    return;
+  }
+
+  const claimed = await readPayloadOrNull(claimPath);
+  const stillOurs =
+    !!claimed &&
+    claimed.pid === input.pid &&
+    claimed.token_hash === tokenHash(input.token) &&
+    claimed.started_at === existing.started_at;
+  if (!stillOurs) {
+    // The file at path changed between our read and our claim. Restore
+    // whatever we grabbed (it's not ours) and abandon.
+    if (claimed) {
+      await rename(claimPath, path).catch(() => undefined);
+    } else {
+      await unlink(claimPath).catch(() => undefined);
+    }
+    return;
+  }
+
+  const next: TokenLockPayload = { ...claimed, heartbeat_at: input.now.toISOString() };
+  if (!tryAtomicCreate(path, next)) {
+    // A third process created a new lock at path. Their lock is valid;
+    // do not disturb it.
+    await unlink(claimPath).catch(() => undefined);
+    return;
+  }
+  await chmod(path, 0o600).catch(() => undefined);
+  await unlink(claimPath).catch(() => undefined);
 }
 
 /**
