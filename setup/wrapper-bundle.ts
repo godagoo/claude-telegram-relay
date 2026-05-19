@@ -14,6 +14,35 @@ export const WRAPPER_BUNDLE_ID = "com.claude.telegram-relay-wrapper";
 export const WRAPPER_BUNDLE_NAME = "ClaudeRelay";
 export const WRAPPER_EXECUTABLE_NAME = "ClaudeRelay";
 
+import { existsSync } from "fs";
+import { join } from "path";
+
+export interface WrapperPaths {
+  root: string;
+  executable: string;
+  infoPlist: string;
+}
+
+export function wrapperPaths(root: string): WrapperPaths {
+  return {
+    root,
+    executable: join(root, "Contents", "MacOS", WRAPPER_EXECUTABLE_NAME),
+    infoPlist: join(root, "Contents", "Info.plist"),
+  };
+}
+
+/**
+ * Shared wrapper-installed predicate. Both setup:launchd and setup:verify
+ * must agree on what "installed" means; otherwise launchd ends up pointing
+ * at the wrapper while verify reports the realpath fallback (or vice
+ * versa). A bundle is "installed" only when BOTH the launcher executable
+ * and the Info.plist are present.
+ */
+export function isWrapperInstalled(root: string): boolean {
+  const paths = wrapperPaths(root);
+  return existsSync(paths.executable) && existsSync(paths.infoPlist);
+}
+
 export interface WrapperInfoPlistOptions {
   version: string;
 }

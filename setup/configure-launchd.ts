@@ -12,7 +12,12 @@ import { chmodSync, existsSync, mkdirSync, realpathSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 import { generateRelayPlist, type RelayPlistOptions } from "./launchd-plist.ts";
-import { WRAPPER_BUNDLE_ID, WRAPPER_BUNDLE_NAME, WRAPPER_EXECUTABLE_NAME } from "./wrapper-bundle.ts";
+import {
+  WRAPPER_BUNDLE_ID,
+  WRAPPER_BUNDLE_NAME,
+  isWrapperInstalled,
+  wrapperPaths,
+} from "./wrapper-bundle.ts";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 const HOME = homedir();
@@ -74,14 +79,16 @@ function generatePlist(opts: {
   };
   if (process.env.RELAY_PYTHON) env.RELAY_PYTHON = process.env.RELAY_PYTHON;
 
-  // Auto-detect the ClaudeRelay wrapper bundle. When present, the LaunchAgent
-  // points at the wrapper executable and TCC/FDA grants attach to the
-  // wrapper's stable CFBundleIdentifier rather than the versioned Bun
-  // realpath. Falls back to direct Bun when the bundle isn't installed.
+  // Auto-detect the ClaudeRelay wrapper bundle. When present (BOTH the
+  // launcher executable AND the Info.plist exist — see isWrapperInstalled),
+  // the LaunchAgent points at the wrapper executable and TCC/FDA grants
+  // attach to the wrapper's stable CFBundleIdentifier rather than the
+  // versioned Bun realpath. Falls back to direct Bun when the bundle isn't
+  // fully installed. setup:verify uses the same predicate.
   const wrapperRoot = process.env.RELAY_WRAPPER_APP_ROOT ||
     join(HOME, "Applications", `${WRAPPER_BUNDLE_NAME}.app`);
-  const wrapperExecPath = join(wrapperRoot, "Contents", "MacOS", WRAPPER_EXECUTABLE_NAME);
-  const useWrapper = opts.keepAlive && existsSync(wrapperExecPath);
+  const useWrapper = opts.keepAlive && isWrapperInstalled(wrapperRoot);
+  const wrapperExecPath = wrapperPaths(wrapperRoot).executable;
   if (useWrapper) {
     env.RELAY_FDA_BUNDLE_ID = WRAPPER_BUNDLE_ID;
   }

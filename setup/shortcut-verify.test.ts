@@ -373,6 +373,45 @@ test("rejects body lookup that explicitly reads from a non-dictionary action", (
   );
 });
 
+test("rejects when the dictionary parser action is missing its UUID", () => {
+  const base = actions({});
+  const dictionary = base[1].WFWorkflowActionParameters as Record<string, unknown>;
+  delete dictionary.UUID;
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain(
+    "dictionary parser action is missing a UUID",
+  );
+});
+
+test("rejects recipient WFInput that targets the Get File action", () => {
+  const base = actions({});
+  const recipientLookup = base[2].WFWorkflowActionParameters as Record<string, unknown>;
+  recipientLookup.WFInput = {
+    Value: { OutputUUID: "get-file", Type: "ActionOutput" },
+    WFSerializationType: "WFTextTokenAttachment",
+  };
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain(
+    "recipient dictionary lookup WFInput points at get-file",
+  );
+});
+
+test("rejects recipient WFInput that has no OutputUUID at all (malformed)", () => {
+  const base = actions({});
+  const recipientLookup = base[2].WFWorkflowActionParameters as Record<string, unknown>;
+  recipientLookup.WFInput = {
+    Value: { Type: "ActionOutput" }, // no OutputUUID
+    WFSerializationType: "WFTextTokenAttachment",
+  };
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain(
+    "recipient dictionary lookup WFInput is malformed",
+  );
+});
+
 test("rejects Send Message content whose attachmentsByRange points at a non-body action", () => {
   const base = actions({});
   const send = base[base.length - 1].WFWorkflowActionParameters as Record<string, unknown>;

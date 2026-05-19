@@ -8,9 +8,15 @@
  */
 
 import { existsSync, readFileSync, statSync } from "fs";
+import { realpath } from "fs/promises";
 import { join, dirname, basename } from "path";
 import { homedir } from "os";
 import * as os from "os";
+import {
+  WRAPPER_BUNDLE_ID,
+  isWrapperInstalled,
+  wrapperPaths,
+} from "./wrapper-bundle.ts";
 import {
   DEFAULT_SHORTCUT_NAME,
   defaultICloudDriveDraftDir,
@@ -287,6 +293,57 @@ async function main() {
 
   // 4. Services (macOS only)
   if (process.platform === "darwin") {
+    // Compute the FDA target string once. Both the chat.db failure
+    // message and the FDA target report below use this same string so
+    // operators never see two different "grant FDA to: ..." instructions
+    // in one verify run. PLAN5: replace shell `readlink -f` with
+    // fs.promises.realpath and unify the target across all callers.
+    const wrapperAppRoot = process.env.RELAY_WRAPPER_APP_ROOT ||
+      join(homedir(), "Applications", "ClaudeRelay.app");
+    const wrapperExecPath = wrapperPaths(wrapperAppRoot).executable;
+    const wrapperInstalled = isWrapperInstalled(wrapperAppRoot);
+    const plistPath = join(homedir(), "Library", "LaunchAgents", "com.claude.telegram-relay.plist");
+    let fdaTargetDescription = "";
+    let fdaTargetWarning = "";
+    {
+      let launchdFirstArg = "";
+      if (existsSync(plistPath)) {
+        const plutilFda = await runCommand(
+          ["plutil", "-convert", "json", "-o", "-", plistPath],
+          { timeoutMs: 5_000 },
+        );
+        if (plutilFda.code === 0) {
+          try {
+            const parsed = JSON.parse(plutilFda.stdout) as { ProgramArguments?: unknown };
+            const args = Array.isArray(parsed?.ProgramArguments)
+              ? (parsed.ProgramArguments as unknown[])
+              : [];
+            launchdFirstArg = typeof args[0] === "string" ? (args[0] as string) : "";
+          } catch {
+            // ignore; fall through to realpath
+          }
+        }
+      }
+
+      if (launchdFirstArg === wrapperExecPath && wrapperInstalled) {
+        fdaTargetDescription = `${WRAPPER_BUNDLE_ID} (wrapper at ${wrapperAppRoot})`;
+      } else {
+        const symlinkPath = launchdFirstArg || process.execPath;
+        try {
+          const resolved = await realpath(symlinkPath);
+          fdaTargetDescription = resolved !== symlinkPath
+            ? `${resolved} (launchd ProgramArguments[0]=${symlinkPath})`
+            : resolved;
+        } catch (err) {
+          fdaTargetDescription = symlinkPath;
+          fdaTargetWarning =
+            `Could not resolve realpath of ${symlinkPath}: ` +
+            `${err instanceof Error ? err.message : String(err)}. ` +
+            "FDA grants attached to this path may break after Bun upgrades.";
+        }
+      }
+    }
+
     console.log(`\n${bold("  Services (launchd)")}`);
     for (const label of ["com.claude.telegram-relay", "com.claude.smart-checkin", "com.claude.morning-briefing"]) {
       const result = await runCommand(["launchctl", "list", label], { timeoutMs: 5_000 });
@@ -306,8 +363,7 @@ async function main() {
       warn(`Could not inspect relay launchd log paths: ${launchdPrint.stderr.trim() || launchdPrint.stdout.trim() || `exit ${launchdPrint.code}`}`);
     }
 
-    // launchd plist policy check
-    const plistPath = join(homedir(), "Library", "LaunchAgents", "com.claude.telegram-relay.plist");
+    // launchd plist policy check (plistPath declared above with the FDA target).
     if (existsSync(plistPath)) {
       const plutil = await runCommand(
         ["plutil", "-convert", "json", "-o", "-", plistPath],
@@ -444,11 +500,9 @@ async function main() {
       if (probe.code === 0) {
         pass("iMessage chat.db read probe succeeded (Full Disk Access granted)");
       } else {
-        const bunRealpath = await runCommand(["readlink", "-f", process.execPath], { timeoutMs: 5_000 });
-        const target = bunRealpath.code === 0 ? bunRealpath.stdout.trim() : process.execPath;
         fail(
           `iMessage chat.db read failed: ${probe.stderr.trim() || probe.stdout.trim()}. ` +
-          `Grant Full Disk Access to: ${target}`,
+          `Grant Full Disk Access to: ${fdaTargetDescription}`,
         );
       }
     } else {
@@ -458,15 +512,19 @@ async function main() {
     // Bun realpath stability — verify is READ-ONLY. The recorded baseline
     // is written by setup:launchd at install time (see configure-launchd.ts).
     // PLAN3: "setup:verify writes... verification should be read-only."
-    const bunRealpathProbe = await runCommand(["readlink", "-f", process.execPath], { timeoutMs: 5_000 });
-    if (bunRealpathProbe.code === 0) {
-      const currentRealpath = bunRealpathProbe.stdout.trim();
+    let currentBunRealpath = "";
+    try {
+      currentBunRealpath = await realpath(process.execPath);
+    } catch (err) {
+      warn(`Could not resolve Bun realpath: ${err instanceof Error ? err.message : String(err)}; FDA target may drift unnoticed`);
+    }
+    if (currentBunRealpath) {
       const recordPath = join(RELAY_DIR, "state", "bun-realpath");
       const previousRealpath = existsSync(recordPath) ? readFileSync(recordPath, "utf8").trim() : null;
-      const drift = bunRealpathDriftCheck(currentRealpath, previousRealpath);
+      const drift = bunRealpathDriftCheck(currentBunRealpath, previousRealpath);
       if (!drift.ok && drift.drifted) {
         fail(
-          `Bun realpath drifted: was ${previousRealpath}, now ${currentRealpath}. ` +
+          `Bun realpath drifted: was ${previousRealpath}, now ${currentBunRealpath}. ` +
           "Re-grant Full Disk Access to the new realpath, then rerun: bun run setup:launchd",
         );
       } else if (previousRealpath === null) {
@@ -475,63 +533,20 @@ async function main() {
           "Run: bun run setup:launchd to record it.",
         );
       } else {
-        pass(`Bun realpath stable: ${currentRealpath}`);
+        pass(`Bun realpath stable: ${currentBunRealpath}`);
       }
-
-      // FDA responsible target comes from the installed LaunchAgent's
-      // ProgramArguments[0], not env. If it's the wrapper executable,
-      // report the bundle id. If it's bun, report the realpath. This
-      // reflects the actual TCC target launchd will use.
-      const wrapperAppRoot = process.env.RELAY_WRAPPER_APP_ROOT ||
-        join(homedir(), "Applications", "ClaudeRelay.app");
-      const wrapperExecPath = join(wrapperAppRoot, "Contents", "MacOS", "ClaudeRelay");
-      const wrapperInfoPath = join(wrapperAppRoot, "Contents", "Info.plist");
-      const wrapperInstalled = existsSync(wrapperExecPath) && existsSync(wrapperInfoPath);
-
-      let fdaTarget = currentRealpath;
-      if (existsSync(plistPath)) {
-        const plutilFda = await runCommand(
-          ["plutil", "-convert", "json", "-o", "-", plistPath],
-          { timeoutMs: 5_000 },
-        );
-        if (plutilFda.code === 0) {
-          try {
-            const parsed = JSON.parse(plutilFda.stdout) as { ProgramArguments?: unknown };
-            const args = Array.isArray(parsed?.ProgramArguments)
-              ? (parsed.ProgramArguments as unknown[])
-              : [];
-            const first = typeof args[0] === "string" ? args[0] as string : "";
-            if (first === wrapperExecPath && wrapperInstalled) {
-              fdaTarget = `com.claude.telegram-relay-wrapper (wrapper at ${wrapperAppRoot})`;
-            } else if (first) {
-              // Resolve the launchd target's realpath so the user grants
-              // FDA to the concrete versioned binary (TCC attaches to the
-              // resolved inode), not a symlink that breaks on Bun upgrades.
-              const resolved = await runCommand(["readlink", "-f", first], { timeoutMs: 5_000 });
-              const resolvedPath = resolved.code === 0 ? resolved.stdout.trim() : "";
-              if (resolvedPath && resolvedPath !== first) {
-                fdaTarget = `${resolvedPath} (launchd ProgramArguments[0]=${first})`;
-              } else {
-                fdaTarget = first;
-              }
-            }
-          } catch {
-            // fall back to realpath
-          }
-        }
-      }
-      pass(`FDA responsible target: ${fdaTarget}`);
-      if (!wrapperInstalled) {
-        warn(
-          `ClaudeRelay wrapper not installed at ${wrapperAppRoot}. ` +
-          "Run: bun run setup:wrapper to make FDA stable across Bun upgrades.",
-        );
-      }
-      pass(`Launchd label: com.claude.telegram-relay`);
-      pass(`Active relay PID count: ${relayProcessCount}`);
-    } else {
-      warn("Could not resolve Bun realpath; FDA target may drift unnoticed");
     }
+
+    pass(`FDA responsible target: ${fdaTargetDescription}`);
+    if (fdaTargetWarning) warn(fdaTargetWarning);
+    if (!wrapperInstalled) {
+      warn(
+        `ClaudeRelay wrapper not installed at ${wrapperAppRoot}. ` +
+        "Run: bun run setup:wrapper to make FDA stable across Bun upgrades.",
+      );
+    }
+    pass(`Launchd label: com.claude.telegram-relay`);
+    pass(`Active relay PID count: ${relayProcessCount}`);
 
     console.log(`\n${bold("  iMessage Handoff")}`);
     const shortcutName = env.RELAY_IMESSAGE_SHORTCUT_NAME || DEFAULT_SHORTCUT_NAME;

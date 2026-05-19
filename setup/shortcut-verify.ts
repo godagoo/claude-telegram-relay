@@ -308,7 +308,20 @@ export function validateClaudeDraftShortcutActions(
   // contract for the singleton iPhone draft path. Requiring explicit
   // WFInput is unambiguous and survives the Shortcut editor reformatting
   // the action list.
+  //
+  // PLAN5: missing dictionary parser UUID is a hard error (previously a
+  // silent skip — meaning a Shortcut with no dictionary UUID at all would
+  // pass validation because we couldn't compare lookup inputs against it).
+  // We only support UUID-based action references; OutputName fallback is
+  // intentionally NOT accepted because it's user-renamable and breaks the
+  // moment a user customizes their copy of the Shortcut.
   const dictionaryUuid = dictionaryParams ? asString(dictionaryParams.UUID) : undefined;
+  if (dictionaryParams && !dictionaryUuid) {
+    errors.push(
+      "ClaudeDraft dictionary parser action is missing a UUID; " +
+      "the recipient and body lookups need an explicit UUID to reference",
+    );
+  }
   const checkLookupInput = (
     lookupName: string,
     lookupParams: Record<string, unknown> | undefined,
