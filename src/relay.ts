@@ -377,11 +377,16 @@ async function saveMessage(
       process.exit(1);
     }
   } else {
+    // Capture the acquired payload's started_at so release can verify it
+    // against the file on disk and refuse to delete a lock that's no
+    // longer ours (PID reuse, takeover-during-shutdown race).
+    const acquiredStartedAt = lockResult.payload.started_at;
     releaseLockOnExit = async () => {
       await releaseTokenLock({
         token: BOT_TOKEN,
         pid: process.pid,
         host: RELAY_HOST,
+        startedAt: acquiredStartedAt,
       });
     };
     stopLockHeartbeat = startTokenLockHeartbeat({

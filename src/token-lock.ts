@@ -139,6 +139,27 @@ function tryAtomicCreate(path: string, payload: TokenLockPayload): boolean {
   }
 }
 
+/**
+ * No-overwrite restore: if a previous claim grabbed the lockfile, put it
+ * back at `path` only if `path` is empty. If a third process has since
+ * created a fresh lock at `path`, leave that new lock alone — restoring
+ * via blind `rename(claim, path)` would destroy it.
+ *
+ * Always consumes the claim file: either the restore succeeded, or we
+ * keep the third process's fresh lock and discard our claim.
+ * Returns true when the original was restored; false otherwise.
+ */
+async function tryRestoreClaim(
+  path: string,
+  claimPath: string,
+  claimed: TokenLockPayload | null,
+): Promise<boolean> {
+  let restored = false;
+  if (claimed) restored = tryAtomicCreate(path, claimed);
+  await unlink(claimPath).catch(() => undefined);
+  return restored;
+}
+
 async function readPayloadOrNull(path: string): Promise<TokenLockPayload | null> {
   try {
     const raw = await readFile(path, "utf8");
@@ -260,12 +281,11 @@ export async function acquireTokenLock(input: {
       claimed.token_hash === existing.token_hash &&
       claimed.heartbeat_at === existing.heartbeat_at;
     if (!observedMatches) {
-      if (claimed) {
-        await rename(claimPath, path).catch(() => undefined);
-      } else {
-        await unlink(claimPath).catch(() => undefined);
-      }
-      const holder = claimed ?? existing;
+      // PLAN6: never overwrite a third process's new lock during restore.
+      // tryRestoreClaim uses O_EXCL — if path is now occupied, the new
+      // holder stays and our claim is discarded.
+      await tryRestoreClaim(path, claimPath, claimed);
+      const holder = (await readPayloadOrNull(path)) ?? claimed ?? existing;
       return { ok: false, reason: "held_by_live_relay", holder, path };
     }
   }
@@ -296,17 +316,53 @@ export async function releaseTokenLock(input: {
   pid: number;
   baseDir?: string;
   host?: string;
+  /** ISO started_at from acquire's payload; defends against PID reuse. */
+  startedAt?: string;
+  /**
+   * Test-only hook. Fires after the atomic rename(path, claim) but before
+   * the ownership verification — lets a regression test interpose a fresh
+   * holder write at path to verify the release does not delete the new
+   * holder.
+   */
+  _testHookAfterClaim?: () => Promise<void> | void;
 }): Promise<void> {
+  // PLAN6: release must be atomic, not read-then-unlink. The previous flow
+  // had a TOCTOU window: A's release reads existing=A's payload, gets
+  // pre-empted, B takes over and writes a new lock at path, A's unlink
+  // then deletes B's lock. Switch to the same atomic-claim pattern used
+  // by acquire/heartbeat:
+  //   1. rename(path, releaseClaimPath) — POSIX-atomic; ENOENT bails.
+  //   2. Verify the claim's pid + token_hash + host + (optional) started_at
+  //      match the caller. If not, restore via no-overwrite tryAtomicCreate.
+  //   3. Unlink the claim — which IS our original lock, now off path.
   const path = tokenLockPath(input.token, input.baseDir);
-  const existing = await readPayloadOrNull(path);
-  if (!existing) return;
-  // Defensive ownership check: only unlink when the file's token_hash, pid,
-  // and (when provided) host match the caller. A surprised relay should
-  // never delete a sibling's lock just because the path collides.
-  if (existing.pid !== input.pid) return;
-  if (existing.token_hash !== tokenHash(input.token)) return;
-  if (input.host !== undefined && existing.host !== input.host) return;
-  await unlink(path).catch(() => undefined);
+  const claimPath = `${path}.release-${input.pid}-${randomUUID()}`;
+  try {
+    await rename(path, claimPath);
+  } catch (err) {
+    if ((err as { code?: string }).code === "ENOENT") return;
+    return;
+  }
+
+  if (input._testHookAfterClaim) await input._testHookAfterClaim();
+
+  const claimed = await readPayloadOrNull(claimPath);
+  const stillOurs =
+    !!claimed &&
+    claimed.pid === input.pid &&
+    claimed.token_hash === tokenHash(input.token) &&
+    (input.host === undefined || claimed.host === input.host) &&
+    (input.startedAt === undefined || claimed.started_at === input.startedAt);
+
+  if (!stillOurs) {
+    // Not our lock anymore. No-overwrite restore so a fresh holder that
+    // raced ahead at path stays in place, and our claim is discarded.
+    await tryRestoreClaim(path, claimPath, claimed);
+    return;
+  }
+
+  // Confirmed ours. Unlinking the claim removes our original lock.
+  await unlink(claimPath).catch(() => undefined);
 }
 
 export async function heartbeatTokenLock(input: {
@@ -352,13 +408,10 @@ export async function heartbeatTokenLock(input: {
     claimed.token_hash === tokenHash(input.token) &&
     claimed.started_at === existing.started_at;
   if (!stillOurs) {
-    // The file at path changed between our read and our claim. Restore
-    // whatever we grabbed (it's not ours) and abandon.
-    if (claimed) {
-      await rename(claimPath, path).catch(() => undefined);
-    } else {
-      await unlink(claimPath).catch(() => undefined);
-    }
+    // The file at path changed between our read and our claim. PLAN6:
+    // restore must be no-overwrite — if a third process already wrote a
+    // fresh lock at path, do not disturb it.
+    await tryRestoreClaim(path, claimPath, claimed);
     return;
   }
 
