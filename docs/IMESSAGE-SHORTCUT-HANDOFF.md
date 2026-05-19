@@ -61,8 +61,13 @@ Field semantics:
   the running relay means a stale draft synced in from a different Mac.
 - `created_at` and `expires_at` are ISO 8601 UTC. The relay defaults
   `expires_at` to `created_at + RELAY_DRAFT_TTL_MS` (default 10 minutes).
-  `setup:verify` rejects drafts whose `expires_at` is in the past so the
-  iPhone Shortcut can't replay an old payload.
+  `setup:verify` rejects payloads whose `expires_at` is in the past as
+  a Mac-side validation gate (so an operator running verify sees a stale
+  draft flagged). The iPhone Shortcut itself does NOT inspect
+  `expires_at` — it consumes whatever `latest.json` it finds at run
+  time. The relay clears `latest.json` on each new draft, so a stale
+  file is not typically reachable to replay; see the Environment
+  overrides section for the full TTL/replay semantics.
 - `recipient` accepts either a phone number or an email; Messages picks
   the right transport.
 - `body_sha256` is the lowercase hex SHA-256 of `body`. `setup:verify`
