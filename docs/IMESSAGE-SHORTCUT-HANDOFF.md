@@ -206,6 +206,7 @@ Set in the relay environment if defaults don't fit:
 ```bash
 RELAY_ICLOUD_DRAFT_DIR=/custom/abs/path/claude-relay-drafts
 RELAY_IMESSAGE_SHORTCUT_NAME=ClaudeDraft
+RELAY_DRAFT_TTL_MS=600000
 ```
 
 `RELAY_ICLOUD_DRAFT_DIR` must point inside an iCloud-synced container that
@@ -221,6 +222,13 @@ copy; it is a trap because it can look correct until it diverges.
 `RELAY_IMESSAGE_SHORTCUT_NAME` only matters if you also rename the iOS
 Shortcut — the relay just embeds it in the `shortcuts://` URL.
 
+`RELAY_DRAFT_TTL_MS` controls the `expires_at` field on `latest.json`.
+Default 600000 (10 minutes). `setup:verify` and the iPhone Shortcut both
+reject drafts whose `expires_at` is in the past, so this is the upper
+bound on how long a written draft is considered live. Set higher on a
+slow-syncing iCloud connection; lower if you want stricter freshness.
+Non-numeric or non-positive values silently fall back to the default.
+
 ## Verifying the handoff fired (from logs, not the Mac UI)
 
 Each placement appends one row to today's
@@ -231,7 +239,7 @@ Each placement appends one row to today's
 | `imessage_draft_mode` | `"icloud_drive_file"` |
 | `imessage_draft_handoff_path` | absolute path to the written `latest.json` |
 | `imessage_draft_body_sha256` | hex SHA-256 of the body, never the body itself |
-| `imessage_draft_shortcut_url` | the `shortcuts://run-shortcut?name=...` reply embedded in Telegram |
+| `imessage_draft_shortcut_url` | the `shortcuts://run-shortcut?name=...` URL the relay computed for the run. **Decision-log metadata only — this string is NOT included in the Telegram reply.** The Telegram reply contains just the draft body (or the install-pending warning when the Shortcut isn't on the iPhone yet). |
 
 If `imessage_draft_mode` is `"pasted"` or `"new_compose"` instead, the iCloud
 write failed and the relay fell back (see next section). If

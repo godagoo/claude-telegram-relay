@@ -108,6 +108,13 @@ async function main(): Promise<void> {
 
   // Ad-hoc sign the bundle so TCC has a stable code-signing identity (cdhash)
   // to bind grants to. Unsigned bundles get re-prompted on every change.
+  //
+  // TODO (PLAN5): if TCC attribution still points at the Bun realpath
+  // rather than this bundle after wrapper rollout, switch to a Developer
+  // ID Application certificate (`codesign --sign "Developer ID
+  // Application: <name> (<team>)"`) or migrate to SMAppService for
+  // first-class TCC bundle identity. Defer until we see real-world
+  // evidence that the ad-hoc cdhash isn't sufficient.
   const sign = Bun.spawnSync([
     "codesign",
     "--sign",

@@ -1208,7 +1208,7 @@ All runtime state lives under `~/.claude-relay/`:
 | CLAUDE_TIMEOUT_MS | No | 90000 | ms before SIGTERM sent to claude |
 | CLAUDE_RESUME | No | 0 | Set to 1 to resume Claude sessions |
 | SUPABASE_URL | No | -- | Supabase project URL (enables Supabase features) |
-| SUPABASE_ANON_KEY | No | -- | Supabase anon key |
+| SUPABASE_ANON_KEY | No | -- | Supabase service_role key (env var name preserved for back-compat; the configured RLS policies grant access to service_role only) |
 | MEMORY_AUTHORITY | No | obsidian | "supabase" to enable durable memory |
 | SUPABASE_MESSAGE_HISTORY | No | 0 | "1" to persist turns to Supabase |
 | SUPABASE_RELEVANT_CONTEXT | No | 0 | "1" to enable pgvector semantic search |
