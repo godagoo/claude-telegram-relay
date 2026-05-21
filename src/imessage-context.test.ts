@@ -5,6 +5,8 @@ import {
   extractIMessageDraftRequest,
   fetchIMessageContext,
   renderIMessageContext,
+  requestHasIMessageDraftMaterial,
+  shouldClarifyMissingIMessageDraftBody,
   type IMessageContextResult,
 } from "./imessage-context";
 
@@ -59,6 +61,61 @@ test("returns null when there is no contact", () => {
   expect(
     extractIMessageDraftRequest("Draft a message saying hey"),
   ).toBeNull();
+});
+
+test("clarifies instead of inventing a draft when recipient resolves but body/context are empty", () => {
+  const request = extractIMessageDraftRequest("Text Peggy");
+  const context: IMessageContextResult = {
+    request: { contact: "Peggy", limit: 10 },
+    status: "empty",
+    messages: [],
+    resolvedRecipient: "+15555550123",
+  };
+
+  expect(requestHasIMessageDraftMaterial("Text Peggy", request)).toBe(false);
+  expect(
+    shouldClarifyMissingIMessageDraftBody({
+      message: "Text Peggy",
+      request,
+      contextResult: context,
+    }),
+  ).toBe(true);
+
+  const selfRequest = extractIMessageDraftRequest("Draft an iMessage to me");
+  expect(requestHasIMessageDraftMaterial("Draft an iMessage to me", selfRequest)).toBe(false);
+});
+
+test("does not clarify when thread context or user-supplied draft material exists", () => {
+  const bareRequest = extractIMessageDraftRequest("Reply to Peggy");
+  const foundContext: IMessageContextResult = {
+    request: { contact: "Peggy", limit: 10 },
+    status: "found",
+    messages: [{ id: 1, sender: "them", ts: "2026-05-20 09:00", text: "Are we still on?" }],
+    resolvedRecipient: "+15555550123",
+  };
+  expect(
+    shouldClarifyMissingIMessageDraftBody({
+      message: "Reply to Peggy",
+      request: bareRequest,
+      contextResult: foundContext,
+    }),
+  ).toBe(false);
+
+  const described = extractIMessageDraftRequest("Draft a message to Peggy about tomorrow's plan");
+  const emptyContext: IMessageContextResult = {
+    request: { contact: "Peggy", limit: 10 },
+    status: "empty",
+    messages: [],
+    resolvedRecipient: "+15555550123",
+  };
+  expect(requestHasIMessageDraftMaterial("Draft a message to Peggy about tomorrow's plan", described)).toBe(true);
+  expect(
+    shouldClarifyMissingIMessageDraftBody({
+      message: "Draft a message to Peggy about tomorrow's plan",
+      request: described,
+      contextResult: emptyContext,
+    }),
+  ).toBe(false);
 });
 
 test("'Respond to Conor saying hope all is well man' triggers iMessage draft", () => {

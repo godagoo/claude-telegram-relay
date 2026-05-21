@@ -7,11 +7,11 @@ You message it. Claude responds. Text, photos, documents, voice. It remembers ac
 **Created by [Goda Go](https://youtube.com/@GodaGo)** | [AI Productivity Hub Community](https://skool.com/autonomee)
 
 ```
-You ──▶ Telegram ──▶ Relay ──▶ Claude Code CLI ──▶ Response
-                                    │
-                         Obsidian (durable memory)
-                                    │
-                     Supabase (optional history/search)
+You -> Telegram -> Relay -> Claude Code CLI -> Response
+                         |
+              Obsidian durable memory
+                         |
+              Supabase optional history/search
 ```
 
 ## What You Get
@@ -129,6 +129,70 @@ The relay does three things:
 Claude Code gives you full power: tools, MCP servers, web search, file access. Not just a model — an AI with hands.
 
 The durable memory source of truth is Obsidian. Relay lessons, behavior rules, project facts, and iMessage safety constraints live as Markdown in the vault. Supabase is optional and complementary: use it for Telegram message history and semantic search over prior conversations. Supabase durable facts/goals are disabled unless you intentionally set `MEMORY_AUTHORITY=supabase`.
+
+## iMessage Staging Handoff
+
+For iMessage draft requests, the relay reads recent thread context, asks Claude
+for the draft body with Obsidian and retrieval context injected, then sends a
+normal iMessage to one staging handle. A Shortcuts automation watches that
+staging thread and opens the target Messages compose sheet. The relay does not
+drive the final compose field directly, and it never sends the target message.
+
+Required architecture:
+
+```text
+Telegram request
+  -> relay resolves the Messages contact
+  -> relay reads recent iMessage thread context from chat.db
+  -> relay injects Obsidian memory, project anchors, and retrieval context
+  -> Claude drafts under the writing rules
+  -> relay strips prose dashes
+  -> relay writes the final draft to iCloud Drive latest.json
+  -> relay sends JSON to the staging iMessage handle as the phone wake-up signal
+  -> the iPhone Shortcuts automation runs ClaudeDraft
+  -> ClaudeDraft reads latest.json and opens the final chatbox with Show When Run enabled
+```
+
+Payload sent to the staging thread:
+
+```json
+{
+  "version": "CLDRAFT/1",
+  "to": "+15195551234",
+  "label": "Conor",
+  "body": "Hey Conor, thanks for sending that over. I can take a look tonight."
+}
+```
+
+Configure the relay with:
+
+```bash
+RELAY_IMESSAGE_STAGING_HANDLE=+15555555555
+```
+
+The staging handle must be different from the final target recipient. The
+helper refuses to send CLDRAFT/1 JSON to the target handle; set
+`RELAY_IMESSAGE_ALLOW_SELF_STAGING=1` only for a deliberate self-staging test.
+
+Build the watcher in Shortcuts.app:
+
+1. Automation -> plus -> Message.
+2. Message Contains: `CLDRAFT/1`.
+3. Sender: the staging handle if you want to restrict it; `Any Sender` works
+   because the version marker is specific.
+4. Run Immediately.
+5. On iPhone, run `ClaudeDraft`. It reads the synced iCloud Drive
+   `claude-relay-drafts/latest.json` file and uses Send Message with
+   `Show When Run` ON.
+
+The older `ClaudeStageDraft` parser remains useful on macOS, where the Message
+automation reliably exposes the incoming message content. On iPhone, the
+Message automation fired but repeatedly passed blank content through nested
+shortcuts, so the production phone path uses the staging iMessage as the wake
+signal and iCloud Drive as the payload source.
+
+Details, exact Shortcut steps, TCC notes, and dry-run/live tests are in
+[`docs/IMESSAGE-SHORTCUT-HANDOFF.md`](docs/IMESSAGE-SHORTCUT-HANDOFF.md).
 
 ## Environment Variables
 

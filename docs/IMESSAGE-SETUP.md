@@ -9,24 +9,44 @@ The bot will never send a message for you. That is a hard rule.
 
 These two capabilities have different macOS permission requirements. Setup is one-time per machine.
 
-## Capability 1: drop a draft (no permission grant needed)
+## Capability 1: stage an iMessage draft (Shortcuts + Automation)
 
-These work out of the box:
+The production iMessage path is the staging Shortcut handoff:
 
 ```bash
-# iMessage
-echo "Hey Peggy, ..." | scripts/draft-imessage.sh +16043154583
-
-# Email
-echo "Body text" | scripts/draft-email.sh wregan599@gmail.com "Subject line"
+echo "Hey Peggy, ..." | \
+  RELAY_IMESSAGE_STAGING_HANDLE='+15555555555' \
+  scripts/stage-imessage.sh +16043154583 Peggy
 ```
 
 Mechanism:
 
-- iMessage draft: the body is copied to your clipboard, then a `sms:<recipient>&body=...` URL opens Messages.app with the body prefilled. If macOS cannot prefill the compose field, the helper falls back to clipboard plus opening Messages.
-- Email draft: the body is URL-encoded into a `mailto:` URL, which opens your default mail client with a new draft pre-filled. The body is also copied to the clipboard as a safety net in case the URL was truncated.
+- The relay resolves the target contact, reads recent iMessage context from
+  `chat.db`, and injects Obsidian memory plus retrieval/project-anchor context
+  before Claude drafts.
+- Claude writes the draft under the user writing rules. The relay runs a final
+  prose-dash sanitizer before staging.
+- The relay sends a normal iMessage to `RELAY_IMESSAGE_STAGING_HANDLE`.
+- The staging body is a JSON payload with `version: "CLDRAFT/1"`, `to`,
+  `label`, and `body`.
+- A Shortcuts.app Message automation watches for `CLDRAFT/1`, runs
+  `ClaudeStageDraft`, and uses Send Message with `Show When Run` ON. That
+  opens the target compose sheet for manual review.
 
-No Full Disk Access, no Automation permission, no Accessibility permission. The bot can call these via its Bash tool at any time.
+This hop does not require Full Disk Access or Accessibility. It does require
+Messages to be signed in, and macOS may ask for Automation permission so
+Shortcuts can control Messages. If the relay's staging-send AppleScript
+triggers a prompt, grant Automation to the launchd bun binary printed by
+`bun run setup:verify`, not Terminal or a GUI shell.
+
+Detailed payload, Shortcut rebuild steps, and tests:
+`docs/IMESSAGE-SHORTCUT-HANDOFF.md`.
+
+Email drafts still use the mailto helper:
+
+```bash
+echo "Body text" | scripts/draft-email.sh wregan599@gmail.com "Subject line"
+```
 
 ## Capability 2: read iMessage context (requires Full Disk Access)
 

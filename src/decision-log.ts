@@ -42,6 +42,7 @@ export interface DecisionRecord {
   imessage_context_contact?: string;
   imessage_draft_status?:
     | "placed"
+    | "staging_handoff_sent"
     | "phone_handoff_ready"
     | "phone_shortcut_install_pending"
     | "markers_missing"
@@ -53,11 +54,28 @@ export interface DecisionRecord {
     | "pasted"
     | "clipboard_only"
     | "new_compose"
+    | "staging_imessage"
     | "icloud_drive_file"
     | "iphone_mirror_typed";
   imessage_draft_handoff_path?: string;
+  imessage_draft_payload_sha256?: string;
   imessage_draft_body_sha256?: string;
   imessage_draft_shortcut_url?: string;
+  /**
+   * UUIDv4 from the CLDRAFT/1 envelope built by src/cldraft-payload.ts.
+   * Same value flows into the iCloud fallback file so logs and Shortcut
+   * state correlate across both transports.
+   */
+  imessage_draft_id?: string;
+  /**
+   * True when src/vault-writer.ts was invoked after staging success. The
+   * actual write is fire-and-forget; result paths land in console output
+   * keyed by draft_id and are not captured here because the write may still
+   * be in flight when this record is appended.
+   */
+  vault_write_attempted?: boolean;
+  /** Draft id correlator for joining decision logs to vault-writer logs. */
+  vault_draft_id?: string;
   memory_tags_stripped?: number;
   wrapper_tags_stripped?: number;
   scaffolding_tags_stripped?: number;

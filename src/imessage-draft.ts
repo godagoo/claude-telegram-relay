@@ -1,8 +1,9 @@
 // imessage-draft.ts
 // Deterministic post-action: take the iMessage draft body Claude emits between
-// marker tokens and place it into Messages.app's compose surface via
-// scripts/draft-imessage.sh. The helper only pbcopies and opens the thread; it
-// never sends.
+// marker tokens and hand it to the staging iMessage watcher via
+// scripts/stage-imessage.sh. The staging Shortcut opens the final target compose
+// sheet; the relay process never drives that compose field directly and never
+// sends the target message.
 //
 // This mirrors imessage-context.ts (deterministic prefetch). The relay owns
 // both side effects so Claude never has to call a Bash tool that the headless
@@ -10,13 +11,15 @@
 
 import { spawn } from "bun";
 import { join } from "path";
+import { buildCldraftPayload } from "./cldraft-payload.ts";
 
 export const DRAFT_MARKER_OPEN = "<<<IMESSAGE_DRAFT>>>";
 export const DRAFT_MARKER_CLOSE = "<<<END_IMESSAGE_DRAFT>>>";
 
 const DRAFT_BLOCK_RE = /<<<IMESSAGE_DRAFT>>>([\s\S]*?)<<<END_IMESSAGE_DRAFT>>>/;
 const ORPHAN_MARKER_RE = /<<<\/?(?:END_)?IMESSAGE_DRAFT>>>/g;
-const HELPER_TIMEOUT_MS = 25_000;
+const DRAFT_HELPER_TIMEOUT_MS = 25_000;
+const STAGE_HELPER_TIMEOUT_MS = 35_000;
 const PHONE_HANDOFF_LINE_RE =
   /\n*[ \t]*(?:Phone handoff ready|Open on iPhone)(?:\s+for\s+([^:\n]+))?:\s*(shortcuts:\/\/run-shortcut\?name=[^\s]+)\s*\n*/i;
 
@@ -59,13 +62,17 @@ const PLACEMENT_CLAIM_LINE_RES: RegExp[] = [
 
 /**
  * Strip placement-claim and policy-footer lines from Claude's response.
- * Safety guard: if the strip removes EVERYTHING, return the original text
- * untouched and log a warning. Better to show the boilerplate once than
- * send "I generated an empty response" to Telegram. The caller is then
- * expected to trim — this function never trims so the safety check sees
- * what the caller would see.
+ * Safety guard: by default, if the strip removes EVERYTHING, return the
+ * original text untouched and log a warning. Better to show the boilerplate
+ * once than send "I generated an empty response" to Telegram. Callers that
+ * are stripping a fragment before adding the relay-owned placement status can
+ * disable the guard, because an empty fragment is the correct result there.
  */
-export function stripPlacementClaims(text: string): string {
+export function stripPlacementClaims(
+  text: string,
+  options: { preserveNonEmpty?: boolean } = {},
+): string {
+  const preserveNonEmpty = options.preserveNonEmpty ?? true;
   const draftBlocks: string[] = [];
   let out = text.replace(DRAFT_BLOCK_RE, (block) => {
     const idx = draftBlocks.push(block) - 1;
@@ -76,7 +83,7 @@ export function stripPlacementClaims(text: string): string {
     return draftBlocks[Number(idx)] ?? "";
   });
   out = out.replace(/\n{3,}/g, "\n\n");
-  if (text.trim().length > 0 && out.trim().length === 0) {
+  if (preserveNonEmpty && text.trim().length > 0 && out.trim().length === 0) {
     console.error(
       `[stripPlacementClaims] strip would empty response (${text.length} chars); returning original`,
     );
@@ -87,6 +94,7 @@ export function stripPlacementClaims(text: string): string {
 
 export type IMessageDraftStatus =
   | "placed"
+  | "staging_handoff_sent"
   | "phone_handoff_ready"
   | "phone_shortcut_install_pending"
   | "markers_missing"
@@ -119,6 +127,19 @@ export interface PlaceDraftResult {
   /** Helper's reason string when mode is clipboard_only. Diagnostic only. */
   reason?: string;
   /** Hard-failure error message when ok is false. */
+  error?: string;
+}
+
+export interface StageDraftResult {
+  ok: boolean;
+  mode?: "staging_imessage";
+  payloadSha256?: string;
+  /**
+   * UUIDv4 generated for this draft. Surfaced so the decision log and the
+   * Telegram reply can correlate against the staging Messages thread and the
+   * iCloud fallback file (which uses the same draft_id).
+   */
+  draftId?: string;
   error?: string;
 }
 
@@ -165,10 +186,13 @@ export function rebuildAroundDraftBlock(
   if (!m || m.index === undefined) {
     const stripped = stripPlacementClaims(
       response.replace(ORPHAN_MARKER_RE, ""),
+      { preserveNonEmpty: false },
     ).trim();
     return stripped.length > 0 ? `${stripped}\n\n${replacement}` : replacement;
   }
-  const lead = stripPlacementClaims(response.slice(0, m.index)).trim();
+  const lead = stripPlacementClaims(response.slice(0, m.index), {
+    preserveNonEmpty: false,
+  }).trim();
   return lead.length > 0 ? `${lead}\n\n${replacement}` : replacement;
 }
 
@@ -187,8 +211,9 @@ export function formatPhoneHandoffForTelegram(response: string): string {
 }
 
 /**
- * Pipes the draft body to scripts/draft-imessage.sh with the resolved
- * recipient. Returns whether the placement succeeded plus any helper stderr.
+ * Legacy Mac-side helper wrapper. Kept for manual recovery/tests, but the
+ * production relay path uses stageIMessageDraft so launchd never drives the
+ * final target compose field directly.
  */
 export async function placeIMessageDraft(
   projectRoot: string,
@@ -216,8 +241,8 @@ export async function placeIMessageDraft(
       } catch {
         // Already exited.
       }
-      reject(new Error(`imessage_draft_timeout_${HELPER_TIMEOUT_MS}ms`));
-    }, HELPER_TIMEOUT_MS);
+      reject(new Error(`imessage_draft_timeout_${DRAFT_HELPER_TIMEOUT_MS}ms`));
+    }, DRAFT_HELPER_TIMEOUT_MS);
   });
 
   try {
@@ -260,6 +285,118 @@ export async function placeIMessageDraft(
     return {
       ok: false,
       error: envelope.reason ?? "unknown helper outcome",
+    };
+  } catch (err) {
+    if (timeoutId) clearTimeout(timeoutId);
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Sends the draft to the configured staging iMessage handle. The staging
+ * Shortcut does the final compose-sheet open from inside Shortcuts.app.
+ *
+ * The CLDRAFT/1 payload is built here via cldraft-payload.ts so the schema
+ * is owned by TypeScript and the shell helper is a thin send-it transport.
+ * The draftId returned in the result is the UUIDv4 embedded in the payload;
+ * the iCloud fallback writer inside the shell helper reuses the same value
+ * so logs and Shortcut state correlate across both transports.
+ */
+export async function stageIMessageDraft(
+  projectRoot: string,
+  recipient: string,
+  contactLabel: string,
+  body: string,
+): Promise<StageDraftResult> {
+  const script = join(projectRoot, "scripts", "stage-imessage.sh");
+  const { payload, draftId } = buildCldraftPayload({
+    to: recipient,
+    label: contactLabel,
+    body,
+  });
+
+  const proc = spawn([script, recipient, contactLabel], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      RELAY_CLDRAFT_PAYLOAD_JSON: payload,
+      RELAY_CLDRAFT_DRAFT_ID: draftId,
+    },
+  });
+
+  proc.stdin?.write(body);
+  await proc.stdin?.end();
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+      reject(new Error(`imessage_stage_timeout_${STAGE_HELPER_TIMEOUT_MS}ms`));
+    }, STAGE_HELPER_TIMEOUT_MS);
+  });
+
+  try {
+    const [stdout, stderr, code] = await Promise.race([
+      Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]),
+      timeout,
+    ]);
+    if (timeoutId) clearTimeout(timeoutId);
+
+    let envelope: {
+      ok?: boolean;
+      mode?: string;
+      reason?: string;
+      payload_sha256?: string;
+    };
+    try {
+      envelope = JSON.parse(stdout.trim() || "{}");
+    } catch {
+      return {
+        ok: false,
+        error: `stage helper stdout was not JSON: ${stdout.slice(0, 120)}`,
+      };
+    }
+
+    if (code !== 0) {
+      return {
+        ok: false,
+        error: envelope.reason ?? (stderr.trim() || `stage helper exited ${code}`),
+      };
+    }
+
+    if (envelope.ok && envelope.mode === "staging_imessage") {
+      return {
+        ok: true,
+        mode: "staging_imessage",
+        payloadSha256: envelope.payload_sha256,
+        draftId,
+      };
+    }
+    if (envelope.ok && envelope.mode === "dry_run") {
+      return {
+        ok: true,
+        mode: "staging_imessage",
+        payloadSha256: envelope.payload_sha256,
+        draftId,
+      };
+    }
+    return {
+      ok: false,
+      error: envelope.reason ?? "unknown stage helper outcome",
     };
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);

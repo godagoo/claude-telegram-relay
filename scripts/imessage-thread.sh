@@ -189,8 +189,16 @@ allow_message_text_fallback() {
   return 0
 }
 
+# Globals populated by resolve_recipient so the rest of the script can pass
+# display_name and last_messaged_at through to the final JSON envelope. Empty
+# defaults match the pre-PR2 behavior when only a handle was available.
+RESOLVED_DISPLAY_NAME=""
+RESOLVED_LAST_MESSAGED_AT="0"
+
 resolve_recipient() {
   local input="$1"
+  RESOLVED_DISPLAY_NAME=""
+  RESOLVED_LAST_MESSAGED_AT="0"
   if is_direct_identifier "$input"; then
     printf "%s" "$input"
     return 0
@@ -226,13 +234,46 @@ PY
     return 66
   fi
 
-  local contact err_file
+  # Call the resolver in --meta mode so we capture display_name and
+  # last_messaged_at alongside the handle. Parse the single-line JSON via
+  # Python (the same interpreter that produced it) to avoid pulling jq into
+  # the runtime dependency surface.
+  local meta_output err_file
   err_file="$(mktemp "${TMPDIR:-/tmp}/resolve-contact.XXXXXX")"
-  if contact="$("$PYTHON3" "$resolver" "$input" 2>"$err_file")"; then
+  if meta_output="$("$PYTHON3" "$resolver" --meta "$input" 2>"$err_file")"; then
     rm -f "$err_file"
-    if [[ -n "$contact" ]]; then
-      printf "%s" "$contact"
-      return 0
+    if [[ -n "$meta_output" ]]; then
+      local parsed_tsv
+      parsed_tsv="$(META_JSON="$meta_output" "$PYTHON3" - <<'PY'
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ.get("META_JSON", "{}") or "{}")
+except json.JSONDecodeError:
+    data = {}
+handle = data.get("handle", "") or ""
+display_name = data.get("display_name", "") or ""
+try:
+    last_messaged_at = int(data.get("last_messaged_at", 0) or 0)
+except (TypeError, ValueError):
+    last_messaged_at = 0
+# Tab-separated so bash can split on \t. Display names from AddressBook do
+# not contain tabs in practice; we strip any defensively below.
+sys.stdout.write(
+    f"{handle}\t{display_name.replace(chr(9), ' ')}\t{last_messaged_at}\n"
+)
+PY
+)"
+      local handle
+      IFS=$'\t' read -r handle RESOLVED_DISPLAY_NAME RESOLVED_LAST_MESSAGED_AT \
+        <<<"$parsed_tsv"
+      # Defensive: if the parse glitched, fall through to fallback paths.
+      if [[ -n "$handle" ]]; then
+        printf "%s" "$handle"
+        return 0
+      fi
     fi
   else
     local status=$?
@@ -253,6 +294,11 @@ PY
   # text, then use that chat identifier. Do not use this for short or
   # relationship-style aliases; those are too ambiguous to place a draft
   # safely.
+  #
+  # No display_name is recoverable on this branch (we found the handle by
+  # message-text search, not by AddressBook lookup), and last_messaged_at
+  # stays 0. The relay still surfaces the handle to the user so they can
+  # eyeball the recipient before sending.
   local q
   q="$(sql_string "$input")"
   local sql
@@ -311,4 +357,11 @@ MESSAGES_JSON="$(sqlite_query_or_exit "$SQL_MESSAGES")"
 [[ -z "$MESSAGES_JSON" ]] && MESSAGES_JSON='[]'
 
 NORMALIZER="$(cd "$(dirname "$0")" && pwd)/imessage-normalize-messages.py"
-printf "%s" "$MESSAGES_JSON" | "$PYTHON3" "$NORMALIZER" "$RESOLVED_RECIPIENT" "$LIMIT"
+# Pass display_name and last_messaged_at through to the normalizer so the
+# final {resolved, messages, ...} envelope includes them when known. Empty
+# defaults are stripped by the normalizer so the legacy envelope shape
+# survives for callers that resolve by direct identifier.
+printf "%s" "$MESSAGES_JSON" | \
+  RELAY_RESOLVED_DISPLAY_NAME="$RESOLVED_DISPLAY_NAME" \
+  RELAY_RESOLVED_LAST_MESSAGED_AT="$RESOLVED_LAST_MESSAGED_AT" \
+  "$PYTHON3" "$NORMALIZER" "$RESOLVED_RECIPIENT" "$LIMIT"

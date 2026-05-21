@@ -8,8 +8,8 @@
  */
 
 import { existsSync, readFileSync, statSync } from "fs";
-import { realpath } from "fs/promises";
-import { join, dirname, basename } from "path";
+import { mkdtemp, readFile, realpath, rm } from "fs/promises";
+import { join, dirname } from "path";
 import { homedir } from "os";
 import * as os from "os";
 import {
@@ -17,13 +17,6 @@ import {
   isWrapperInstalled,
   wrapperPaths,
 } from "./wrapper-bundle.ts";
-import {
-  DEFAULT_SHORTCUT_NAME,
-  defaultICloudDriveDraftDir,
-  ICLOUD_DRIVE_DRAFT_FILE_NAME,
-  isCloudDocsDraftDir,
-  validateICloudDriveDraftPayload,
-} from "../src/icloud-drive-draft.ts";
 import { tokenHash, tokenLockPath } from "../src/token-lock.ts";
 import { redactBotToken } from "../src/redact-token.ts";
 import {
@@ -37,11 +30,6 @@ import {
   loadTokenLockState,
   resolveRelayErrorLogPath,
 } from "./health-check.ts";
-import {
-  readInstalledShortcutActions,
-  readSignedShortcutFileActions,
-  validateClaudeDraftShortcutActions,
-} from "./shortcut-verify.ts";
 import { runCommandWithTimeout } from "./process-timeout.ts";
 import { getSupabaseFeatureConfig } from "../src/supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "../src/arch-check.ts";
@@ -71,6 +59,10 @@ function pass(msg: string) { console.log(`  ${PASS} ${msg}`); passed++; }
 function fail(msg: string) { console.log(`  ${FAIL} ${msg}`); failed++; }
 function warn(msg: string) { console.log(`  ${WARN} ${msg}`); warned++; }
 
+function sqlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 async function runCommand(
   args: string[],
   options: { cwd?: string; env?: Record<string, string | undefined>; timeoutMs?: number } = {},
@@ -87,6 +79,10 @@ async function runCommand(
       ? `Command timed out after ${options.timeoutMs ?? COMMAND_TIMEOUT_MS}ms: ${args[0]}`
       : result.stderr,
   };
+}
+
+function commandFailureText(result: { code: number; stdout: string; stderr: string }): string {
+  return (result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`);
 }
 
 async function fetchJsonWithTimeout(url: string, init: RequestInit = {}): Promise<any> {
@@ -497,9 +493,11 @@ async function main() {
       );
       if (probe.code === 0) {
         pass("iMessage chat.db read probe succeeded (Full Disk Access granted)");
+      } else if (probe.code === 124) {
+        warn("iMessage chat.db read probe timed out (database likely locked by Messages or mds). Close Messages and re-run setup:verify.");
       } else {
         fail(
-          `iMessage chat.db read failed: ${probe.stderr.trim() || probe.stdout.trim()}. ` +
+          `iMessage chat.db read failed: ${commandFailureText(probe)}. ` +
           `Grant Full Disk Access to: ${fdaTargetDescription}`,
         );
       }
@@ -537,6 +535,41 @@ async function main() {
 
     pass(`FDA responsible target: ${fdaTargetDescription}`);
     if (fdaTargetWarning) warn(fdaTargetWarning);
+    if (currentBunRealpath) {
+      const tccDb = join(homedir(), "Library", "Application Support", "com.apple.TCC", "TCC.db");
+      if (existsSync(tccDb)) {
+        // tccd.app can hold a writer lock against TCC.db while a permission
+        // sheet is open; bound the probe so verify never wedges.
+        const automationGrant = await runCommand(
+          [
+            "sqlite3",
+            "-readonly",
+            tccDb,
+            [
+              "SELECT auth_value FROM access",
+              "WHERE service='kTCCServiceAppleEvents'",
+              `AND client=${sqlQuote(currentBunRealpath)}`,
+              "AND client_type=1",
+              "AND indirect_object_identifier='com.apple.MobileSMS'",
+              "ORDER BY last_modified DESC LIMIT 1;",
+            ].join(" "),
+          ],
+          { timeoutMs: 5_000 },
+        );
+        const authValue = automationGrant.stdout.trim();
+        if (automationGrant.code === 0 && authValue === "2") {
+          pass("Automation grant present for launchd bun -> Messages");
+        } else if (automationGrant.code === 124) {
+          warn(`TCC Automation probe timed out for launchd bun -> Messages (TCC.db locked by tccd?): ${currentBunRealpath}`);
+        } else if (automationGrant.code !== 0) {
+          warn(`TCC Automation probe failed for launchd bun -> Messages: ${commandFailureText(automationGrant)}`);
+        } else {
+          warn(`Automation grant missing for launchd bun -> Messages: ${currentBunRealpath}`);
+        }
+      } else {
+        warn(`TCC database not readable for Automation check: ${tccDb}`);
+      }
+    }
     // PLAN6: the shell-script wrapper is experimental — it has not been
     // verified to bind TCC to its bundle id on this macOS version. Do not
     // push operators toward it. The documented path is direct Bun realpath
@@ -556,59 +589,241 @@ async function main() {
       fail(pidCountMsg);
     }
 
-    console.log(`\n${bold("  iMessage Handoff")}`);
-    const shortcutName = env.RELAY_IMESSAGE_SHORTCUT_NAME || DEFAULT_SHORTCUT_NAME;
-    const draftDir = env.RELAY_ICLOUD_DRAFT_DIR || defaultICloudDriveDraftDir();
-    const draftPath = join(draftDir, ICLOUD_DRIVE_DRAFT_FILE_NAME);
-    const iCloudDriveRoot = join(
-      homedir(),
-      "Library",
-      "Mobile Documents",
-      "com~apple~CloudDocs",
-    );
-    const pendingIPhoneShortcutPaths = [
-      join(iCloudDriveRoot, `${shortcutName}.shortcut`),
-      join(iCloudDriveRoot, `${shortcutName}-install.shortcut`),
-    ];
-    const legacyShortcutsPath = join(
-      homedir(),
-      "Library",
-      "Mobile Documents",
-      "iCloud~is~workflow~my~workflows",
-      "Documents",
-      "claude-relay-drafts",
-      ICLOUD_DRIVE_DRAFT_FILE_NAME,
-    );
+    console.log(`\n${bold("  iMessage Staging Handoff")}`);
+    const stageScript = join(PROJECT_ROOT, "scripts", "stage-imessage.sh");
+    const stagingHandle = env.RELAY_IMESSAGE_STAGING_HANDLE || process.env.RELAY_IMESSAGE_STAGING_HANDLE || "";
 
-    if (!isCloudDocsDraftDir(draftDir, iCloudDriveRoot)) {
-      fail(`RELAY_ICLOUD_DRAFT_DIR must be inside the CloudDocs iCloud Drive root: ${iCloudDriveRoot}`);
-    } else if (draftDir.includes("iCloud~is~workflow~my~workflows")) {
-      fail("RELAY_ICLOUD_DRAFT_DIR points at the non-syncing Shortcuts container");
+    if (!existsSync(stageScript)) {
+      fail(`Staging helper missing: ${stageScript}`);
     } else {
-      pass("Relay iCloud draft dir targets the CloudDocs iCloud Drive container");
+      const stat = statSync(stageScript);
+      (stat.mode & 0o111) !== 0
+        ? pass("Staging helper is executable")
+        : fail(`Staging helper is not executable: chmod +x ${stageScript}`);
     }
 
-    existsSync(draftPath)
-      ? pass(`Latest iCloud draft exists: ${draftPath}`)
-      : warn(`Latest iCloud draft missing: ${draftPath} — send one draft to create it`);
+    stagingHandle.trim()
+      ? pass("RELAY_IMESSAGE_STAGING_HANDLE is set")
+      : warn("RELAY_IMESSAGE_STAGING_HANDLE not set - iMessage draft staging is disabled until configured");
 
-    if (existsSync(draftPath)) {
+    if (existsSync(stageScript)) {
+      const dryRunRoot = await mkdtemp(join(os.tmpdir(), "relay-stage-verify-"));
+      const dryRunPayload = join(dryRunRoot, "payload.txt");
       try {
-        const payload = JSON.parse(await Bun.file(draftPath).text()) as Record<string, unknown>;
-        const validation = validateICloudDriveDraftPayload(payload, { now: new Date() });
-        if (validation.ok) {
-          pass("Latest iCloud draft payload validates (schema, sha256, not expired)");
+        const dryRun = await runCommand(
+          [
+            "/bin/sh",
+            "-lc",
+            "printf '%s' 'setup verify body' | \"$1\" '+15555550123' 'Setup Verify'",
+            "sh",
+            stageScript,
+          ],
+          {
+            cwd: PROJECT_ROOT,
+            env: {
+              ...process.env,
+              RELAY_IMESSAGE_STAGING_HANDLE: stagingHandle.trim() || "+15555550000",
+              RELAY_STAGE_IMESSAGE_DRY_RUN_PATH: dryRunPayload,
+            },
+          },
+        );
+        if (dryRun.code === 0) {
+          const payload = await readFile(dryRunPayload, "utf8");
+          try {
+            const parsed = JSON.parse(payload) as {
+              version?: string;
+              to?: string;
+              label?: string;
+              body?: string;
+            };
+            if (
+              parsed.version === "CLDRAFT/1" &&
+              parsed.to === "+15555550123" &&
+              parsed.label === "Setup Verify" &&
+              parsed.body === "setup verify body"
+            ) {
+              pass("Staging helper dry-run payload validates");
+            } else {
+              fail(`Staging helper dry-run payload mismatch: ${JSON.stringify(payload)}`);
+            }
+          } catch {
+            fail(`Staging helper dry-run payload is not JSON: ${JSON.stringify(payload)}`);
+          }
         } else {
-          for (const error of validation.errors) fail(`Latest iCloud draft: ${error}`);
+          fail(`Staging helper dry-run failed: ${(dryRun.stderr || dryRun.stdout).trim()}`);
         }
-      } catch (e: any) {
-        fail(`Latest iCloud draft is not valid JSON: ${e.message}`);
+      } finally {
+        await rm(dryRunRoot, { recursive: true, force: true });
       }
     }
 
-    existsSync(legacyShortcutsPath)
-      ? warn(`Legacy Shortcuts-container draft still exists: ${legacyShortcutsPath}`)
-      : pass("No stale Shortcuts-container draft file");
+    if (await commandExists("shortcuts")) {
+      pass("shortcuts CLI installed");
+    } else {
+      fail("shortcuts CLI not found");
+    }
+
+    const shortcutsDb = join(homedir(), "Library", "Shortcuts", "Shortcuts.sqlite");
+    if (existsSync(shortcutsDb)) {
+      const stageShortcutCheckScript = String.raw`
+import plistlib
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+row = conn.execute(
+    """
+    SELECT s.ZNAME, t.ZDATA, a.ZDATA, s.ZHASSHORTCUTINPUTVARIABLES, s.ZINPUTCLASSESDATA
+    FROM ZTRIGGER t
+    JOIN ZSHORTCUT s ON s.Z_PK=t.ZSHORTCUT
+    JOIN ZSHORTCUTACTIONS a ON a.ZSHORTCUT=s.Z_PK
+    WHERE t.ZENABLED=1
+      AND t.ZSHOULDPROMPT=0
+    ORDER BY s.ZMODIFICATIONDATE DESC
+    """
+).fetchall()
+if not row:
+    raise SystemExit("ClaudeStageDraft automation is missing or not set to Run Immediately")
+
+matching = [r for r in row if b"CLDRAFT/1" in (r[1] or b"")]
+if not matching:
+    raise SystemExit("Shortcuts Message automation is not filtered on CLDRAFT/1")
+
+shortcut_name, trigger_blob, actions_blob, has_shortcut_input, input_classes_blob = matching[0]
+if shortcut_name != "ClaudeStageDraft":
+    raise SystemExit(
+        f"Mac CLDRAFT/1 automation points to {shortcut_name!r}; "
+        "iPhone production should run ClaudeDraft from its own Personal Automation. "
+        "Disable this Mac automation if it opens unwanted Mac compose sheets."
+    )
+
+if b"CLDRAFT/1" not in trigger_blob:
+    raise SystemExit("ClaudeStageDraft Message automation is not filtered on CLDRAFT/1")
+
+if has_shortcut_input != 1:
+    raise SystemExit("ClaudeStageDraft must be saved as a shortcut that receives Shortcut Input; otherwise Run Shortcut passes an empty value")
+
+try:
+    input_classes = plistlib.loads(input_classes_blob or b"")
+except Exception:
+    input_classes = []
+if not input_classes:
+    raise SystemExit("ClaudeStageDraft accepted input classes are empty; reinstall or re-save it so the iPhone can pass the Message automation input")
+
+actions = plistlib.loads(actions_blob)
+
+def params(action):
+    return action.get("WFWorkflowActionParameters", {})
+
+def action_id(action):
+    return action.get("WFWorkflowActionIdentifier")
+
+def output_uuid(value):
+    if not isinstance(value, dict):
+        return None
+    wrapped = value.get("Value")
+    if isinstance(wrapped, dict):
+        return wrapped.get("OutputUUID")
+    return value.get("OutputUUID")
+
+def input_uuid(action):
+    return output_uuid(params(action).get("WFInput"))
+
+def has_content_shortcut_input(action):
+    wf_input = params(action).get("WFInput", {})
+    value = wf_input.get("Value", {}) if isinstance(wf_input, dict) else {}
+    if value.get("Type") != "ExtensionInput":
+        return False
+    aggrandizements = value.get("Aggrandizements", [])
+    return any(
+        isinstance(item, dict)
+        and item.get("Type") == "WFPropertyVariableAggrandizement"
+        and item.get("PropertyName") == "Content"
+        for item in aggrandizements
+    )
+
+text_action = next((a for a in actions if action_id(a) == "is.workflow.actions.detect.text"), None)
+if not text_action:
+    raise SystemExit("ClaudeStageDraft is missing Get Text from Shortcut Input")
+if not has_content_shortcut_input(text_action):
+    raise SystemExit("Get Text must read Shortcut Input > Content; otherwise Send Message opens with no recipient")
+text_uuid = params(text_action).get("UUID")
+
+dict_action = next((a for a in actions if action_id(a) == "is.workflow.actions.detect.dictionary"), None)
+if not dict_action:
+    raise SystemExit("ClaudeStageDraft is missing Get Dictionary from Text")
+dict_uuid = params(dict_action).get("UUID")
+if input_uuid(dict_action) != text_uuid:
+    raise SystemExit("Get Dictionary must read the Text output")
+
+lookups = [
+    a for a in actions
+    if action_id(a) == "is.workflow.actions.getvalueforkey"
+]
+lookup_by_key = {params(a).get("WFDictionaryKey"): a for a in lookups}
+to_action = lookup_by_key.get("to")
+body_action = lookup_by_key.get("body")
+if not to_action or not body_action:
+    raise SystemExit("ClaudeStageDraft must look up both to and body from the payload")
+if input_uuid(to_action) != dict_uuid or input_uuid(body_action) != dict_uuid:
+    raise SystemExit("to/body lookups must read the parsed CLDRAFT dictionary")
+
+send_action = next((a for a in actions if action_id(a) == "is.workflow.actions.sendmessage"), None)
+if not send_action:
+    raise SystemExit("ClaudeStageDraft is missing Send Message")
+send_params = params(send_action)
+if send_params.get("ShowWhenRun") is not True:
+    raise SystemExit("Send Message must have Show When Run enabled")
+recipient_uuid = output_uuid(send_params.get("WFSendMessageActionRecipients"))
+if recipient_uuid != params(to_action).get("UUID"):
+    raise SystemExit("Send Message recipient must be the to dictionary value")
+content = send_params.get("WFSendMessageContent", {})
+body_uuid = None
+if isinstance(content, dict):
+    value = content.get("Value", {})
+    if isinstance(value, dict):
+        attachments = value.get("attachmentsByRange", {})
+        if isinstance(attachments, dict) and len(attachments) == 1:
+            body_uuid = output_uuid(next(iter(attachments.values())))
+if body_uuid != params(body_action).get("UUID"):
+    raise SystemExit("Send Message body must be the body dictionary value")
+
+print("ok")
+`;
+
+      // Shortcuts.app holds a writer lock while open; without a timeout the
+      // verify script blocks indefinitely. Match the chat.db / TCC probe
+      // budget (5s) so a busy DB surfaces a warn-level message instead.
+      const shortcutCheck = await runCommand(
+        [
+          "python3",
+          "-c",
+          stageShortcutCheckScript,
+          shortcutsDb,
+        ],
+        { timeoutMs: 5_000 },
+      );
+      if (shortcutCheck.code === 0) {
+        pass("Shortcuts Message automation installed for CLDRAFT/1 -> ClaudeStageDraft");
+      } else if (shortcutCheck.code === 124) {
+        warn(`Shortcuts.sqlite query timed out (DB likely locked by Shortcuts.app). Close Shortcuts.app and re-run setup:verify.`);
+      } else if (shortcutCheck.code !== 0) {
+        warn(`Shortcuts Message automation check failed: ${commandFailureText(shortcutCheck)}`);
+      } else {
+        warn("Manual check: Shortcuts.app Automation must have Message Contains=CLDRAFT/1, Run Immediately, Shortcut Input > Content, and Send Message Show When Run=ON");
+      }
+      // The above only covers the Mac diagnostic copy. The iPhone production
+      // Shortcut (ClaudeDraft) lives on the phone and is not reachable from
+      // here. Surface the manual requirement on every run so an accidental
+      // toggle on iPhone can never silently turn the relay into an auto-send.
+      // The user explicitly accepted in PR 2 planning that contact ambiguity
+      // is resolved silently by most-recent-activity, which makes this flag
+      // the load-bearing safety net.
+      warn("Manual check (iPhone): the ClaudeDraft Shortcut's Send Message action must have Show When Run = ON. The Mac check above does not reach the phone.");
+    } else {
+      warn(`Shortcuts database not found: ${shortcutsDb}`);
+    }
 
     console.log(`\n${bold("  iMessage Contact Resolver")}`);
     const resolverPath = join(PROJECT_ROOT, "scripts", "resolve-contact.py");
@@ -684,53 +899,6 @@ async function main() {
         );
     }
 
-    if (await commandExists("shortcuts")) {
-      pass("shortcuts CLI installed");
-      const read = await readInstalledShortcutActions(shortcutName);
-      if (!read.ok) {
-        fail(read.error ?? `Could not inspect Shortcut: ${shortcutName}`);
-      } else {
-        const validation = validateClaudeDraftShortcutActions(read.actions, { draftDir });
-        if (validation.ok) {
-          pass(`Mac-installed ${shortcutName} reads the CloudDocs latest.json handoff and preserves Show When Run`);
-        } else {
-          for (const error of validation.errors) fail(error);
-        }
-        for (const warning of validation.warnings) warn(warning);
-      }
-    } else {
-      fail("shortcuts CLI not found");
-    }
-
-    const existingPendingShortcutPaths = pendingIPhoneShortcutPaths.filter(existsSync);
-    if (existingPendingShortcutPaths.length > 0) {
-      for (const shortcutPath of existingPendingShortcutPaths) {
-        const read = await readSignedShortcutFileActions(shortcutPath);
-        if (!read.ok) {
-          fail(`Pending iPhone Shortcut install file is unreadable: ${read.error}`);
-          continue;
-        }
-
-        const validation = validateClaudeDraftShortcutActions(read.actions, { draftDir });
-        if (!validation.ok) {
-          for (const error of validation.errors) {
-            fail(`Pending iPhone Shortcut install file is invalid: ${error}`);
-          }
-        } else if (basename(shortcutPath) !== `${shortcutName}.shortcut`) {
-          fail(
-            `Pending iPhone Shortcut file ${shortcutPath} imports as ${basename(shortcutPath, ".shortcut")}; install ${join(iCloudDriveRoot, `${shortcutName}.shortcut`)} to replace the relay target, then delete both files`,
-          );
-        } else {
-          fail(
-            `Fixed ${shortcutName} iPhone install file still exists at ${shortcutPath}; install it on iPhone, confirm the body appears, then delete the file`,
-          );
-        }
-
-        for (const warning of validation.warnings) warn(warning);
-      }
-    } else {
-      pass(`No pending ${shortcutName} iPhone install artifact`);
-    }
   }
 
   // 5. Optional

@@ -28,6 +28,7 @@ import {
   tokenLockPath,
   type TokenLockPayload,
 } from "../src/token-lock.ts";
+import { runCommandWithTimeout } from "./process-timeout.ts";
 import { scanRelayLogForRecentFailures } from "./verify-checks.ts";
 
 export type HealthSeverity = "pass" | "warn" | "fail";
@@ -437,13 +438,17 @@ async function loadDotEnv(envPath: string): Promise<Record<string, string>> {
 }
 
 export async function readProcessLines(): Promise<string[]> {
-  const proc = Bun.spawn(["/bin/ps", "axww", "-o", "pid=,etime=,command="], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const stdout = await new Response(proc.stdout).text();
-  await proc.exited;
-  return stdout
+  const result = await runCommandWithTimeout(
+    ["/bin/ps", "axww", "-o", "pid=,etime=,command="],
+    { timeoutMs: 5_000 },
+  );
+  if (result.timedOut) {
+    throw new Error("process list timed out after 5000ms");
+  }
+  if (result.code !== 0) {
+    throw new Error(result.stderr.trim() || result.stdout.trim() || `ps exited ${result.code}`);
+  }
+  return result.stdout
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);

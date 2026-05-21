@@ -133,7 +133,26 @@ def main() -> int:
     if not isinstance(rows, list):
         rows = []
 
-    print(json.dumps({"resolved": resolved, "messages": normalize_rows(rows, limit)}, ensure_ascii=False))
+    import os
+    envelope: dict[str, Any] = {
+        "resolved": resolved,
+        "messages": normalize_rows(rows, limit),
+    }
+    # Optional metadata threaded through from imessage-thread.sh so the relay
+    # can surface "Drafting for X (last messaged N days ago)" in Telegram
+    # without re-querying AddressBook or chat.db. Empty / zero defaults match
+    # the legacy shape; callers can ignore them safely.
+    display_name = os.environ.get("RELAY_RESOLVED_DISPLAY_NAME", "")
+    if display_name:
+        envelope["display_name"] = display_name
+    last_messaged_at_raw = os.environ.get("RELAY_RESOLVED_LAST_MESSAGED_AT", "")
+    if last_messaged_at_raw:
+        try:
+            envelope["last_messaged_at"] = int(last_messaged_at_raw)
+        except ValueError:
+            pass
+
+    print(json.dumps(envelope, ensure_ascii=False))
     return 0
 
 

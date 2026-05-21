@@ -1902,3 +1902,123 @@ Five rounds of senior review across PLAN4–PLAN8 surfaced a recurring set of mi
 - The old pre-PLAN-A relay's SIGTERM/exit handler unlinks its own legacy `~/.claude-relay/bot.lock` on shutdown. The first proper `launchctl bootout` after upgrade is usually enough to clear it. Explicit `rm` is belt-and-suspenders, not a load-bearing step.
 - For a stale iCloud `latest.json` after a schema bump, prefer `clearICloudDriveDraft` over hand-writing a v2 stub. `validateICloudDriveDraftPayload` rejects drafts whose `expires_at` has passed, so migrated v1 content with the original timestamps would fail anyway; a synthetic placeholder risks an iPhone Shortcut firing on the wrong recipient. Deleting the file demotes the verifier line from a fail to a warn, and the next real draft from the relay writes a valid v2 file.
 - Post-cutover green signature on this relay: exactly one relay PID (different from the pre-cutover PID), token lock present at `~/.claude-relay/locks/token-<hash>.lock` with `pid` matching the live process, host matching `os.hostname()`, error log near zero bytes containing no `telegram_409` / `telegram_401` / `spawn_nul_crash` lines, and `setup:verify` printing "Your bot is ready!" with exit 0. Treat any future deviation from this signature as a regression to investigate before claiming readiness.
+
+## 2026-05-20 - iMessage staging Shortcut handoff replaces direct compose placement
+
+- The reliable architecture is a two-hop handoff: relay sends a normal
+  iMessage to a staging handle, then a Shortcuts Message automation parses the
+  staging payload and opens the target Messages compose sheet. The relay should
+  not drive the target compose field through `sms:&body=`, AppleScript UI
+  scripting, or iPhone Mirroring in the production path.
+- The full architecture is: Telegram request -> relay resolves Messages
+  contact -> relay reads recent iMessage context from `chat.db` -> relay
+  injects Obsidian memory, project anchors, and retrieval context -> Claude
+  drafts under William's style rules -> relay strips prose em/en dashes ->
+  relay sends staging iMessage -> Shortcuts parses it -> Send Message opens
+  the final target chatbox with `Show When Run` enabled.
+- Staging payloads are deliberately human-readable JSON with
+  `version: "CLDRAFT/1"`, `to`, `label`, and `body`. The `CLDRAFT/1` value is
+  both the schema marker and the Shortcuts `Message Contains` trigger filter.
+- `scripts/stage-imessage.sh` is the write-side helper. It reads the draft
+  body from stdin, sends the staging payload to
+  `RELAY_IMESSAGE_STAGING_HANDLE`, and returns JSON without printing the body.
+  Dry-run tests use `RELAY_STAGE_IMESSAGE_DRY_RUN_PATH`.
+- `setup:verify` should validate the staging helper and warn about the manual
+  Shortcuts automation, not fail the relay on stale CloudDocs/ClaudeDraft
+  state. The old CloudDocs shortcut can remain installed, but it is no longer
+  the runtime draft-placement contract.
+
+## 2026-05-20 - Staff-engineer audit: direct-body duplication and dash-range fixes
+
+- `rebuildAroundDraftBlock` is destructive on its first call: it strips the
+  IMESSAGE_DRAFT marker pair when inlining the replacement. Calling it twice
+  on the same `assistantText` falls into the no-markers branch on the second
+  pass and APPENDS the replacement again, producing a duplicated body in the
+  user-visible reply. The relay's text handler had an extra rebuild between
+  the prose-dash strip and the staging-success rebuild — only fired when the
+  user provided a `directIMessageBody` (e.g. "Text +1555... saying X — Y")
+  with em/en dashes, because Claude-path responses had their dashes already
+  stripped in `sanitizeClaudeResponse`. Fix: update the `body` variable after
+  `stripProseDashes`, but do NOT rebuild yet; let each branch's existing
+  rebuild handle marker removal in one pass.
+- `stripProseDashes` treated em-dash and en-dash inconsistently in numeric
+  ranges. The numeric-range pre-rule matched only en-dash (`(\d)\s*–\s*(\d)`),
+  so `27—476 CE` collapsed to `27, 476 CE` (range turned into a list) while
+  `27–476 CE` correctly became `27 to 476 CE`. Authors mix the two dash forms
+  freely; treat them the same in the range pre-rule (`[—–]`) so the downstream
+  dash-to-comma replacer never sees a numeric-range dash.
+- `setup:verify` queries against `Shortcuts.sqlite` and `TCC.db` had no
+  per-command timeout. Both databases can be held by their owning apps
+  (Shortcuts.app, tccd) while a UI sheet is open, and a wedged probe blocks
+  the entire verifier. Pin every macOS-side sqlite read to a 5s budget,
+  matching the chat.db probe convention. Surface a clear "DB locked, close
+  the app and re-run" warn-level message instead of a generic warning when
+  the timeout fires (code 124).
+
+## 2026-05-20 - Follow-up audit: staging failure-path and sanitizer edge cases
+
+- `stripPlacementClaims` has two valid modes. Whole-response cleanup should
+  preserve a non-empty all-boilerplate response so Telegram never gets an
+  empty reply. Fragment cleanup inside `rebuildAroundDraftBlock` and
+  `markers_missing` should allow an all-claim fragment to become empty,
+  because the relay is about to append its own authoritative status. Do not
+  use the whole-response safety guard on placement fragments.
+- A resolved recipient is not the same as enough material to draft. If the
+  user says only `Text Peggy` or `Text +1555...`, and there is no found thread
+  context plus no user-supplied draft material, ask what the message should
+  say instead of letting Claude invent a body and staging it.
+- The staging helper's SHA is over the full CLDRAFT/1 payload, not the body
+  alone. Log it as `imessage_draft_payload_sha256`; reserve
+  `imessage_draft_body_sha256` for a future actual body-only hash.
+- The staging handle must not equal the final target recipient. Failing closed
+  with `staging_handle_matches_recipient` prevents a misconfigured environment
+  from sending the human-readable JSON draft payload to the person being
+  texted. Use `RELAY_IMESSAGE_ALLOW_SELF_STAGING=1` only for deliberate tests.
+- Prose dash cleanup must preserve ranges beyond bare digits: `9am–5pm`,
+  `May–June`, `10%–20%`, and `5 mg–10 mg` are ranges, not comma-separated
+  lists. The catch-all dash replacement also needs punctuation awareness so it
+  never creates `, .`, `, !`, or dangling trailing commas.
+- `setup:verify` timeout branches should say which probe timed out or failed.
+  A `chat.db` timeout is not Full Disk Access denial, a TCC sqlite error is
+  not the same as a missing Automation grant, and a Shortcuts schema/query
+  error is not the same as a missing automation.
+
+## 2026-05-20 - Shortcuts Message trigger content extraction
+
+- A macOS Shortcuts Message automation passes a structured `Message` object,
+  not raw text. `Get Dictionary from Shortcut Input` and `Get Text from Input`
+  both produce empty `to`/`body` unless the `Shortcut Input` variable is
+  changed from `Message` to `Content`. The visible symptom is a Messages
+  compose sheet with `To: No recipients` and a blank body.
+- The correct first action in `ClaudeStageDraft` is `Get Text from Content`,
+  where `Content` is the `Shortcut Input` variable property. In the shortcut
+  plist this is `WFPropertyVariableAggrandizement` with
+  `PropertyName=Content`; `setup:verify` must check for that, not just for
+  the presence of `CLDRAFT/1` and `Send Message`.
+- A successful staging send can still look like a timeout to the relay if
+  Messages/Shortcuts opens the final compose sheet while the AppleScript send
+  process remains blocked. Treat the exact CLDRAFT/1 payload appearing in
+  `chat.db` after the helper starts as the source of truth. If the payload row
+  exists, kill the lingering `osascript` process and return success instead of
+  reporting `imessage_stage_timeout_*` back to Telegram.
+
+## 2026-05-21 - iPhone nested shortcut input must be explicit and accepted
+
+- iPhone Personal Automations can show `Receive messages as input` and still
+  run a nested shortcut with an empty value. In the automation's `Run Shortcut`
+  action, expand the shortcut name and set `Input` to `Shortcut Input`; a stale
+  deleted `Text` variable is displayed in red and produces a blank Messages
+  compose sheet.
+- The nested `ClaudeStageDraft` helper also needs saved shortcut metadata that
+  declares it accepts input. A shortcut plist can visually contain the
+  `Shortcut Input` token while `ZINPUTCLASSESDATA` is empty and
+  `ZHASSHORTCUTINPUTVARIABLES=0`; iOS then passes nothing to the helper.
+  `setup:verify` must catch this, because action-shape validation alone is not
+  enough.
+- Empirical iPhone Mirroring test showed that even after fixing the automation
+  input and helper metadata, iOS could still open a blank compose through the
+  nested `ClaudeStageDraft` message-content parser. The reliable iPhone path is
+  staging iMessage as wake-up signal plus `ClaudeDraft` reading
+  `iCloud Drive/claude-relay-drafts/latest.json`. Verified 2026-05-21 with a
+  Madison smoke test: the body landed in the iPhone Messages text box and was
+  not sent.

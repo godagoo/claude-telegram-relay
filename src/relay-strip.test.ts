@@ -63,6 +63,36 @@ test("replaces prose em/en dashes outside code spans", () => {
   expect(r.stripped).toBe(2);
 });
 
+// Regression: numeric ranges authored with an em-dash (e.g. "27—476 CE", "5—10
+// items") were converted to a comma ("27, 476 CE", "5, 10 items"), losing the
+// range meaning. The numeric-range handler only matched en-dash. Both em-dash
+// and en-dash should convert to " to " in numeric range contexts so the
+// downstream dash-to-comma replacer never collapses a real range into a list.
+test("numeric ranges convert with em-dash and en-dash consistently", () => {
+  expect(stripProseDashes("Pages 10–12").clean).toBe("Pages 10 to 12");
+  expect(stripProseDashes("Pages 10—12").clean).toBe("Pages 10 to 12");
+  expect(stripProseDashes("27—476 CE").clean).toBe("27 to 476 CE");
+  expect(stripProseDashes("Roman Empire 27—476 CE").clean).toBe(
+    "Roman Empire 27 to 476 CE",
+  );
+});
+
+test("date, time, and unit ranges keep range meaning", () => {
+  expect(stripProseDashes("Clinic is 9am–5pm").clean).toBe("Clinic is 9am to 5pm");
+  expect(stripProseDashes("Coverage 08:00—17:00").clean).toBe("Coverage 08:00 to 17:00");
+  expect(stripProseDashes("May–June 2026").clean).toBe("May to June 2026");
+  expect(stripProseDashes("May 1–3").clean).toBe("May 1 to 3");
+  expect(stripProseDashes("Use 5 mg–10 mg").clean).toBe("Use 5 mg to 10 mg");
+  expect(stripProseDashes("Risk 10%–20%").clean).toBe("Risk 10% to 20%");
+});
+
+test("prose dash replacement is punctuation-aware", () => {
+  expect(stripProseDashes("Hello —. World").clean).toBe("Hello. World");
+  expect(stripProseDashes("Wait—!").clean).toBe("Wait!");
+  expect(stripProseDashes("Here is the point —").clean).toBe("Here is the point");
+  expect(stripProseDashes("— leading dash").clean).toBe("leading dash");
+});
+
 test("preserves em dashes inside pre and quoted blocks", () => {
   const r = stripProseDashes("Outside — strip.\n<pre>a—b</pre>\n>>> quoted — keep");
   expect(r.clean).toBe("Outside, strip.\n<pre>a—b</pre>\n>>> quoted — keep");
