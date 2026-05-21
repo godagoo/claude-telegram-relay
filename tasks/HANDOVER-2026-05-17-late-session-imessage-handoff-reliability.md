@@ -1,8 +1,8 @@
 # Handover: Late Session iMessage Handoff Reliability Fixes
 
-Date: 2026-05-17  
-Project: `/Users/williamregan/Projects/claude-telegram-relay`  
-Branch: `relay/anesthesia-corpus-portability`  
+Date: 2026-05-17
+Project: `/Users/williamregan/Projects/claude-telegram-relay`
+Branch: `relay/anesthesia-corpus-portability`
 Remote: `https://github.com/wregan599-jpg/claude-telegram-relay.git`
 
 ## Executive Summary
