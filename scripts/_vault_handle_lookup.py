@@ -11,7 +11,8 @@ to message-text search. Per-contact notes live at:
 that may include `handle:` (phone in E.164 or an email). This helper:
 
     1. slugifies the user-typed alias (lowercase, kebab, strip punctuation)
-    2. opens 02-Cross-Project/people/<slug>.md
+    2. opens 02-Cross-Project/people/<slug>.md, or a single unique
+       02-Cross-Project/people/<slug>-*.md full-name note
     3. parses just enough of the frontmatter to extract `handle`
     4. prints the handle (or empty string) to stdout
 
@@ -20,8 +21,9 @@ the message-text path."
 
 Intentionally minimal:
     - no external YAML dependency (we parse a single string field)
-    - no fuzzy matching (audit asked for simplest deterministic fallback
-      first); users who want fuzzy lookup can add multiple slug files
+    - no fuzzy matching; the only fallback beyond exact slug is a unique
+      filename-prefix match so writer-created `conor-mcgrath.md` can satisfy
+      a later "Conor" lookup without guessing among multiple Conors
     - no local-search or local-rag MCP usage (those are Claude-session
       tools, not callable from the relay subprocess runtime)
 """
@@ -90,15 +92,34 @@ def _read_frontmatter_handle(path: Path) -> str:
     return ""
 
 
+def _single_unique_prefix_match(people_dir: Path, slug: str) -> Path | None:
+    """Return one <slug>-*.md file only when the prefix is unambiguous."""
+    try:
+        candidates = sorted(
+            path
+            for path in people_dir.glob(f"{slug}-*.md")
+            if path.is_file() and path.stem.startswith(f"{slug}-")
+        )
+    except OSError:
+        return None
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
 def lookup(alias: str) -> str:
     if not alias.strip():
         return ""
     slug = slugify(alias)
     if not slug:
         return ""
-    path = _vault_root() / PEOPLE_SUBPATH / f"{slug}.md"
+    people_dir = _vault_root() / PEOPLE_SUBPATH
+    path = people_dir / f"{slug}.md"
     if not path.exists():
-        return ""
+        prefix_match = _single_unique_prefix_match(people_dir, slug)
+        if not prefix_match:
+            return ""
+        path = prefix_match
     return _read_frontmatter_handle(path)
 
 

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
+import { writeRelayVaultArtifacts } from "./vault-writer";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 const HELPER = join(PROJECT_ROOT, "scripts", "_vault_handle_lookup.py");
@@ -54,6 +55,55 @@ Recent threads...
     const result = await runLookup("Conor", root);
     expect(result.code).toBe(0);
     expect(result.stdout).toBe("+15551234567");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("vault lookup finds a writer-created full-name note by unique first-name alias", async () => {
+  const root = await setupVault();
+  try {
+    await writeRelayVaultArtifacts(
+      {
+        draftId: "550e8400-e29b-41d4-a716-446655440000",
+        contactDisplayName: "Conor McGrath",
+        contactHandle: "+15551234567",
+        userInstruction: "tell him Saturday works",
+        draftBody: "Saturday works, what time were you thinking",
+        contextMessages: [],
+      },
+      { vaultRoot: root, now: new Date("2026-05-21T14:23:05.000Z") },
+    );
+
+    const result = await runLookup("Conor", root);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("+15551234567");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("vault lookup refuses ambiguous first-name prefix matches", async () => {
+  const root = await setupVault();
+  try {
+    await writeFile(
+      join(root, "02-Cross-Project", "people", "conor-mcgrath.md"),
+      `---
+handle: +15551234567
+---
+`,
+    );
+    await writeFile(
+      join(root, "02-Cross-Project", "people", "conor-smith.md"),
+      `---
+handle: +15557654321
+---
+`,
+    );
+
+    const result = await runLookup("Conor", root);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
