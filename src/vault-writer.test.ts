@@ -60,7 +60,7 @@ test("slugifyContact falls back to a stable string when input has no alphanumeri
 test("formatPerThreadEntry includes instruction, context, draft, and metadata", () => {
   const entry = formatPerThreadEntry(sampleInput(), FIXED_NOW);
   expect(entry).toContain("## ");
-  expect(entry).toContain("— draft staged");
+  expect(entry).toContain(" draft staged");
   expect(entry).toContain("Draft id");
   expect(entry).toContain(SAMPLE_DRAFT_ID);
   expect(entry).toContain("+15551234567");
@@ -99,7 +99,7 @@ test("buildPerThreadFileInitial emits frontmatter + heading + first entry", () =
   expect(content).toContain('contact: "Conor McGrath"');
   expect(content).toContain('handle: "+15551234567"');
   expect(content).toContain('last_updated: "2026-05-21"');
-  expect(content).toContain("# iMessage thread — Conor McGrath — 2026-05-21");
+  expect(content).toContain("# iMessage thread: Conor McGrath (2026-05-21)");
   expect(content).toContain("Saturday works");
 });
 
@@ -119,7 +119,7 @@ test("formatContactSummaryUpdate creates fresh note with frontmatter when no exi
   expect(content).toContain('name: "contact-conor-mcgrath"');
   expect(content).toContain("# Conor McGrath");
   expect(content).toContain("## Recent Threads");
-  expect(content).toContain("- [[2026-05-21|2026-05-21 — conor-mcgrath]]");
+  expect(content).toContain("- [[2026-05-21|2026-05-21 conor-mcgrath]]");
   expect(content).toContain("## Topics");
   expect(content).toContain("- 2026-05-21: tell him I can do Saturday");
 });
@@ -145,7 +145,7 @@ test("formatContactSummaryUpdate deduplicates Recent Threads on the same day", (
   const first = formatContactSummaryUpdate(sampleInput(), FIXED_NOW);
   const updated = formatContactSummaryUpdate(sampleInput(), FIXED_NOW, first);
   // The wikilink should appear exactly once even after two invocations.
-  const matches = updated.match(/\[\[2026-05-21\|2026-05-21 — conor-mcgrath\]\]/g);
+  const matches = updated.match(/\[\[2026-05-21\|2026-05-21 conor-mcgrath\]\]/g);
   expect(matches).not.toBeNull();
   expect(matches!.length).toBe(1);
 });
@@ -154,8 +154,8 @@ test("formatContactSummaryUpdate adds a new Recent Threads entry for a new day",
   const first = formatContactSummaryUpdate(sampleInput(), FIXED_NOW);
   const tomorrow = new Date("2026-05-22T10:00:00.000Z");
   const updated = formatContactSummaryUpdate(sampleInput(), tomorrow, first);
-  expect(updated).toContain("[[2026-05-21|2026-05-21 — conor-mcgrath]]");
-  expect(updated).toContain("[[2026-05-22|2026-05-22 — conor-mcgrath]]");
+  expect(updated).toContain("[[2026-05-21|2026-05-21 conor-mcgrath]]");
+  expect(updated).toContain("[[2026-05-22|2026-05-22 conor-mcgrath]]");
 });
 
 test("formatContactSummaryUpdate bumps last_updated in existing frontmatter", () => {
@@ -234,7 +234,7 @@ test("writeRelayVaultArtifacts appends to per-thread file on second same-day inv
 
     const perThread = await readFile(second.perThreadPath!, "utf8");
     // Both invocation sections present
-    const sectionHeadings = perThread.match(/## \d{2}:\d{2}:\d{2} — draft staged/g);
+    const sectionHeadings = perThread.match(/## \d{2}:\d{2}:\d{2} draft staged/g);
     expect(sectionHeadings).not.toBeNull();
     expect(sectionHeadings!.length).toBe(2);
     // Both bodies present
@@ -315,8 +315,8 @@ test("writeRelayVaultArtifacts updates the contact summary in place across days"
     const summaryPath = join(vaultRoot, "02-Cross-Project", "people", "conor-mcgrath.md");
     const summary = await readFile(summaryPath, "utf8");
     expect(summary).toContain('last_updated: "2026-05-22"');
-    expect(summary).toContain("[[2026-05-21|2026-05-21 — conor-mcgrath]]");
-    expect(summary).toContain("[[2026-05-22|2026-05-22 — conor-mcgrath]]");
+    expect(summary).toContain("[[2026-05-21|2026-05-21 conor-mcgrath]]");
+    expect(summary).toContain("[[2026-05-22|2026-05-22 conor-mcgrath]]");
     expect(summary).toContain("- 2026-05-21: tell him I can do Saturday");
     expect(summary).toContain("- 2026-05-22: ask if she got the slides");
   } finally {

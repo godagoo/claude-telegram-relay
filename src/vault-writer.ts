@@ -136,7 +136,7 @@ export function formatPerThreadEntry(
   now: Date,
 ): string {
   const lines: string[] = [];
-  lines.push(`## ${localTimeOfDay(now)} — draft staged`);
+  lines.push(`## ${localTimeOfDay(now)} draft staged`);
   lines.push("");
   lines.push(`- **Draft id:** \`${input.draftId}\``);
   lines.push(`- **Handle:** ${input.contactHandle || "(unresolved)"}`);
@@ -179,7 +179,7 @@ export function buildPerThreadFileInitial(
     handle: input.contactHandle || "",
     last_updated: isoDate(now),
   });
-  const heading = `# iMessage thread — ${input.contactDisplayName || input.contactHandle} — ${isoDate(now)}\n\n`;
+  const heading = `# iMessage thread: ${input.contactDisplayName || input.contactHandle} (${isoDate(now)})\n\n`;
   return `${frontmatter}${heading}${formatPerThreadEntry(input, now)}`;
 }
 
@@ -208,7 +208,7 @@ export function formatContactSummaryUpdate(
 ): string {
   const slug = input.contactSlug ?? slugifyContact(input.contactDisplayName || input.contactHandle);
   const today = isoDate(now);
-  const recentThreadWikilink = `[[${today}|${today} — ${slug}]]`;
+  const recentThreadWikilink = `[[${today}|${today} ${slug}]]`;
   const topicLine = `- ${today}: ${trimToOneLine(input.userInstruction, 200)}`;
 
   if (!existing) {
