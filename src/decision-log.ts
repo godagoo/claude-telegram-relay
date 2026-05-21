@@ -40,6 +40,17 @@ export interface DecisionRecord {
   imessage_context_status?: "found" | "empty" | "fda_denied" | "error" | "timeout";
   imessage_context_count?: number;
   imessage_context_contact?: string;
+  /**
+   * Resolved iMessage recipient (phone or email), display name from
+   * AddressBook, and raw chat.db `date` value used for recency
+   * tie-breaking. Populated when imessage_context_status is "found"
+   * with a resolved handle. Together with imessage_context_contact
+   * (the user-typed alias), these prove which ambiguous duplicate the
+   * relay actually picked. PR3.5 audit #6 (Codex 2026-05-21).
+   */
+  imessage_resolved_recipient?: string;
+  imessage_resolved_display_name?: string;
+  imessage_resolved_last_messaged_at?: number;
   imessage_draft_status?:
     | "placed"
     | "staging_handoff_sent"
