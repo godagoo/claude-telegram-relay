@@ -40,6 +40,13 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Allow `from _phone_handle_variants import phone_handle_variants` when this
+# script is run directly. Both this resolver and scripts/imessage-thread.sh
+# share that helper so the chat.db candidate set is identical across the
+# Python and bash callers (PR3.5 audit #2, Codex 2026-05-21).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _phone_handle_variants import phone_handle_variants  # noqa: E402
+
 # Lower than ratio() < 0.75 misses obvious typos (e.g. "gailene" vs "Gaileen"
 # scores 0.857). Higher than 0.80 starts gating legit nicknames. 0.75 is the
 # sweet spot. Keep in lockstep with tests/scripts that depend on this.
@@ -167,33 +174,52 @@ def tokens(c: dict) -> list[str]:
     return out
 
 
+def _messages_db_path() -> Path:
+    """Return the chat.db path, honoring RELAY_MESSAGES_DB_PATH for tests.
+    Matches the staging helper's env-override pattern (PR3.5 audit #2)."""
+    override = os.environ.get("RELAY_MESSAGES_DB_PATH", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / "Library" / "Messages" / "chat.db"
+
+
 def _most_recent_message_date(identifier: str) -> int:
-    """Max(date) in `~/Library/Messages/chat.db` for any 1:1 chat whose
-    chat_identifier matches `identifier` (with or without leading '+', and
-    with the common '+1<naked>' US-prefix variant). Returns 0 if no messages
-    or the DB is unreadable. Used to break ties when multiple address-book
-    contacts share a name (e.g. multiple "Mark"s) — the one the user has
+    """Max(date) in chat.db for any 1:1 chat whose chat_identifier matches
+    any canonical variant of `identifier`. Returns 0 if no messages or the
+    DB is unreadable. Used to break ties when multiple address-book
+    contacts share a name (e.g. multiple "Mark"s); the one the user has
     actually been messaging wins.
+
+    PR3.5 audit #2 (Codex 2026-05-21): the previous candidate set
+    (identifier, +naked, naked, +1naked) was both incomplete (missing the
+    bare 10-digit form for an 11-digit input) and malformed (+1<naked>
+    becomes "+1<already-1-prefixed>" when naked starts with "1"). The
+    shared phone_handle_variants() helper produces the same set
+    imessage-thread.sh uses, so the recency lookup and the downstream
+    chat_identifier match agree on which row to pick.
     """
     if not identifier:
         return 0
-    naked = identifier.lstrip("+")
-    db_path = Path.home() / "Library" / "Messages" / "chat.db"
+    variants = phone_handle_variants(identifier)
+    if not variants:
+        return 0
+    db_path = _messages_db_path()
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=4.0)
     except sqlite3.Error:
         return 0
     try:
+        placeholders = ",".join(["?"] * len(variants))
         cur = conn.execute(
-            """
+            f"""
             SELECT MAX(m.date)
             FROM message m
             JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
             JOIN chat c ON c.ROWID = cmj.chat_id
-            WHERE c.chat_identifier IN (?, ?, ?, ?)
+            WHERE c.chat_identifier IN ({placeholders})
               AND c.chat_identifier NOT LIKE 'chat%'
             """,
-            (identifier, f"+{naked}", naked, f"+1{naked}"),
+            variants,
         )
         row = cur.fetchone()
         return int(row[0] or 0)

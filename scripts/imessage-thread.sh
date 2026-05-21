@@ -85,49 +85,25 @@ PY
 }
 
 chat_identifier_candidates_sql() {
-  local identifier="$1"
-  local digits without_country candidate seen already out
-  local -a candidates unique
-
-  candidates=("$identifier")
-
-  if [[ "$identifier" != *"@"* ]]; then
-    digits="$(printf "%s" "$identifier" | tr -cd '0-9')"
-    if [[ -n "$digits" ]]; then
-      candidates+=("$digits" "+$digits")
-      if [[ ${#digits} -eq 10 ]]; then
-        candidates+=("1$digits" "+1$digits")
-      elif [[ ${#digits} -eq 11 && "$digits" == 1* ]]; then
-        without_country="${digits#1}"
-        candidates+=("$without_country" "+$without_country")
-      fi
-    fi
-  fi
-
-  unique=()
-  for candidate in "${candidates[@]}"; do
-    [[ -n "$candidate" ]] || continue
-    already=0
-    if (( ${#unique[@]} > 0 )); then
-      for seen in "${unique[@]}"; do
-        if [[ "$seen" == "$candidate" ]]; then
-          already=1
-          break
-        fi
-      done
-    fi
-    (( already == 0 )) && unique+=("$candidate")
-  done
+  # Single source of truth lives in scripts/_phone_handle_variants.py so this
+  # script and resolve-contact.py see the same candidate set. The previous
+  # in-bash expansion produced a different set than resolve-contact.py's
+  # (identifier, +naked, naked, +1naked) tuple, which let the recency
+  # tie-breaker miss the chat row whose chat_identifier happened to use a
+  # variant only one side checked. PR3.5 audit #2 (Codex 2026-05-21).
+  local identifier="$1" candidate out
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  local helper="$script_dir/_phone_handle_variants.py"
 
   out=""
-  if (( ${#unique[@]} > 0 )); then
-    for candidate in "${unique[@]}"; do
-      if [[ -n "$out" ]]; then
-        out+=", "
-      fi
-      out+="'$(sql_string "$candidate")'"
-    done
-  fi
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if [[ -n "$out" ]]; then
+      out+=", "
+    fi
+    out+="'$(sql_string "$candidate")'"
+  done < <("$PYTHON3" "$helper" "$identifier")
   printf "%s" "$out"
 }
 
