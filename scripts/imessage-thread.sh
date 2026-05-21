@@ -249,6 +249,24 @@ PY
     return 66
   fi
 
+  # Vault frontmatter fallback (PR3.5 #4, Codex 2026-05-21).
+  # When AddressBook returns no match, consult per-contact notes at
+  #   $RELAY_OBSIDIAN_VAULT_DIR/02-Cross-Project/people/<slug>.md
+  # for a `handle:` frontmatter field. This is the user's deterministic
+  # contact layer; aliases are maintained as filenames so a lookup is
+  # an exact slug match. The helper exits silently when no note exists.
+  local vault_helper="$script_dir/_vault_handle_lookup.py"
+  if [[ -x "$vault_helper" ]]; then
+    local vault_handle
+    vault_handle="$("$PYTHON3" "$vault_helper" "$input" 2>/dev/null)"
+    if [[ -n "$vault_handle" ]]; then
+      RESOLVED_DISPLAY_NAME="$input"
+      RESOLVED_LAST_MESSAGED_AT="0"
+      printf "%s" "$vault_handle"
+      return 0
+    fi
+  fi
+
   if ! allow_message_text_fallback "$input"; then
     return 0
   fi
