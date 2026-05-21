@@ -1178,13 +1178,17 @@ bot.on("message:text", async (ctx) => {
     let imessageDraftShortcutUrl: string | undefined;
     let imessageDraftId: string | undefined;
     // PR 3 (Option D vault writer): the relay records every staged draft to
-    // the user's Obsidian vault. The write is fire-and-forget after staging
-    // success, so the decision record only captures that the attempt was
-    // made and the draft id used for correlation. Result paths land in the
-    // console log instead because the write may still be in flight when the
-    // record is appended.
+    // the user's Obsidian vault. The write is fire-and-forget AFTER the
+    // Telegram reply has been sent — staging success queues the input here,
+    // and the actual write fires below, after sendTelegramResponse and
+    // markUpdateSentAndRemember resolve. This matches the contract in
+    // src/vault-writer.ts and ensures a slow disk write can never delay or
+    // perturb the reply path. PR3.5 audit #8-timing (Codex 2026-05-21).
     let vaultWriteAttempted = false;
     let vaultDraftId: string | undefined;
+    let pendingVaultWriteInput:
+      | Parameters<typeof writeRelayVaultArtifacts>[0]
+      | null = null;
     if (shouldClarifyMissingIMessageBody) {
       imessageDraftStatus = imessageContextResult?.resolvedRecipient
         ? "empty_body"
@@ -1293,17 +1297,17 @@ bot.on("message:text", async (ctx) => {
             console.log(
               `[imessage-draft] staging_handoff_sent for ${contactLabel} (${resolved}) draft_id=${staged.draftId ?? "unknown"} payload_sha256=${staged.payloadSha256 ?? "unknown"}`,
             );
-            // Fire-and-forget vault write (Option D full indexing). Happens
-            // alongside the rest of post-send work so a slow disk write never
-            // delays the Telegram reply. Errors land in console only; the
-            // decision log records only that the attempt was made, never the
-            // body. See src/vault-writer.ts.
+            // Queue the vault write input. The actual write fires AFTER
+            // sendTelegramResponse and markUpdateSentAndRemember below, so a
+            // slow disk write cannot delay or perturb the Telegram reply.
+            // See src/vault-writer.ts (Option D full indexing) — its
+            // docstring is the contract this defers to. PR3.5 audit #8.
             vaultWriteAttempted = true;
             vaultDraftId = staged.draftId;
             const vaultContextMessages = (imessageContextResult?.messages ?? []).map(
               (m) => ({ ts: m.ts, sender: m.sender, text: m.text }),
             );
-            void writeRelayVaultArtifacts({
+            pendingVaultWriteInput = {
               draftId: staged.draftId ?? "",
               contactDisplayName:
                 imessageContextResult?.resolvedDisplayName ?? contactLabel,
@@ -1311,24 +1315,7 @@ bot.on("message:text", async (ctx) => {
               userInstruction: text,
               draftBody: body,
               contextMessages: vaultContextMessages,
-            })
-              .then((r) => {
-                if (r.ok) {
-                  console.log(
-                    `[vault-writer] ok draft_id=${staged.draftId ?? "unknown"} per_thread=${r.perThreadPath ?? "n/a"} contact=${r.contactSummaryPath ?? "n/a"} daily=${r.dailySessionPath ?? "n/a"}`,
-                  );
-                } else {
-                  console.error(
-                    `[vault-writer] partial_failure draft_id=${staged.draftId ?? "unknown"} errors=${r.errors.join("; ")}`,
-                  );
-                }
-              })
-              .catch((err) => {
-                console.error(
-                  `[vault-writer] write threw draft_id=${staged.draftId ?? "unknown"}:`,
-                  err instanceof Error ? err.message : String(err),
-                );
-              });
+            };
           } else {
             imessageDraftStatus = "helper_failed";
             imessageDraftId = staged.draftId;
@@ -1365,6 +1352,34 @@ bot.on("message:text", async (ctx) => {
       errorMsg = [errorMsg, sendResult.partialFailure].filter(Boolean).join("; ");
     }
     await markUpdateSentAndRemember(updateId);
+
+    // Vault write fires only after the reply is durably sent and remembered.
+    // Fire-and-forget so a slow disk write does not delay the rest of post-
+    // send work. PR3.5 audit #8-timing (Codex 2026-05-21) — see
+    // src/vault-writer.ts docstring for the AFTER-reply contract.
+    if (pendingVaultWriteInput) {
+      const queuedInput = pendingVaultWriteInput;
+      const correlator = queuedInput.draftId || "unknown";
+      void writeRelayVaultArtifacts(queuedInput)
+        .then((r) => {
+          if (r.ok) {
+            console.log(
+              `[vault-writer] ok draft_id=${correlator} per_thread=${r.perThreadPath ?? "n/a"} contact=${r.contactSummaryPath ?? "n/a"} daily=${r.dailySessionPath ?? "n/a"}`,
+            );
+          } else {
+            console.error(
+              `[vault-writer] partial_failure draft_id=${correlator} errors=${r.errors.join("; ")}`,
+            );
+          }
+        })
+        .catch((err) => {
+          console.error(
+            `[vault-writer] write threw draft_id=${correlator}:`,
+            err instanceof Error ? err.message : String(err),
+          );
+        });
+    }
+
     await saveMessage("assistant", sendableText);
     await appendTurn(chatId, { role: "assistant", content: sendableText, ts: new Date().toISOString() });
 
