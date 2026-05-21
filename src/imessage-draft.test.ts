@@ -76,7 +76,11 @@ test("replaceDraftBlock strips orphan markers when no pair exists", () => {
 // Messages — no thread found for galene." and Telegram showed both,
 // contradicting each other. rebuildAroundDraftBlock must discard everything
 // after the closing marker so only the relay's status reaches the user.
-test("rebuildAroundDraftBlock discards trailing hallucinated success claim", () => {
+//
+// Updated 2026-05-21 (PR3.5 #5): the lead "Here's the draft for Galene:"
+// is now also stripped, because the relay inserts its own selection line
+// above the body. The trailing placement claim was already stripped.
+test("rebuildAroundDraftBlock discards trailing hallucinated success claim AND duplicate lead", () => {
   const input = [
     "Here's the draft for Galene:",
     "",
@@ -87,19 +91,19 @@ test("rebuildAroundDraftBlock discards trailing hallucinated success claim", () 
     "Draft in the Messages compose box for Galene. Review and send when ready.",
   ].join("\n");
 
-  const hint = "Couldn't open Messages on your Mac — no thread found for galene.";
+  const hint = "Couldn't open Messages on your Mac, no thread found for galene.";
   const out = rebuildAroundDraftBlock(input, `[body]\n\n${hint}`);
 
-  expect(out).toContain("Here's the draft for Galene:");
   expect(out).toContain("[body]");
   expect(out).toContain(hint);
+  expect(out).not.toContain("Here's the draft for Galene");
   expect(out).not.toContain("Draft in the Messages compose box");
   expect(out).not.toContain("Review and send when ready");
   expect(out).not.toContain(DRAFT_MARKER_OPEN);
   expect(out).not.toContain(DRAFT_MARKER_CLOSE);
 });
 
-test("rebuildAroundDraftBlock strips placement claims from the lead too", () => {
+test("rebuildAroundDraftBlock strips placement claims AND draft-intro leads", () => {
   const input = [
     "I've placed the draft in Messages for Peggy.",
     "Here's the draft for Peggy:",
@@ -109,9 +113,11 @@ test("rebuildAroundDraftBlock strips placement claims from the lead too", () => 
   ].join("\n");
 
   const out = rebuildAroundDraftBlock(input, "[relay status]");
-  expect(out).toContain("Here's the draft for Peggy:");
-  expect(out).toContain("[relay status]");
+  // PR3.5 #5: both the "I've placed" claim and the "Here's the draft for"
+  // intro line are stripped, so the only introduction is the relay status.
+  expect(out).toBe("[relay status]");
   expect(out).not.toMatch(/I've placed the draft/i);
+  expect(out).not.toMatch(/Here's the draft for Peggy/i);
 });
 
 test("rebuildAroundDraftBlock drops an all-claim lead fragment", () => {
@@ -141,9 +147,11 @@ test("rebuildAroundDraftBlock falls back gracefully when no markers exist", () =
     "Draft is in the Messages compose box for Peggy. Review and send when ready.",
   ].join("\n");
   const out = rebuildAroundDraftBlock(input, "[status]");
-  expect(out).toContain("Here's the draft for Peggy:");
+  // PR3.5 #5: lead intro is stripped; body content survives; placement
+  // claim survives stripping. Result is "Body text." + relay status.
   expect(out).toContain("Body text.");
   expect(out).toContain("[status]");
+  expect(out).not.toContain("Here's the draft for Peggy");
   expect(out).not.toMatch(/Draft is in the Messages compose box/i);
 });
 
@@ -243,8 +251,10 @@ test("stripPlacementClaims removes 'Draft above, review and send manually' boile
     "Draft above, review and send manually.",
   ].join("\n");
   const out = stripPlacementClaims(input);
-  expect(out).toContain("Here's the draft for Conor:");
+  // PR3.5 #5: the draft-intro lead is now stripped too; only the actual
+  // body content survives. The boilerplate footer is still stripped.
   expect(out).toContain("Hope all is well, man.");
+  expect(out).not.toContain("Here's the draft for Conor");
   expect(out).not.toMatch(/Draft above/i);
   expect(out).not.toMatch(/send manually/i);
 });
@@ -818,6 +828,67 @@ test("stageIMessageDraft preserves draftId and payloadSha256 when stage helper e
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// PR3.5 audit #5 regression (Codex 2026-05-21). The relay owns the contact-
+// selection line shown above the body ("Drafting for X (Nd ago):"). If
+// Claude also writes "Here's the draft for X:" before the marker, the user
+// sees two introduction lines for the same message. The prompt is tightened
+// to forbid lead text and stripPlacementClaims now strips any remaining
+// "Here's the draft for X" leads on the lead slice used by
+// rebuildAroundDraftBlock.
+
+test("stripPlacementClaims removes a Here's-the-draft lead (PR3.5 #5)", () => {
+  expect(
+    stripPlacementClaims("Here's the draft for Conor:\n", {
+      preserveNonEmpty: false,
+    }),
+  ).toBe("");
+});
+
+test("stripPlacementClaims removes Here-is/Below-is/Drafting lead variants", () => {
+  const inputs = [
+    "Here is the draft for Sarah:",
+    "Below is the message for Mom:",
+    "Drafting note for Mark Stevens:",
+    "This is a reply to Mom:",
+    "Attached is the text for Conor:",
+  ];
+  for (const lead of inputs) {
+    expect(
+      stripPlacementClaims(lead + "\n", { preserveNonEmpty: false }).trim(),
+    ).toBe("");
+  }
+});
+
+test("stripPlacementClaims preserves body lines that look like draft-intro variants in context", () => {
+  // A line that begins with "Here's the draft for Conor:" inside the actual
+  // draft body would be stripped by this regex too — that's fine because the
+  // strip operates on the LEAD slice via rebuildAroundDraftBlock, not the
+  // marker-enclosed body. This test guards a different shape: legitimate
+  // body content that mentions "draft" without the intro framing.
+  const body = "I should draft a longer message for the meeting.";
+  expect(stripPlacementClaims(body)).toBe(body);
+});
+
+test("rebuildAroundDraftBlock drops a 'Here's the draft for X' lead when staging succeeds", () => {
+  const input = [
+    "Here's the draft for Conor:",
+    "",
+    DRAFT_MARKER_OPEN,
+    "Saturday works, what time were you thinking",
+    DRAFT_MARKER_CLOSE,
+  ].join("\n");
+  const replacement = [
+    "Drafting for Conor McGrath (3d ago):",
+    "",
+    "Saturday works, what time were you thinking",
+  ].join("\n");
+  const result = rebuildAroundDraftBlock(input, replacement);
+  // No duplicate "Here's the draft for Conor" line survives the rebuild.
+  expect(result).not.toContain("Here's the draft for Conor");
+  // The replacement is the only introduction the user sees.
+  expect(result).toBe(replacement);
 });
 
 test("stageIMessageDraft preserves draftId and payloadSha256 on unknown helper outcome", async () => {

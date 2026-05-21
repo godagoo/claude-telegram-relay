@@ -58,6 +58,13 @@ const PLACEMENT_CLAIM_LINE_RES: RegExp[] = [
   /^[ \t]*you'?ll\s+need\s+to\s+send\s+(?:this|it|that|the\s+(?:draft|message))[^\n]*\n?/gim,
   // "Send this through your Messages app or another messaging platform."
   /^[ \t]*send\s+(?:this|it|that|the\s+(?:draft|message))\s+(?:through|via|using|directly)[^\n]*\n?/gim,
+  // PR3.5 #5 (Codex 2026-05-21): generic pre-marker draft-intro leads like
+  // "Here's the draft for Sarah:" duplicate the relay-owned selectionLine
+  // ("Drafting for Sarah (3d ago):") that the staging-success path inserts.
+  // Strip these on the lead slice so the user sees one introduction line,
+  // not two. Anchored at a known intro verb and the literal word "draft",
+  // "message", "text", or "reply" so legitimate body content survives.
+  /^[ \t]*(?:here(?:'s|\s+is|\s+are)|drafting|below\s+is|attached\s+is|this\s+is)\s+(?:a\s+|the\s+)?(?:draft|message|text|reply|note)\s+(?:for|to)\s+[^\n:]+[:.]?\s*\n?/gim,
 ];
 
 /**
