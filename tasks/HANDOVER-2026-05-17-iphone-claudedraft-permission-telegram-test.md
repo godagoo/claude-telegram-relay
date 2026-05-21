@@ -1,8 +1,8 @@
 # Claude Telegram Relay Handover - iPhone ClaudeDraft Permission + Telegram UI Test
 
-Date: 2026-05-17  
-Repo: `/Users/williamregan/Projects/claude-telegram-relay`  
-Branch: `relay/anesthesia-corpus-portability`  
+Date: 2026-05-17
+Repo: `/Users/williamregan/Projects/claude-telegram-relay`
+Branch: `relay/anesthesia-corpus-portability`
 Relevant commits:
 
 - `206d2c6 relay: fix dad handoff visibility and Barash typo retrieval`
