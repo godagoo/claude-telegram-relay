@@ -323,12 +323,12 @@ if [[ -n "$DRY_RUN_PATH" ]]; then
     emit_json true "dry_run" "" "$PAYLOAD_SHA"
     exit 0
   fi
-  emit_json false "" "dry_run_write_failed"
+  emit_json false "" "dry_run_write_failed" "$PAYLOAD_SHA"
   exit 67
 fi
 
 if ! write_icloud_draft; then
-  emit_json false "" "icloud_draft_write_failed"
+  emit_json false "" "icloud_draft_write_failed" "$PAYLOAD_SHA"
   exit 67
 fi
 
@@ -379,8 +379,8 @@ if payload_seen_after_rowid "$START_ROWID"; then
   exit 0
 fi
 if (( elapsed >= SEND_TIMEOUT_SECONDS )); then
-  emit_json false "" "osascript_timeout"
+  emit_json false "" "osascript_timeout" "$PAYLOAD_SHA"
 else
-  emit_json false "" "osascript_send_failed_${OSASCRIPT_CODE}"
+  emit_json false "" "osascript_send_failed_${OSASCRIPT_CODE}" "$PAYLOAD_SHA"
 fi
 exit 67

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# imessage-thread.sh — print the most recent iMessages with a given contact
+# imessage-thread.sh - print the most recent iMessages with a given contact
 # as JSON. Used by the bot to gather context before drafting a reply.
 #
 # Usage:
@@ -142,10 +142,6 @@ EOF
   printf "%s" "$out"
 }
 
-is_direct_identifier() {
-  [[ "$1" =~ ^[+0-9][0-9[:space:]().-]{6,}$ || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
-}
-
 allow_message_text_fallback() {
   local input_lc
   input_lc="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
@@ -170,16 +166,13 @@ allow_message_text_fallback() {
 # defaults match the pre-PR2 behavior when only a handle was available.
 RESOLVED_DISPLAY_NAME=""
 RESOLVED_LAST_MESSAGED_AT="0"
+RESOLVED_RECIPIENT=""
 
 resolve_recipient() {
   local input="$1"
+  RESOLVED_RECIPIENT=""
   RESOLVED_DISPLAY_NAME=""
   RESOLVED_LAST_MESSAGED_AT="0"
-  if is_direct_identifier "$input"; then
-    printf "%s" "$input"
-    return 0
-  fi
-
   # Primary resolver: a Python helper that searches every AddressBook source
   # database (iCloud/Exchange/CardDAV subdirs under
   # ~/Library/Application Support/AddressBook/Sources/*/) and fuzzy-matches
@@ -187,7 +180,9 @@ resolve_recipient() {
   # this Mac holds only the "me" record, which is why the old strict
   # substring query against just that DB always missed real contacts. The
   # helper handles direct identifiers, blocks relationship aliases, and
-  # returns an empty string if no good match exists.
+  # returns an empty string if no good match exists. Direct phone/email inputs
+  # intentionally go through this same --meta path so they still get normalized
+  # and carry last_messaged_at into the relay's checkpoint line and decision log.
   local script_dir
   script_dir="$(cd "$(dirname "$0")" && pwd)"
   local resolver="$script_dir/resolve-contact.py"
@@ -235,7 +230,7 @@ PY
       done <<<"$parsed_kv"
       # Defensive: if the parse glitched, fall through to fallback paths.
       if [[ -n "$handle" ]]; then
-        printf "%s" "$handle"
+        RESOLVED_RECIPIENT="$handle"
         return 0
       fi
     fi
@@ -262,7 +257,7 @@ PY
     if [[ -n "$vault_handle" ]]; then
       RESOLVED_DISPLAY_NAME="$input"
       RESOLVED_LAST_MESSAGED_AT="0"
-      printf "%s" "$vault_handle"
+      RESOLVED_RECIPIENT="$vault_handle"
       return 0
     fi
   fi
@@ -296,10 +291,10 @@ ORDER BY MAX(m.date) DESC
 LIMIT 1;
 SQL
 )"
-  sqlite_query_or_exit "$sql"
+  RESOLVED_RECIPIENT="$(sqlite_query_or_exit "$sql")"
 }
 
-RESOLVED_RECIPIENT="$(resolve_recipient "$RECIPIENT")"
+resolve_recipient "$RECIPIENT"
 if [[ -z "$RESOLVED_RECIPIENT" ]]; then
   printf '{"resolved":"","messages":[]}\n'
   exit 0

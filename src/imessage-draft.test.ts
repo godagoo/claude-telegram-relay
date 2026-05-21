@@ -719,6 +719,62 @@ wait "$sleep_pid"
   10_000,
 );
 
+test("stage helper includes payload hash on post-payload staging failure", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "stage-imessage-failhash-"));
+  const osascriptPath = join(dir, "fake-osascript.sh");
+
+  try {
+    await writeFile(
+      osascriptPath,
+      `#!/usr/bin/env bash
+exit 42
+`,
+    );
+    await chmod(osascriptPath, 0o755);
+
+    const proc = Bun.spawn(
+      [
+        join(PROJECT_ROOT, "scripts", "stage-imessage.sh"),
+        "+15196816391",
+        "Peggy",
+      ],
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          RELAY_OSASCRIPT_CMD: osascriptPath,
+          RELAY_IMESSAGE_STAGING_HANDLE: "+15550001111",
+          RELAY_MESSAGES_DB_PATH: join(dir, "missing-chat.db"),
+          RELAY_STAGE_IMESSAGE_WRITE_ICLOUD_DRAFT: "0",
+          RELAY_STAGE_IMESSAGE_TIMEOUT_SECONDS: "1",
+        },
+      },
+    );
+    proc.stdin?.write("failure hash body");
+    await proc.stdin?.end();
+
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    expect(stderr).toBe("");
+    expect(code).toBe(67);
+    const envelope = JSON.parse(stdout);
+    expect(envelope).toMatchObject({
+      ok: false,
+      recipient: "+15196816391",
+    });
+    expect(envelope.reason).toMatch(/^osascript_(timeout|send_failed_42)$/);
+    expect(envelope.payload_sha256).toMatch(/^[a-f0-9]{64}$/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("stage helper writes the iCloud ClaudeDraft handoff file before live staging", async () => {
   const dir = await mkdtemp(join(tmpdir(), "stage-imessage-icloud-"));
   const osascriptPath = join(dir, "fake-osascript.sh");
@@ -803,6 +859,7 @@ test("stageIMessageDraft preserves draftId when stage helper emits non-JSON stdo
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/not JSON/);
     expect(result.draftId).toMatch(UUID_RE);
+    expect(result.payloadSha256).toMatch(/^[a-f0-9]{64}$/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

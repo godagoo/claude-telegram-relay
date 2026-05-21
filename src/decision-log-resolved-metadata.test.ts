@@ -73,3 +73,26 @@ test("relay.ts populates resolved iMessage metadata from imessageContextResult",
     "imessage_resolved_last_messaged_at: imessageContextResult?.resolvedLastMessagedAt",
   );
 });
+
+test("relay.ts keeps staging payload hash on helper failure records", async () => {
+  const PROJECT_ROOT = dirname(dirname(import.meta.path));
+  const source = await readFile(join(PROJECT_ROOT, "src", "relay.ts"), "utf8");
+  const failureIdx = source.indexOf('imessageDraftStatus = "helper_failed"');
+  expect(failureIdx).toBeGreaterThanOrEqual(0);
+  const assignmentIdx = source.indexOf(
+    "imessageDraftPayloadSha256 = staged.payloadSha256",
+    failureIdx,
+  );
+  expect(assignmentIdx).toBeGreaterThan(failureIdx);
+  const logIdx = source.indexOf("imessage_draft_payload_sha256:", assignmentIdx);
+  expect(logIdx).toBeGreaterThan(assignmentIdx);
+});
+
+test("relay.ts fetches context for direct identifiers instead of synthetic bypass", async () => {
+  const PROJECT_ROOT = dirname(dirname(import.meta.path));
+  const source = await readFile(join(PROJECT_ROOT, "src", "relay.ts"), "utf8");
+  expect(source).toContain("const directIdentifierWithoutContext =");
+  expect(source).not.toContain(
+    "const imessageContextResult: IMessageContextResult | null = directResolvedRecipient",
+  );
+});

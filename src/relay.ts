@@ -957,34 +957,26 @@ bot.on("message:text", async (ctx) => {
     // Placement defaults to TRUE for any iMessage/text/SMS draft so the user
     // doesn't have to repeat "directly in the iMessage box" each time.
     const draftRequest = extractIMessageDraftRequest(text);
-    const directResolvedRecipient =
+    const directIdentifierWithoutContext =
       draftRequest?.directBody &&
       !draftRequest.wantsContext &&
-      isDirectMessageIdentifier(draftRequest.contact)
-        ? draftRequest.contact
-        : undefined;
-    const imessageContextResult: IMessageContextResult | null = directResolvedRecipient
-      ? {
-          request: {
-            contact: draftRequest!.contact,
-            limit: draftRequest!.contextLimit,
-          },
-          status: "empty",
-          messages: [],
-          resolvedRecipient: directResolvedRecipient,
-        }
-      : draftRequest
-        ? await fetchIMessageContext(PROJECT_ROOT, {
-          contact: draftRequest.contact,
-          limit: draftRequest.contextLimit,
-        })
-        : null;
+      isDirectMessageIdentifier(draftRequest.contact);
+    const imessageContextResult: IMessageContextResult | null = draftRequest
+      ? await fetchIMessageContext(PROJECT_ROOT, {
+        contact: draftRequest.contact,
+        limit: draftRequest.contextLimit,
+      })
+      : null;
+    const directResolvedRecipient = directIdentifierWithoutContext
+      ? (imessageContextResult?.resolvedRecipient ?? draftRequest?.contact)
+      : undefined;
     const wantsIMessagePlacement = draftRequest?.wantsPlacement ?? false;
     // Inject thread context for named iMessage drafts, including direct-body
     // requests like "Text Jacqueline saying ...". The supplied body is the
     // user's core meaning, not proof we should skip the user's writing rules or
     // the last 5-10 messages from the actual thread. Direct phone/email targets
-    // still bypass context because there is no safe local thread name to read.
+    // still run the helper so their handle is normalized and recency metadata
+    // reaches the checkpoint line, but they bypass prompt context injection.
     //
     // Previously this was gated away whenever `directBody` existed, which made
     // the relay place literal text and skip Claude entirely. Live failure
@@ -1179,7 +1171,7 @@ bot.on("message:text", async (ctx) => {
     let imessageDraftId: string | undefined;
     // PR 3 (Option D vault writer): the relay records every staged draft to
     // the user's Obsidian vault. The write is fire-and-forget AFTER the
-    // Telegram reply has been sent — staging success queues the input here,
+    // Telegram reply has been sent. Staging success queues the input here,
     // and the actual write fires below, after sendTelegramResponse and
     // markUpdateSentAndRemember resolve. This matches the contract in
     // src/vault-writer.ts and ensures a slow disk write can never delay or
@@ -1300,7 +1292,7 @@ bot.on("message:text", async (ctx) => {
             // Queue the vault write input. The actual write fires AFTER
             // sendTelegramResponse and markUpdateSentAndRemember below, so a
             // slow disk write cannot delay or perturb the Telegram reply.
-            // See src/vault-writer.ts (Option D full indexing) — its
+            // See src/vault-writer.ts (Option D full indexing). Its
             // docstring is the contract this defers to. PR3.5 audit #8.
             vaultWriteAttempted = true;
             vaultDraftId = staged.draftId;
@@ -1319,6 +1311,7 @@ bot.on("message:text", async (ctx) => {
           } else {
             imessageDraftStatus = "helper_failed";
             imessageDraftId = staged.draftId;
+            imessageDraftPayloadSha256 = staged.payloadSha256;
             assistantText = rebuildAroundDraftBlock(
               assistantText,
               `${body}\n\n(Couldn't stage this through the iMessage watcher: ${staged.error ?? "unknown error"}.)`,
@@ -1355,7 +1348,7 @@ bot.on("message:text", async (ctx) => {
 
     // Vault write fires only after the reply is durably sent and remembered.
     // Fire-and-forget so a slow disk write does not delay the rest of post-
-    // send work. PR3.5 audit #8-timing (Codex 2026-05-21) — see
+    // send work. PR3.5 audit #8-timing (Codex 2026-05-21). See
     // src/vault-writer.ts docstring for the AFTER-reply contract.
     if (pendingVaultWriteInput) {
       const queuedInput = pendingVaultWriteInput;
@@ -1385,7 +1378,7 @@ bot.on("message:text", async (ctx) => {
 
     // Background memory capture. Synchronous classification (regex match) so
     // the decision record can include the reason; the actual file write is
-    // fire-and-forget — never blocks the reply, never throws into the queue.
+    // fire-and-forget: never blocks the reply, never throws into the queue.
     const memoryCandidate = classifyMemoryCandidate({
       userText: text,
       assistantText: sendableText,
@@ -1841,7 +1834,7 @@ function buildPrompt(
     // Hard rule logged 2026-05-11 after the user asked for an iMessage and
     // an email draft. The bot must NEVER send; only draft. Full policy in
     // ~/.claude/projects/.../memory/feedback_drafts_never_send.md.
-    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft body as the body of your reply — no policy footer, no \"Draft above\", no \"send manually\", no \"review and send\", no \"I can't send for you\". The relay tells the user where the draft is; you do not need to remind them. If the user later says \"just send it\" or \"you send it\", refuse politely in one sentence and stop.",
+    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft body as the body of your reply with no policy footer, no \"Draft above\", no \"send manually\", no \"review and send\", and no \"I can't send for you\". The relay tells the user where the draft is; you do not need to remind them. If the user later says \"just send it\" or \"you send it\", refuse politely in one sentence and stop.",
     // Helper scripts the bot can invoke via its Bash tool. Documented in
     // docs/IMESSAGE-SETUP.md. The two draft helpers do NOT require Full Disk
     // Access; they drop the draft into the native compose surface and the
@@ -1878,11 +1871,11 @@ function buildPrompt(
   if (opts?.iMessageDraftContact) {
     const contact = opts.iMessageDraftContact;
     parts.push(
-      `\niMessage handoff (this message): the user wants a draft for ${contact}. The relay will handle placement after you respond by sending a structured payload to the iMessage staging thread for the Shortcut watcher. Output the iMessage body — and only the body — between the literal marker lines below, each on its own line:`,
+      `\niMessage handoff (this message): the user wants a draft for ${contact}. The relay will handle placement after you respond by sending a structured payload to the iMessage staging thread for the Shortcut watcher. Output the iMessage body, and only the body, between the literal marker lines below, each on its own line:`,
       DRAFT_MARKER_OPEN,
       "(the iMessage body)",
       DRAFT_MARKER_CLOSE,
-      `Treat any phrase after "saying", "say", or "with" in the user's message as the core meaning to preserve, not necessarily as verbatim wording. Use the injected iMessage context when present, then rewrite the body so it sounds organic, confident, warm, and human. Keep it concise enough for a real text message unless the user asks for length. Do not use hyphen, en dash, or em dash characters in the draft body. Write NOTHING before the opening marker and NOTHING after the closing marker. The relay inserts its own contact-selection line above the body (e.g. "Drafting for ${contact} (3d ago):") and a handoff status line as needed; if you also write "Here's the draft for ${contact}:" before the marker, the user sees two introduction lines for the same message. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation — the relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval — there is no approval surface in this runtime.`,
+      `Treat any phrase after "saying", "say", or "with" in the user's message as the core meaning to preserve, not necessarily as verbatim wording. Use the injected iMessage context when present, then rewrite the body so it sounds organic, confident, warm, and human. Keep it concise enough for a real text message unless the user asks for length. Do not use hyphen, en dash, or em dash characters in the draft body. Write NOTHING before the opening marker and NOTHING after the closing marker. The relay inserts its own contact-selection line above the body (e.g. "Drafting for ${contact} (3d ago):") and a handoff status line as needed; if you also write "Here's the draft for ${contact}:" before the marker, the user sees two introduction lines for the same message. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation. The relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval. There is no approval surface in this runtime.`,
     );
   }
 

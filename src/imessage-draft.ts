@@ -10,6 +10,7 @@
 // `claude -p` runtime cannot approve.
 
 import { spawn } from "bun";
+import { createHash } from "crypto";
 import { join } from "path";
 import { buildCldraftPayload } from "./cldraft-payload.ts";
 
@@ -22,6 +23,10 @@ const DRAFT_HELPER_TIMEOUT_MS = 25_000;
 const STAGE_HELPER_TIMEOUT_MS = 35_000;
 const PHONE_HANDOFF_LINE_RE =
   /\n*[ \t]*(?:Phone handoff ready|Open on iPhone)(?:\s+for\s+([^:\n]+))?:\s*(shortcuts:\/\/run-shortcut\?name=[^\s]+)\s*\n*/i;
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
 
 // Claude likes to append boilerplate after a draft: "Draft is in the Messages
 // compose box for X. Review and send when ready." or "Draft above, review
@@ -324,6 +329,7 @@ export async function stageIMessageDraft(
     label: contactLabel,
     body,
   });
+  const payloadSha256 = sha256Hex(payload);
 
   const proc = spawn([script, recipient, contactLabel], {
     stdin: "pipe",
@@ -373,12 +379,13 @@ export async function stageIMessageDraft(
       envelope = JSON.parse(stdout.trim() || "{}");
     } catch {
       // PR3.5 #3 (Codex 2026-05-21): every failure branch must carry draftId
-      // so the relay log can correlate against the staging thread and the
-      // iCloud handoff file. payloadSha256 is unavailable here (no envelope).
+      // and the locally computed payload hash so logs can correlate even when
+      // the shell helper exits before emitting a usable JSON envelope.
       return {
         ok: false,
         error: `stage helper stdout was not JSON: ${stdout.slice(0, 120)}`,
         draftId,
+        payloadSha256,
       };
     }
 
@@ -387,7 +394,7 @@ export async function stageIMessageDraft(
         ok: false,
         error: envelope.reason ?? (stderr.trim() || `stage helper exited ${code}`),
         draftId,
-        payloadSha256: envelope.payload_sha256,
+        payloadSha256: envelope.payload_sha256 ?? payloadSha256,
       };
     }
 
@@ -395,7 +402,7 @@ export async function stageIMessageDraft(
       return {
         ok: true,
         mode: "staging_imessage",
-        payloadSha256: envelope.payload_sha256,
+        payloadSha256: envelope.payload_sha256 ?? payloadSha256,
         draftId,
       };
     }
@@ -403,7 +410,7 @@ export async function stageIMessageDraft(
       return {
         ok: true,
         mode: "staging_imessage",
-        payloadSha256: envelope.payload_sha256,
+        payloadSha256: envelope.payload_sha256 ?? payloadSha256,
         draftId,
       };
     }
@@ -411,7 +418,7 @@ export async function stageIMessageDraft(
       ok: false,
       error: envelope.reason ?? "unknown stage helper outcome",
       draftId,
-      payloadSha256: envelope.payload_sha256,
+      payloadSha256: envelope.payload_sha256 ?? payloadSha256,
     };
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);
@@ -419,6 +426,7 @@ export async function stageIMessageDraft(
       ok: false,
       error: err instanceof Error ? err.message : String(err),
       draftId,
+      payloadSha256,
     };
   }
 }

@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
 import { dirname, join } from "path";
 import {
   detectIMessageWriteIntent,
@@ -11,6 +13,50 @@ import {
 } from "./imessage-context";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
+
+async function buildTempMessagesHome(
+  rows: Array<{
+    chatIdentifier: string;
+    date: number;
+    isFromMe: 0 | 1;
+    text: string;
+  }>,
+): Promise<string> {
+  const home = await mkdtemp(join(tmpdir(), "imessage-thread-home-"));
+  const messagesDir = join(home, "Library", "Messages");
+  await mkdir(messagesDir, { recursive: true });
+  const dbPath = join(messagesDir, "chat.db");
+  const sqlStmts = [
+    "CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT);",
+    "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, date INTEGER, is_from_me INTEGER, text TEXT, attributedBody BLOB, associated_message_type INTEGER);",
+    "CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);",
+  ];
+  rows.forEach((row, i) => {
+    const id = i + 1;
+    const chat = row.chatIdentifier.replace(/'/g, "''");
+    const text = row.text.replace(/'/g, "''");
+    sqlStmts.push(`INSERT INTO chat (ROWID, chat_identifier) VALUES (${id}, '${chat}');`);
+    sqlStmts.push(
+      `INSERT INTO message (ROWID, date, is_from_me, text, attributedBody, associated_message_type) VALUES (${id}, ${row.date}, ${row.isFromMe}, '${text}', NULL, 0);`,
+    );
+    sqlStmts.push(`INSERT INTO chat_message_join (chat_id, message_id) VALUES (${id}, ${id});`);
+  });
+  const proc = Bun.spawn(["sqlite3", dbPath], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin?.write(sqlStmts.join("\n"));
+  await proc.stdin?.end();
+  const [, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  expect(stderr).toBe("");
+  expect(code).toBe(0);
+  return home;
+}
 
 test("extracts contact, context flag, and placement flag from a full context+placement request", () => {
   expect(
@@ -592,6 +638,48 @@ test("imessage-thread helper rejects non-numeric LIMIT before touching chat.db",
   expect(code).toBe(64);
   expect(stdout).toBe("");
   expect(stderr).toContain("LIMIT must be a positive integer");
+});
+
+test("imessage-thread helper keeps resolver metadata for direct phone identifiers", async () => {
+  const appleDate = 200_000_000_000_000_000;
+  const home = await buildTempMessagesHome([
+    {
+      chatIdentifier: "6043154583",
+      date: appleDate,
+      isFromMe: 0,
+      text: "direct phone context row",
+    },
+  ]);
+  try {
+    const proc = Bun.spawn(
+      [join(PROJECT_ROOT, "scripts", "imessage-thread.sh"), "6043154583", "1"],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          HOME: home,
+          RELAY_MESSAGES_DB_PATH: join(home, "Library", "Messages", "chat.db"),
+          RELAY_CONTACT_ALIASES_PATH: "/nonexistent/contact-aliases.json",
+        },
+      },
+    );
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.resolved).toBe("+16043154583");
+    expect(parsed.last_messaged_at).toBe(appleDate);
+    expect(parsed.messages[0].text).toBe("direct phone context row");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("iMessage normalizer decodes attributedBody rows before stale text rows", async () => {
