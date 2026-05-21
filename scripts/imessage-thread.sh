@@ -235,40 +235,28 @@ PY
   fi
 
   # Call the resolver in --meta mode so we capture display_name and
-  # last_messaged_at alongside the handle. Parse the single-line JSON via
-  # Python (the same interpreter that produced it) to avoid pulling jq into
-  # the runtime dependency surface.
-  local meta_output err_file
+  # last_messaged_at alongside the handle. Parse the JSON via a dedicated
+  # helper that emits newline-delimited key=value pairs; bash reads those
+  # with `IFS='='`, which (unlike the previous IFS=$'\t' approach) preserves
+  # empty fields. PR3.5 audit #1 (Codex 2026-05-21).
+  local meta_output err_file emitter
+  emitter="$script_dir/_resolver-meta-emit-kv.py"
   err_file="$(mktemp "${TMPDIR:-/tmp}/resolve-contact.XXXXXX")"
   if meta_output="$("$PYTHON3" "$resolver" --meta "$input" 2>"$err_file")"; then
     rm -f "$err_file"
     if [[ -n "$meta_output" ]]; then
-      local parsed_tsv
-      parsed_tsv="$(META_JSON="$meta_output" "$PYTHON3" - <<'PY'
-import json
-import os
-import sys
-
-try:
-    data = json.loads(os.environ.get("META_JSON", "{}") or "{}")
-except json.JSONDecodeError:
-    data = {}
-handle = data.get("handle", "") or ""
-display_name = data.get("display_name", "") or ""
-try:
-    last_messaged_at = int(data.get("last_messaged_at", 0) or 0)
-except (TypeError, ValueError):
-    last_messaged_at = 0
-# Tab-separated so bash can split on \t. Display names from AddressBook do
-# not contain tabs in practice; we strip any defensively below.
-sys.stdout.write(
-    f"{handle}\t{display_name.replace(chr(9), ' ')}\t{last_messaged_at}\n"
-)
-PY
-)"
-      local handle
-      IFS=$'\t' read -r handle RESOLVED_DISPLAY_NAME RESOLVED_LAST_MESSAGED_AT \
-        <<<"$parsed_tsv"
+      local parsed_kv
+      parsed_kv="$("$PYTHON3" "$emitter" "$meta_output")"
+      local handle=""
+      RESOLVED_DISPLAY_NAME=""
+      RESOLVED_LAST_MESSAGED_AT="0"
+      while IFS='=' read -r kv_key kv_value; do
+        case "$kv_key" in
+          handle) handle="$kv_value" ;;
+          display_name) RESOLVED_DISPLAY_NAME="$kv_value" ;;
+          last_messaged_at) RESOLVED_LAST_MESSAGED_AT="$kv_value" ;;
+        esac
+      done <<<"$parsed_kv"
       # Defensive: if the parse glitched, fall through to fallback paths.
       if [[ -n "$handle" ]]; then
         printf "%s" "$handle"
