@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import {
@@ -10,9 +10,23 @@ import {
   formatPhoneHandoffForTelegram,
   rebuildAroundDraftBlock,
   replaceDraftBlock,
+  stageIMessageDraft,
   stripPlacementClaims,
 } from "./imessage-draft";
 import { stripProseDashes } from "./response-sanitize";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function writeFakeStageHelper(
+  root: string,
+  bodyScript: string,
+): Promise<string> {
+  await mkdir(join(root, "scripts"), { recursive: true });
+  const path = join(root, "scripts", "stage-imessage.sh");
+  await writeFile(path, `#!/usr/bin/env bash\nset -eu\n${bodyScript}\n`);
+  await chmod(path, 0o755);
+  return path;
+}
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -756,5 +770,74 @@ exit 0
     expect(handoff.body_sha256).toMatch(/^[a-f0-9]{64}$/);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Regression for PR3.5 audit finding #3 (Codex 2026-05-21): stageIMessageDraft
+// dropped draftId on every failure return branch, so the relay logged
+// draft_id=unknown exactly when debugging needed the id. The fix threads
+// draftId (always) and payloadSha256 (when the helper emitted it) through
+// every return path so failed drafts remain correlatable across the relay
+// log, the iCloud handoff file, and the staging Messages thread.
+
+test("stageIMessageDraft preserves draftId when stage helper emits non-JSON stdout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "stage-draftid-nonjson-"));
+  try {
+    await writeFakeStageHelper(root, `echo 'not json at all'`);
+    const result = await stageIMessageDraft(
+      root,
+      "+15551234567",
+      "Test",
+      "body",
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/not JSON/);
+    expect(result.draftId).toMatch(UUID_RE);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stageIMessageDraft preserves draftId and payloadSha256 when stage helper exits non-zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "stage-draftid-nonzero-"));
+  try {
+    await writeFakeStageHelper(
+      root,
+      `echo '{"ok":false,"reason":"stage_failed","payload_sha256":"abc123"}'\nexit 7`,
+    );
+    const result = await stageIMessageDraft(
+      root,
+      "+15551234567",
+      "Test",
+      "body",
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("stage_failed");
+    expect(result.draftId).toMatch(UUID_RE);
+    expect(result.payloadSha256).toBe("abc123");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stageIMessageDraft preserves draftId and payloadSha256 on unknown helper outcome", async () => {
+  const root = await mkdtemp(join(tmpdir(), "stage-draftid-unknown-"));
+  try {
+    await writeFakeStageHelper(
+      root,
+      `echo '{"ok":true,"mode":"some_new_mode","payload_sha256":"def456"}'`,
+    );
+    const result = await stageIMessageDraft(
+      root,
+      "+15551234567",
+      "Test",
+      "body",
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/unknown stage helper outcome/);
+    expect(result.draftId).toMatch(UUID_RE);
+    expect(result.payloadSha256).toBe("def456");
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

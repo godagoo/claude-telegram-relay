@@ -365,9 +365,13 @@ export async function stageIMessageDraft(
     try {
       envelope = JSON.parse(stdout.trim() || "{}");
     } catch {
+      // PR3.5 #3 (Codex 2026-05-21): every failure branch must carry draftId
+      // so the relay log can correlate against the staging thread and the
+      // iCloud handoff file. payloadSha256 is unavailable here (no envelope).
       return {
         ok: false,
         error: `stage helper stdout was not JSON: ${stdout.slice(0, 120)}`,
+        draftId,
       };
     }
 
@@ -375,6 +379,8 @@ export async function stageIMessageDraft(
       return {
         ok: false,
         error: envelope.reason ?? (stderr.trim() || `stage helper exited ${code}`),
+        draftId,
+        payloadSha256: envelope.payload_sha256,
       };
     }
 
@@ -397,12 +403,15 @@ export async function stageIMessageDraft(
     return {
       ok: false,
       error: envelope.reason ?? "unknown stage helper outcome",
+      draftId,
+      payloadSha256: envelope.payload_sha256,
     };
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);
     return {
       ok: false,
       error: err instanceof Error ? err.message : String(err),
+      draftId,
     };
   }
 }
