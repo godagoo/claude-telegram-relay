@@ -806,6 +806,7 @@ exit 0
           RELAY_MESSAGES_DB_PATH: join(dir, "missing-chat.db"),
           RELAY_ICLOUD_DRAFT_DIR: draftDir,
           RELAY_STAGE_IMESSAGE_TIMEOUT_SECONDS: "1",
+          RELAY_STAGE_IMESSAGE_ICLOUD_SETTLE_SECONDS: "0",
         },
       },
     );
@@ -838,6 +839,85 @@ exit 0
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("stage helper waits after writing the iCloud handoff before live staging", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "stage-imessage-settle-"));
+  const dbPath = join(dir, "chat.db");
+  const osascriptPath = join(dir, "fake-osascript.sh");
+  const draftDir = join(dir, "drafts");
+
+  try {
+    await writeFile(
+      osascriptPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+db="$RELAY_MESSAGES_DB_PATH"
+payload="$3"
+python3 - "$db" "$payload" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("CREATE TABLE IF NOT EXISTS message (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT)")
+conn.execute("INSERT INTO message(text) VALUES (?)", (sys.argv[2],))
+conn.commit()
+PY
+sleep 30 &
+sleep_pid=$!
+trap 'kill "$sleep_pid" 2>/dev/null || true; exit 143' TERM INT
+wait "$sleep_pid"
+`,
+    );
+    await chmod(osascriptPath, 0o755);
+
+    const startedAt = Date.now();
+    const proc = Bun.spawn(
+      [
+        join(PROJECT_ROOT, "scripts", "stage-imessage.sh"),
+        "+15196816391",
+        "Peggy",
+      ],
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          RELAY_OSASCRIPT_CMD: osascriptPath,
+          RELAY_IMESSAGE_STAGING_HANDLE: "+15550001111",
+          RELAY_MESSAGES_DB_PATH: dbPath,
+          RELAY_ICLOUD_DRAFT_DIR: draftDir,
+          RELAY_STAGE_IMESSAGE_TIMEOUT_SECONDS: "10",
+          RELAY_STAGE_IMESSAGE_ICLOUD_SETTLE_SECONDS: "1",
+        },
+      },
+    );
+    proc.stdin?.write("settled body");
+    await proc.stdin?.end();
+
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(900);
+    expect(JSON.parse(stdout)).toMatchObject({
+      ok: true,
+      recipient: "+15196816391",
+      mode: "staging_imessage",
+    });
+    expect(JSON.parse(await readFile(join(draftDir, "latest.json"), "utf8"))).toMatchObject({
+      recipient: "+15196816391",
+      recipient_label: "Peggy",
+      body: "settled body",
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 10_000);
 
 // Regression for PR3.5 audit finding #3 (Codex 2026-05-21): stageIMessageDraft
 // dropped draftId on every failure return branch, so the relay logged

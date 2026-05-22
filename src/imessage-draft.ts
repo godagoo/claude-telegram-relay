@@ -20,7 +20,13 @@ export const DRAFT_MARKER_CLOSE = "<<<END_IMESSAGE_DRAFT>>>";
 const DRAFT_BLOCK_RE = /<<<IMESSAGE_DRAFT>>>([\s\S]*?)<<<END_IMESSAGE_DRAFT>>>/;
 const ORPHAN_MARKER_RE = /<<<\/?(?:END_)?IMESSAGE_DRAFT>>>/g;
 const DRAFT_HELPER_TIMEOUT_MS = 25_000;
-const STAGE_HELPER_TIMEOUT_MS = 35_000;
+// scripts/stage-imessage.sh worst-case budget:
+//   ICLOUD_SETTLE_SECONDS (default 20) + SEND_TIMEOUT_SECONDS (default 25) = 45s
+// Plus process spawn / SIGTERM overhead. Keep ~12s headroom above the shell so
+// the TS-side timeout only fires when the shell genuinely hangs without
+// emitting its JSON envelope (catastrophic case), not on routine iCloud lag.
+// If you bump either env knob, bump this constant in lockstep.
+const STAGE_HELPER_TIMEOUT_MS = 60_000;
 const PHONE_HANDOFF_LINE_RE =
   /\n*[ \t]*(?:Phone handoff ready|Open on iPhone)(?:\s+for\s+([^:\n]+))?:\s*(shortcuts:\/\/run-shortcut\?name=[^\s]+)\s*\n*/i;
 

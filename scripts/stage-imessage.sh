@@ -37,6 +37,7 @@ SEND_TIMEOUT_SECONDS="${RELAY_STAGE_IMESSAGE_TIMEOUT_SECONDS:-25}"
 ALLOW_SELF_STAGING="${RELAY_IMESSAGE_ALLOW_SELF_STAGING:-}"
 MESSAGES_DB_PATH="${RELAY_MESSAGES_DB_PATH:-$HOME/Library/Messages/chat.db}"
 WRITE_ICLOUD_DRAFT="${RELAY_STAGE_IMESSAGE_WRITE_ICLOUD_DRAFT:-1}"
+ICLOUD_SETTLE_SECONDS="${RELAY_STAGE_IMESSAGE_ICLOUD_SETTLE_SECONDS:-20}"
 ICLOUD_DRAFT_DIR="${RELAY_ICLOUD_DRAFT_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts}"
 # Pre-built payload from the TypeScript caller (src/cldraft-payload.ts). When
 # set, the script uses it verbatim and skips the legacy Python builder. The
@@ -269,6 +270,12 @@ case "$SEND_TIMEOUT_SECONDS" in
     ;;
 esac
 
+case "$ICLOUD_SETTLE_SECONDS" in
+  ''|*[!0-9]*)
+    ICLOUD_SETTLE_SECONDS=20
+    ;;
+esac
+
 if [[ -n "$PRE_BUILT_PAYLOAD" ]]; then
   # Production path: relay.ts built the CLDRAFT/1 envelope via
   # src/cldraft-payload.ts and passed it in verbatim. Single source of truth
@@ -330,6 +337,14 @@ fi
 if ! write_icloud_draft; then
   emit_json false "" "icloud_draft_write_failed" "$PAYLOAD_SHA"
   exit 67
+fi
+
+# The iPhone automation reads latest.json from iCloud Drive after the staging
+# iMessage arrives. Give iCloud a real head start so the wake-up message does
+# not beat file-provider sync and make the phone miss or read the previous
+# draft. Eight seconds was not enough for a live 2026-05-22 Jim handoff.
+if [[ "$WRITE_ICLOUD_DRAFT" != "0" && "$ICLOUD_SETTLE_SECONDS" != "0" ]]; then
+  sleep "$ICLOUD_SETTLE_SECONDS"
 fi
 
 APPLESCRIPT_PATH="$(mktemp "${TMPDIR:-/tmp}/relay-stage-imessage.XXXXXX")"

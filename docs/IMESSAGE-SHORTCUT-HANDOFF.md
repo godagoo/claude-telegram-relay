@@ -21,7 +21,11 @@ Telegram draft request
 
 This supersedes the older CloudDocs `latest.json` / `ClaudeDraft` handoff for
 manual phone launching. The same file is now written as part of the staging
-handoff, and the staging iMessage acts as the wake-up signal.
+handoff, and the staging iMessage acts as the wake-up signal. The relay waits
+before sending that wake-up signal so iCloud Drive has time to propagate
+`latest.json` to the iPhone; a live 2026-05-22 Jim handoff showed that an
+8-second head start could let the iPhone automation fire before the file was
+fresh.
 
 ## Payload Format
 
@@ -65,6 +69,17 @@ fails closed with `staging_handle_matches_recipient` if they match, because
 otherwise the target recipient would receive the CLDRAFT/1 JSON payload.
 Only set `RELAY_IMESSAGE_ALLOW_SELF_STAGING=1` for an intentional self-staging
 test.
+
+The default iCloud settle window is 20 seconds:
+
+```bash
+RELAY_STAGE_IMESSAGE_ICLOUD_SETTLE_SECONDS=20
+```
+
+Lower this only after a live iPhone test proves the compose sheet opens with
+the current body. If the staging iMessage beats iCloud Drive sync, the phone
+automation can fire and fail before `ClaudeDraft` can read the fresh
+`latest.json`; it will not retry automatically for the old staging message.
 
 The relay runs under launchd as `com.claude.telegram-relay`; on this Mac the
 responsible binary is currently:
