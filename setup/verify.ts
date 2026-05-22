@@ -22,6 +22,7 @@ import { redactBotToken } from "../src/redact-token.ts";
 import {
   bunRealpathDriftCheck,
   parseLaunchdPlistJson,
+  selectResolverPython,
 } from "./verify-checks.ts";
 import {
   buildHealthReport,
@@ -353,6 +354,7 @@ async function main() {
     let launchdPlistStandardErrorPath: string | undefined;
     let launchdEnvLogDir: string | undefined;
     let launchdEnvRelayDir: string | undefined;
+    let launchdEnvRelayPython: string | undefined;
 
     let launchdLiveStandardErrorPath: string | undefined;
     const launchdPrint = await runCommand(
@@ -390,6 +392,7 @@ async function main() {
           launchdPlistStandardErrorPath = policy.standardErrorPath;
           launchdEnvLogDir = policy.environment.RELAY_LOG_DIR;
           launchdEnvRelayDir = policy.environment.RELAY_DIR;
+          launchdEnvRelayPython = policy.environment.RELAY_PYTHON;
           policy.throttleInterval === 30
             ? pass("Launchd ThrottleInterval=30")
             : fail(`Launchd ThrottleInterval=${policy.throttleInterval ?? "unset"}, expected 30`);
@@ -827,17 +830,20 @@ print("ok")
 
     console.log(`\n${bold("  iMessage Contact Resolver")}`);
     const resolverPath = join(PROJECT_ROOT, "scripts", "resolve-contact.py");
-    // If RELAY_PYTHON is set, use it — it pins the interpreter across Terminal/launchd
-    // PATH differences. Otherwise default to python3 on the launchd-style PATH.
-    const pinnedPython = env.RELAY_PYTHON || "";
     const launchdPath = LAUNCHD_PATH;
     const resolverEnv = { ...process.env, PATH: launchdPath, HOME: homedir() };
-    const effectivePython = pinnedPython || "python3";
+    const pythonSelection = selectResolverPython({
+      launchdPython: launchdEnvRelayPython,
+      envPython: env.RELAY_PYTHON,
+    });
+    const effectivePython = pythonSelection.command;
 
-    if (pinnedPython) {
-      pass(`RELAY_PYTHON pinned: ${pinnedPython}`);
+    if (pythonSelection.source === "launchd_plist") {
+      pass(`RELAY_PYTHON pinned by launchd plist: ${effectivePython}`);
+    } else if (pythonSelection.source === "env") {
+      pass(`RELAY_PYTHON pinned by .env: ${effectivePython}`);
     } else {
-      warn("RELAY_PYTHON not set — using python3 on launchd PATH (may differ from your shell)");
+      warn("RELAY_PYTHON not set in launchd plist or .env - using python3 on launchd PATH (may differ from your shell)");
     }
 
     if (!existsSync(resolverPath)) {
@@ -866,16 +872,16 @@ print("ok")
 
     const pythonVersionCode = "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')";
     const launchdPython = await runCommand(
-      pinnedPython
-        ? [pinnedPython, "-c", pythonVersionCode]
+      pythonSelection.pinned
+        ? [effectivePython, "-c", pythonVersionCode]
         : ["/bin/sh", "-c", `command -v python3 && python3 -c ${JSON.stringify(pythonVersionCode)}`],
       { env: resolverEnv },
     );
     if (launchdPython.code === 0) {
-      pass(`${pinnedPython ? "RELAY_PYTHON" : "launchd PATH"} resolves python3: ${launchdPython.stdout.trim().replace(/\n/g, " ")}`);
+      pass(`${pythonSelection.label} resolves python3: ${launchdPython.stdout.trim().replace(/\n/g, " ")}`);
     } else {
-      fail(pinnedPython
-        ? `RELAY_PYTHON=${pinnedPython} is not executable or not found`
+      fail(pythonSelection.pinned
+        ? `${pythonSelection.label}=${effectivePython} is not executable or not found`
         : `launchd PATH cannot resolve python3 from ${launchdPath}`);
     }
 

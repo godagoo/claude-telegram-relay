@@ -2,7 +2,13 @@
 // here lets us unit-test the parsers and matchers without spinning up real
 // launchd jobs or seeding chat.db on the test host.
 
-export type FailureKind = "telegram_409" | "telegram_401" | "spawn_nul_crash";
+export type FailureKind =
+  | "telegram_409"
+  | "telegram_401"
+  | "spawn_nul_crash"
+  | "imessage_stage_timeout"
+  | "imessage_stage_failed"
+  | "imessage_markers_missing";
 
 export interface RelayLogScanHit {
   kind: FailureKind;
@@ -13,12 +19,28 @@ export interface RelayLogScanResult {
   hits: RelayLogScanHit[];
 }
 
+// Order matters: first match wins. Put the most specific pattern first so a
+// "staging helper failed ... imessage_stage_timeout_25000ms" line classifies
+// as a timeout, not the generic stage_failed.
 const FAILURE_PATTERNS: { kind: FailureKind; regex: RegExp }[] = [
   // Match the relay's own 409 log line shape; do not match arbitrary "409"
   // tokens that show up in unrelated subsystems.
   { kind: "telegram_409", regex: /Telegram\s+getUpdates\s+409/i },
   { kind: "telegram_401", regex: /Telegram[^\n]*\b401\b|getMe\b[^\n]*401|Unauthorized:\s*invalid token/i },
   { kind: "spawn_nul_crash", regex: /ERR_INVALID_ARG_VALUE.*null bytes/i },
+  // iMessage staging timeout. Scope to the relay's real log prefix so stale
+  // notes or docs mentioning these tokens do not fail verification.
+  {
+    kind: "imessage_stage_timeout",
+    regex: /\[imessage-draft\]\s+staging\s+helper\s+failed\b.*\b(?:imessage_stage_timeout_\d+ms|osascript_timeout)\b/i,
+  },
+  // Generic staging helper failure (osascript error, empty body, payload hash
+  // mismatch, etc.) emitted from src/imessage-draft.ts. Scoped to the
+  // [imessage-draft] prefix so unrelated "staging" mentions don't false-fire.
+  { kind: "imessage_stage_failed", regex: /\[imessage-draft\]\s+staging\s+helper\s+failed/i },
+  // Claude returned a response without the <<<IMESSAGE_DRAFT>>> marker block,
+  // so the relay had nothing to stage. Usually a prompt regression.
+  { kind: "imessage_markers_missing", regex: /\[imessage-draft\]\s+markers_missing\s+for/i },
 ];
 
 export function scanRelayLogForRecentFailures(
@@ -37,6 +59,47 @@ export function scanRelayLogForRecentFailures(
     }
   }
   return { hits };
+}
+
+export type ResolverPythonSource = "launchd_plist" | "env" | "path";
+
+export interface ResolverPythonSelection {
+  command: string;
+  source: ResolverPythonSource;
+  pinned: boolean;
+  label: string;
+}
+
+export function selectResolverPython(input: {
+  launchdPython?: string;
+  envPython?: string;
+}): ResolverPythonSelection {
+  const launchdPython = input.launchdPython?.trim();
+  if (launchdPython) {
+    return {
+      command: launchdPython,
+      source: "launchd_plist",
+      pinned: true,
+      label: "launchd RELAY_PYTHON",
+    };
+  }
+
+  const envPython = input.envPython?.trim();
+  if (envPython) {
+    return {
+      command: envPython,
+      source: "env",
+      pinned: true,
+      label: ".env RELAY_PYTHON",
+    };
+  }
+
+  return {
+    command: "python3",
+    source: "path",
+    pinned: false,
+    label: "launchd PATH",
+  };
 }
 
 export interface LaunchdPolicy {

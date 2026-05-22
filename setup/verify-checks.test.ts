@@ -3,6 +3,7 @@ import {
   bunRealpathDriftCheck,
   parseLaunchdPlistJson,
   scanRelayLogForRecentFailures,
+  selectResolverPython,
   type LaunchdPolicy,
 } from "./verify-checks.ts";
 
@@ -57,6 +58,58 @@ describe("scanRelayLogForRecentFailures", () => {
     );
     expect(result.hits.find((h) => h.kind === "telegram_409")).toBeUndefined();
   });
+
+  test("flags imessage staging timeout (TS-side timeout fired)", () => {
+    const result = scanRelayLogForRecentFailures(
+      "[imessage-draft] staging helper failed for Madison: imessage_stage_timeout_25000ms",
+      { lineLimit: 100 },
+    );
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0].kind).toBe("imessage_stage_timeout");
+  });
+
+  test("flags osascript_timeout as an imessage staging timeout", () => {
+    const result = scanRelayLogForRecentFailures(
+      "[imessage-draft] staging helper failed for Conor: osascript_timeout",
+      { lineLimit: 100 },
+    );
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0].kind).toBe("imessage_stage_timeout");
+  });
+
+  test("does not flag a bare imessage stage timeout token without relay log prefix", () => {
+    const result = scanRelayLogForRecentFailures(
+      "operator note: imessage_stage_timeout_25000ms happened yesterday",
+      { lineLimit: 100 },
+    );
+    expect(result.hits).toEqual([]);
+  });
+
+  test("flags markers_missing when Claude emits no draft marker block", () => {
+    const result = scanRelayLogForRecentFailures(
+      "[imessage-draft] markers_missing for Nater; resp_chars=97",
+      { lineLimit: 100 },
+    );
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0].kind).toBe("imessage_markers_missing");
+  });
+
+  test("does not double-count when both timeout and stage_failed match the same line", () => {
+    const result = scanRelayLogForRecentFailures(
+      "[imessage-draft] staging helper failed for Madison: imessage_stage_timeout_25000ms",
+      { lineLimit: 100 },
+    );
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0].kind).toBe("imessage_stage_timeout");
+  });
+
+  test("classifies bare osascript_timeout token without [imessage-draft] prefix as benign", () => {
+    const result = scanRelayLogForRecentFailures(
+      "internal note: osascript_timeout reasoning in helper README\n",
+      { lineLimit: 100 },
+    );
+    expect(result.hits).toEqual([]);
+  });
 });
 
 describe("parseLaunchdPlistJson", () => {
@@ -102,6 +155,43 @@ describe("parseLaunchdPlistJson", () => {
       JSON.stringify({ KeepAlive: true }),
     ) as LaunchdPolicy;
     expect(parsed.keepAlive).toBe(true);
+  });
+});
+
+describe("selectResolverPython", () => {
+  test("uses launchd RELAY_PYTHON before .env", () => {
+    expect(selectResolverPython({
+      launchdPython: "/opt/homebrew/bin/python3",
+      envPython: "/usr/local/bin/python3",
+    })).toEqual({
+      command: "/opt/homebrew/bin/python3",
+      source: "launchd_plist",
+      pinned: true,
+      label: "launchd RELAY_PYTHON",
+    });
+  });
+
+  test("uses .env RELAY_PYTHON when launchd has no pin", () => {
+    expect(selectResolverPython({
+      envPython: "/usr/local/bin/python3",
+    })).toEqual({
+      command: "/usr/local/bin/python3",
+      source: "env",
+      pinned: true,
+      label: ".env RELAY_PYTHON",
+    });
+  });
+
+  test("falls back to launchd PATH when no pin exists", () => {
+    expect(selectResolverPython({
+      launchdPython: " ",
+      envPython: "",
+    })).toEqual({
+      command: "python3",
+      source: "path",
+      pinned: false,
+      label: "launchd PATH",
+    });
   });
 });
 

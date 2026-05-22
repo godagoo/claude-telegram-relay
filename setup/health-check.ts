@@ -264,7 +264,7 @@ export function checkRecentErrorLog(input: {
     return [
       {
         severity: "pass",
-        message: `Recent relay error log clean (no 409/401/NUL crash) - ${input.errorLogPath}`,
+        message: `Recent relay error log clean (no telegram/crash/imessage-staging hits) - ${input.errorLogPath}`,
       },
     ];
   }

@@ -62,6 +62,43 @@ async function findBun(): Promise<string> {
   }
 }
 
+// Resolve the python3 path the user sees interactively so launchd does not
+// drift to a different interpreter on its narrower PATH.
+// Returns "" if no python3 is on the interactive PATH at setup time;
+// in that case the plist falls back to PATH-based resolution.
+async function findPython(): Promise<string> {
+  const proc = Bun.spawn(["/bin/sh", "-c", "command -v python3 2>/dev/null"], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const out = (await new Response(proc.stdout).text()).trim();
+  return out;
+}
+
+async function validatePython(path: string): Promise<{ ok: boolean; detail: string }> {
+  if (!path.startsWith("/")) {
+    return { ok: false, detail: "path must be absolute" };
+  }
+
+  const proc = Bun.spawn([
+    path,
+    "-c",
+    "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'); raise SystemExit(0 if sys.version_info >= (3, 7) else 1)",
+  ], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  const output = (stdout || stderr).trim() || `exit ${code}`;
+  return code === 0
+    ? { ok: true, detail: `python ${output}` }
+    : { ok: false, detail: output };
+}
+
 function generatePlist(opts: {
   label: string;
   script: string;
@@ -77,7 +114,11 @@ function generatePlist(opts: {
     CLAUDE_TIMEOUT_MS: "90000",
     CLAUDE_RESUME: "0",
   };
-  if (process.env.RELAY_PYTHON) env.RELAY_PYTHON = process.env.RELAY_PYTHON;
+  // Pin RELAY_PYTHON so the contact resolver runs against a stable interpreter
+  // (not whatever python3 the launchd PATH happens to surface first, which has
+  // drifted from the user's interactive shell in the past).
+  const relayPython = process.env.RELAY_PYTHON?.trim() || findPythonSync;
+  if (relayPython) env.RELAY_PYTHON = relayPython;
 
   // Auto-detect the ClaudeRelay wrapper bundle. When present (BOTH the
   // launcher executable AND the Info.plist exist — see isWrapperInstalled),
@@ -113,6 +154,7 @@ function generatePlist(opts: {
 }
 
 let findBunSync = "";
+let findPythonSync = "";
 
 interface ServiceConfig {
   label: string;
@@ -313,6 +355,27 @@ async function main() {
   }
 
   findBunSync = await findBun();
+  let pythonSource = "PATH-resolved at launchd runtime";
+  const explicitPython = process.env.RELAY_PYTHON?.trim() || "";
+  if (explicitPython) {
+    const validation = await validatePython(explicitPython);
+    if (!validation.ok) {
+      throw new Error(`RELAY_PYTHON invalid: ${validation.detail}`);
+    }
+    findPythonSync = explicitPython;
+    pythonSource = `RELAY_PYTHON (env, ${validation.detail})`;
+  } else {
+    const detectedPython = await findPython();
+    if (detectedPython) {
+      const validation = await validatePython(detectedPython);
+      if (validation.ok) {
+        findPythonSync = detectedPython;
+        pythonSource = `auto-detected, ${validation.detail}`;
+      } else {
+        pythonSource = `PATH-resolved at launchd runtime; auto-detect skipped (${validation.detail})`;
+      }
+    }
+  }
 
   // Parse --service flag
   const args = process.argv.slice(2);
@@ -325,6 +388,7 @@ async function main() {
   console.log("");
   console.log(bold("  Configure launchd Services"));
   console.log(dim(`  Bun: ${findBunSync}`));
+  console.log(dim(`  Python: ${findPythonSync || "(none; will use launchd PATH)"} [${pythonSource}]`));
   console.log(dim(`  Project: ${PROJECT_ROOT}`));
   console.log("");
 
