@@ -391,6 +391,42 @@ test("command-position drafts allow short conversational lead-ins", () => {
   });
 });
 
+test("command-position drafts allow actually lead-in with lowercase contact and question-mark body", () => {
+  expect(
+    extractIMessageDraftRequest("Actually text nater saying any word from the girl?"),
+  ).toEqual({
+    contact: "nater",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "any word from the girl?",
+  });
+});
+
+test("command-position drafts allow asking phrasing without losing placement", () => {
+  expect(
+    extractIMessageDraftRequest("Please text nater asking if he wants to fire this weekend."),
+  ).toEqual({
+    contact: "nater",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+});
+
+test("meta complaint about missing compose placement does not create a new draft", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Why didn't you write anything in Nater's iMessage chatbox like you did when we text my dad?",
+    ),
+  ).toBeNull();
+  expect(
+    extractIMessageDraftRequest(
+      "Why didn’t you write anything in Nater’s iMessage chatbox like you did when we text my dad?",
+    ),
+  ).toBeNull();
+});
+
 test("message and ping command-position recipients trigger direct drafts", () => {
   expect(
     extractIMessageDraftRequest("Message Peggy saying thanks"),

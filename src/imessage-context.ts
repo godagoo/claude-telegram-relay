@@ -112,9 +112,15 @@ const PAST_DRAFT_REFERENCE_RE =
   /\b(?:your|the|that|this|my|our|his|her|their|last|previous|previously|earlier|prior)\s+(?:draft|message|reply|response|text|imessage|sms|email|note)\s+(?:to|for|with|about)\b/i;
 const META_DRAFT_QUESTION_RE =
   /\b(?:did|have|has|had)\s+(?:you|we|i|it|claude|codex|assistant|the\s+(?:bot|relay|assistant))\s+(?:already\s+)?(?:draft|drafted|write|wrote|written|compose|composed|send|sent|shoot|shot|text|texted|message|messaged)\s+(?:(?:a|an|the|that|this|my|your|our|his|her|their|last|previous|earlier|prior)\s+)?(?:draft|message|reply|response|text|imessage|sms|email|note)\s+(?:to|for|with|about)\b/i;
+const META_PLACEMENT_FAILURE_RE =
+  /\bwhy\s+(?:didn['’]?t|did\s+not|doesn['’]?t|does\s+not|can['’]?t|cannot|couldn['’]?t|could\s+not)\s+(?:you|it|the\s+(?:bot|relay|assistant))\s+(?:write|open|put|place|drop|stage|show|populate|fill)\b[\s\S]{0,160}\b(?:imessage|messages?|chat\s*box|chatbox|compose(?:\s+(?:sheet|box))?)\b/i;
 
 function isPastDraftReference(message: string): boolean {
-  return PAST_DRAFT_REFERENCE_RE.test(message) || META_DRAFT_QUESTION_RE.test(message);
+  return (
+    PAST_DRAFT_REFERENCE_RE.test(message) ||
+    META_DRAFT_QUESTION_RE.test(message) ||
+    META_PLACEMENT_FAILURE_RE.test(message)
+  );
 }
 
 // Self-recipient: "Reply to myself saying X", "Draft a message to me",
@@ -138,7 +144,7 @@ const RELATIONSHIP_CONTACT_RE =
 const MULTI_RELATIONSHIP_CONTACT_RE =
   /\b(?:[Ww]ith|[Tt]o|[Ff]or|[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\s+(?:and|&)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
 const COMMAND_POSITION_CONTACT_RE =
-  /^\s*(?:(?:[Oo]k(?:ay)?|[Aa]lright|[Ss]ure)[,.\s]+)?(?:(?:[Pp]lease|[Pp]ls|[Cc]an you|[Cc]ould you|[Ww]ould you)\s+)?(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[a-z][a-z'\-]{1,30}(?:\s+[a-z][a-z'\-]{1,30}){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|with|about|letting|telling)\b))/;
+  /^\s*(?:(?:[Oo]k(?:ay)?|[Aa]lright|[Ss]ure|[Aa]ctually)[,.\s]+)?(?:(?:[Pp]lease|[Pp]ls|[Cc]an you|[Cc]ould you|[Ww]ould you)\s+)?(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[a-z][a-z'\-]{1,30}(?:\s+[a-z][a-z'\-]{1,30}){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|asking|ask|with|about|letting|telling)\b))/;
 
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();
@@ -172,7 +178,7 @@ function parseLimit(message: string): number {
 function cleanContact(raw: string): string {
   return raw
     .replace(/[,.!?;:]+$/g, "")
-    .replace(/\s+(for|about|letting|saying|telling)\b.*$/i, "")
+    .replace(/\s+(for|about|letting|saying|telling|asking|ask)\b.*$/i, "")
     .trim();
 }
 
