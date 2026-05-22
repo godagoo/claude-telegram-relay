@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   bunRealpathDriftCheck,
+  launchdPathDriftCheck,
   parseLaunchdPlistJson,
   scanRelayLogForRecentFailures,
   selectResolverPython,
@@ -209,5 +210,30 @@ describe("bunRealpathDriftCheck", () => {
   test("returns ok with no previous when no record exists yet (first run)", () => {
     expect(bunRealpathDriftCheck("/opt/homebrew/Cellar/bun/1.3.13/bin/bun", null))
       .toEqual({ ok: true, drifted: false });
+  });
+});
+
+describe("launchdPathDriftCheck", () => {
+  const expected = "/Users/x/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+  test("passes when plist PATH matches the helper output", () => {
+    expect(launchdPathDriftCheck(expected, expected)).toEqual({ ok: true });
+  });
+
+  test("fails when plist PATH is missing", () => {
+    expect(launchdPathDriftCheck(undefined, expected)).toEqual({
+      ok: false,
+      reason: "missing",
+      expected,
+    });
+  });
+
+  test("fails when plist PATH is stale", () => {
+    expect(launchdPathDriftCheck("/Users/x/.bun/bin:/usr/local/bin:/usr/bin:/bin", expected)).toEqual({
+      ok: false,
+      reason: "drift",
+      actual: "/Users/x/.bun/bin:/usr/local/bin:/usr/bin:/bin",
+      expected,
+    });
   });
 });

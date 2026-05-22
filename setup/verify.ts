@@ -21,8 +21,10 @@ import { tokenHash, tokenLockPath } from "../src/token-lock.ts";
 import { redactBotToken } from "../src/redact-token.ts";
 import {
   bunRealpathDriftCheck,
+  launchdPathDriftCheck,
   parseLaunchdPlistJson,
   selectResolverPython,
+  type LaunchdPolicy,
 } from "./verify-checks.ts";
 import {
   buildHealthReport,
@@ -31,6 +33,7 @@ import {
   loadTokenLockState,
   resolveRelayErrorLogPath,
 } from "./health-check.ts";
+import { launchdPath } from "./launchd-env.ts";
 import { runCommandWithTimeout } from "./process-timeout.ts";
 import { getSupabaseFeatureConfig } from "../src/supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "../src/arch-check.ts";
@@ -39,7 +42,12 @@ const PROJECT_ROOT = dirname(import.meta.dir);
 const RELAY_DIR = process.env.RELAY_DIR || join(homedir(), ".claude-relay");
 const COMMAND_TIMEOUT_MS = 10_000;
 const FETCH_TIMEOUT_MS = 10_000;
-const LAUNCHD_PATH = `${homedir()}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
+const LAUNCHD_PATH = launchdPath(homedir());
+const MANAGED_LAUNCHD_SERVICES = [
+  { name: "relay", label: "com.claude.telegram-relay" },
+  { name: "checkin", label: "com.claude.smart-checkin" },
+  { name: "briefing", label: "com.claude.morning-briefing" },
+] as const;
 
 // Colors
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
@@ -84,6 +92,41 @@ async function runCommand(
 
 function commandFailureText(result: { code: number; stdout: string; stderr: string }): string {
   return (result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`);
+}
+
+async function loadLaunchdPolicyFromPlist(
+  plistPath: string,
+): Promise<{ policy?: LaunchdPolicy; error?: string }> {
+  const plutil = await runCommand(
+    ["plutil", "-convert", "json", "-o", "-", plistPath],
+    { timeoutMs: 5_000 },
+  );
+  if (plutil.code !== 0) {
+    return { error: plutil.stderr.trim() || plutil.stdout.trim() || `exit ${plutil.code}` };
+  }
+  const policy = parseLaunchdPlistJson(plutil.stdout);
+  if (!policy) {
+    return { error: "plist JSON did not parse into a recognizable policy" };
+  }
+  return { policy };
+}
+
+function reportLaunchdPathDrift(
+  label: string,
+  serviceName: string,
+  policy: LaunchdPolicy,
+): void {
+  const drift = launchdPathDriftCheck(policy.environment.PATH, LAUNCHD_PATH);
+  if (drift.ok) {
+    pass(`${label} plist PATH matches launchdPath() helper`);
+  } else if (drift.reason === "missing") {
+    fail(`${label} plist EnvironmentVariables.PATH is unset. Re-run: bun run setup:launchd -- --service ${serviceName}`);
+  } else {
+    fail(
+      `${label} plist PATH drift: plist has \`${drift.actual}\`, expected \`${drift.expected}\`. ` +
+        `Re-run: bun run setup:launchd -- --service ${serviceName}`,
+    );
+  }
 }
 
 async function fetchJsonWithTimeout(url: string, init: RequestInit = {}): Promise<any> {
@@ -300,7 +343,9 @@ async function main() {
       join(homedir(), "Applications", "ClaudeRelay.app");
     const wrapperExecPath = wrapperPaths(wrapperAppRoot).executable;
     const wrapperInstalled = isWrapperInstalled(wrapperAppRoot);
-    const plistPath = join(homedir(), "Library", "LaunchAgents", "com.claude.telegram-relay.plist");
+    const launchAgentsDir = join(homedir(), "Library", "LaunchAgents");
+    const plistPathForLabel = (label: string) => join(launchAgentsDir, `${label}.plist`);
+    const plistPath = plistPathForLabel("com.claude.telegram-relay");
     let fdaTargetDescription = "";
     let fdaTargetWarning = "";
     {
@@ -344,7 +389,7 @@ async function main() {
 
     console.log(`\n${bold("  Services (launchd)")}`);
     let launchdRelayLoaded = false;
-    for (const label of ["com.claude.telegram-relay", "com.claude.smart-checkin", "com.claude.morning-briefing"]) {
+    for (const { label } of MANAGED_LAUNCHD_SERVICES) {
       const result = await runCommand(["launchctl", "list", label], { timeoutMs: 5_000 });
       result.code === 0 ? pass(`${label} loaded`) : warn(`${label} not loaded`);
       if (label === "com.claude.telegram-relay" && result.code === 0) {
@@ -378,49 +423,55 @@ async function main() {
 
     // launchd plist policy check (plistPath declared above with the FDA target).
     if (existsSync(plistPath)) {
-      const plutil = await runCommand(
-        ["plutil", "-convert", "json", "-o", "-", plistPath],
-        { timeoutMs: 5_000 },
-      );
-      if (plutil.code !== 0) {
-        fail(`Could not read launchd plist: ${plutil.stderr.trim() || plutil.stdout.trim()}`);
+      const loaded = await loadLaunchdPolicyFromPlist(plistPath);
+      if (loaded.error || !loaded.policy) {
+        fail(`Could not read launchd plist: ${loaded.error}`);
       } else {
-        const policy = parseLaunchdPlistJson(plutil.stdout);
-        if (!policy) {
-          fail("Launchd plist JSON did not parse into a recognizable policy");
+        const policy = loaded.policy;
+        launchdPlistStandardErrorPath = policy.standardErrorPath;
+        launchdEnvLogDir = policy.environment.RELAY_LOG_DIR;
+        launchdEnvRelayDir = policy.environment.RELAY_DIR;
+        launchdEnvRelayPython = policy.environment.RELAY_PYTHON;
+        policy.throttleInterval === 30
+          ? pass("Launchd ThrottleInterval=30")
+          : fail(`Launchd ThrottleInterval=${policy.throttleInterval ?? "unset"}, expected 30`);
+        policy.exitTimeOut === 20
+          ? pass("Launchd ExitTimeOut=20")
+          : fail(`Launchd ExitTimeOut=${policy.exitTimeOut ?? "unset"}, expected 20`);
+        if (typeof policy.keepAlive === "object") {
+          const ka = policy.keepAlive as Record<string, unknown>;
+          ka.SuccessfulExit === false && ka.Crashed === true
+            ? pass("Launchd KeepAlive = { SuccessfulExit=false, Crashed=true }")
+            : fail(`Launchd KeepAlive dict has unexpected shape: ${JSON.stringify(ka)}`);
         } else {
-          launchdPlistStandardErrorPath = policy.standardErrorPath;
-          launchdEnvLogDir = policy.environment.RELAY_LOG_DIR;
-          launchdEnvRelayDir = policy.environment.RELAY_DIR;
-          launchdEnvRelayPython = policy.environment.RELAY_PYTHON;
-          policy.throttleInterval === 30
-            ? pass("Launchd ThrottleInterval=30")
-            : fail(`Launchd ThrottleInterval=${policy.throttleInterval ?? "unset"}, expected 30`);
-          policy.exitTimeOut === 20
-            ? pass("Launchd ExitTimeOut=20")
-            : fail(`Launchd ExitTimeOut=${policy.exitTimeOut ?? "unset"}, expected 20`);
-          if (typeof policy.keepAlive === "object") {
-            const ka = policy.keepAlive as Record<string, unknown>;
-            ka.SuccessfulExit === false && ka.Crashed === true
-              ? pass("Launchd KeepAlive = { SuccessfulExit=false, Crashed=true }")
-              : fail(`Launchd KeepAlive dict has unexpected shape: ${JSON.stringify(ka)}`);
-          } else {
-            fail("Launchd KeepAlive is a boolean; expected { SuccessfulExit=false, Crashed=true } dict");
-          }
-          for (const key of ["RELAY_DIR", "RELAY_LOG_DIR"] as const) {
-            policy.environment[key]
-              ? pass(`Launchd env has ${key}=${policy.environment[key]}`)
-              : fail(`Launchd env missing ${key}`);
-          }
-          if (policy.environment.RELAY_PYTHON) {
-            pass(`Launchd env pins RELAY_PYTHON=${policy.environment.RELAY_PYTHON}`);
-          } else {
-            warn("Launchd env does not pin RELAY_PYTHON (PATH-dependent python3)");
-          }
+          fail("Launchd KeepAlive is a boolean; expected { SuccessfulExit=false, Crashed=true } dict");
         }
+        for (const key of ["RELAY_DIR", "RELAY_LOG_DIR"] as const) {
+          policy.environment[key]
+            ? pass(`Launchd env has ${key}=${policy.environment[key]}`)
+            : fail(`Launchd env missing ${key}`);
+        }
+        if (policy.environment.RELAY_PYTHON) {
+          pass(`Launchd env pins RELAY_PYTHON=${policy.environment.RELAY_PYTHON}`);
+        } else {
+          warn("Launchd env does not pin RELAY_PYTHON (PATH-dependent python3)");
+        }
+        reportLaunchdPathDrift("com.claude.telegram-relay", "relay", policy);
       }
     } else {
       warn(`launchd plist not installed at ${plistPath}`);
+    }
+
+    for (const { name, label } of MANAGED_LAUNCHD_SERVICES) {
+      if (label === "com.claude.telegram-relay") continue;
+      const path = plistPathForLabel(label);
+      if (!existsSync(path)) continue;
+      const loaded = await loadLaunchdPolicyFromPlist(path);
+      if (loaded.error || !loaded.policy) {
+        fail(`Could not read ${label} plist: ${loaded.error}`);
+      } else {
+        reportLaunchdPathDrift(label, name, loaded.policy);
+      }
     }
 
     const serviceProcessLines = processLines || await getProcessLines();
@@ -830,8 +881,7 @@ print("ok")
 
     console.log(`\n${bold("  iMessage Contact Resolver")}`);
     const resolverPath = join(PROJECT_ROOT, "scripts", "resolve-contact.py");
-    const launchdPath = LAUNCHD_PATH;
-    const resolverEnv = { ...process.env, PATH: launchdPath, HOME: homedir() };
+    const resolverEnv = { ...process.env, PATH: LAUNCHD_PATH, HOME: homedir() };
     const pythonSelection = selectResolverPython({
       launchdPython: launchdEnvRelayPython,
       envPython: env.RELAY_PYTHON,
@@ -882,7 +932,7 @@ print("ok")
     } else {
       fail(pythonSelection.pinned
         ? `${pythonSelection.label}=${effectivePython} is not executable or not found`
-        : `launchd PATH cannot resolve python3 from ${launchdPath}`);
+        : `launchd PATH cannot resolve python3 from ${LAUNCHD_PATH}`);
     }
 
     if (existsSync(resolverPath) && launchdPython.code === 0) {

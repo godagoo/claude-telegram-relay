@@ -111,6 +111,24 @@ export interface LaunchdPolicy {
   standardErrorPath: string | undefined;
 }
 
+export type LaunchdPathDriftResult =
+  | { ok: true }
+  | { ok: false; reason: "missing"; expected: string }
+  | { ok: false; reason: "drift"; actual: string; expected: string };
+
+export function launchdPathDriftCheck(
+  actualPath: string | undefined,
+  expectedPath: string,
+): LaunchdPathDriftResult {
+  if (!actualPath) {
+    return { ok: false, reason: "missing", expected: expectedPath };
+  }
+  if (actualPath !== expectedPath) {
+    return { ok: false, reason: "drift", actual: actualPath, expected: expectedPath };
+  }
+  return { ok: true };
+}
+
 export function parseLaunchdPlistJson(input: string): LaunchdPolicy | null {
   let parsed: unknown;
   try {

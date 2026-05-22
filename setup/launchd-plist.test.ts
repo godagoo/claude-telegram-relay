@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { generateRelayPlist } from "./launchd-plist.ts";
+import { launchdPath } from "./launchd-env.ts";
 
 const baseOptions = {
   label: "com.claude.telegram-relay",
@@ -10,7 +11,7 @@ const baseOptions = {
   logsDir: "/Users/x/.claude-relay/logs",
   env: {
     HOME: "/Users/x",
-    PATH: "/Users/x/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    PATH: launchdPath("/Users/x"),
     RELAY_DIR: "/Users/x/.claude-relay",
     RELAY_LOG_DIR: "/Users/x/.claude-relay/logs",
     CLAUDE_PATH: "/Users/x/.local/bin/claude",

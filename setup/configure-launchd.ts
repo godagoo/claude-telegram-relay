@@ -12,6 +12,7 @@ import { chmodSync, existsSync, mkdirSync, realpathSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 import { generateRelayPlist, type RelayPlistOptions } from "./launchd-plist.ts";
+import { launchdPath } from "./launchd-env.ts";
 import {
   WRAPPER_BUNDLE_ID,
   WRAPPER_BUNDLE_NAME,
@@ -106,7 +107,7 @@ function generatePlist(opts: {
   calendarIntervals?: { Hour: number; Minute: number }[];
 }): string {
   const env: Record<string, string> = {
-    PATH: `${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+    PATH: launchdPath(HOME),
     HOME,
     RELAY_DIR,
     RELAY_LOG_DIR: LOGS_DIR,
