@@ -21,7 +21,11 @@ export function prepareTelegramResponseText(
   fallback = DEFAULT_EMPTY_RESPONSE,
 ): string {
   const trimmed = text.trim();
-  return formatPhoneHandoffForTelegram(trimmed.length > 0 ? trimmed : fallback);
+  if (trimmed.length === 0) return fallback;
+  // Strip phone-handoff lines first, then fall back if the strip emptied
+  // the message (e.g. Claude only emitted the internal handoff sentinel).
+  const stripped = formatPhoneHandoffForTelegram(trimmed).trim();
+  return stripped.length > 0 ? stripped : fallback;
 }
 
 export function splitTelegramResponseText(

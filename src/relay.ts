@@ -12,11 +12,13 @@ import { spawn } from "bun";
 import { constants, existsSync } from "fs";
 import { writeFile, mkdir, readFile, unlink, access, open, chmod, rm } from "fs/promises";
 import { join, dirname, basename, extname } from "path";
+import * as os from "os";
 import { homedir } from "os";
 import { randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { splitPromptForClaudeCli } from "./prompt-split.ts";
+import { buildClaudeCliArgs } from "./claude-cli-args.ts";
+import { redactBotToken } from "./redact-token.ts";
 import { transcribe } from "./transcribe.ts";
 import {
   ANESTHESIA_CORPUS_INSTRUCTIONS,
@@ -42,21 +44,22 @@ import {
 } from "./query-builder.ts";
 import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
-import { sanitizeClaudeResponse } from "./response-sanitize.ts";
+import { sanitizeClaudeResponse, stripProseDashes } from "./response-sanitize.ts";
 import {
+  buildContactSelectionLine,
   extractIMessageDraftRequest,
   fetchIMessageContext,
   renderIMessageContext,
+  shouldClarifyMissingIMessageDraftBody,
   type IMessageContextResult,
 } from "./imessage-context.ts";
 import {
   DRAFT_MARKER_CLOSE,
   DRAFT_MARKER_OPEN,
-  NEW_COMPOSE_SENTINEL,
   extractDraftBody,
-  placeIMessageDraft,
   rebuildAroundDraftBlock,
   replaceDraftBlock,
+  stageIMessageDraft,
   stripPlacementClaims,
   type IMessageDraftStatus,
 } from "./imessage-draft.ts";
@@ -70,29 +73,37 @@ import {
   type DecisionRecord,
 } from "./decision-log.ts";
 import {
-  writeICloudDriveDraft,
+  clearICloudDriveDraft,
 } from "./icloud-drive-draft.ts";
-import {
-  placeIPhoneMirrorDraft,
-  shouldUseIPhoneMirrorPlacement,
-} from "./iphone-mirror-draft.ts";
 import {
   classifyMemoryCandidate,
   writeMemoryCandidate,
 } from "./memory-capture.ts";
+import { writeRelayVaultArtifacts } from "./vault-writer.ts";
 import {
   prepareTelegramResponseText,
   sendTelegramResponse,
 } from "./telegram-response.ts";
 import {
   TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
+  TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
   classifyTelegramPollingConflictError,
   formatTelegramPollingConflictHint,
   formatTelegramPollingConflictLog,
   shouldEscalateTelegramPollingConflict,
+  shouldExitAfterTelegramPollingConflict,
+  shouldPrintConflictHint,
 } from "./telegram-polling.ts";
+import {
+  acquireTokenLock,
+  isLiveRelayPid,
+  releaseTokenLock,
+  startTokenLockHeartbeat,
+  tokenLockPath,
+} from "./token-lock.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "./arch-check.ts";
+import { rotateLogIfTooLarge } from "./log-rotation.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -200,78 +211,57 @@ async function rotateClaudeSessionAfterTimeout(): Promise<void> {
 }
 
 // ============================================================
-// LOCK FILE (prevent multiple instances)
+// LOCK FILE (token-keyed singleton)
 // ============================================================
 
-const LOCK_FILE = join(RELAY_DIR, "bot.lock");
+const TOKEN_LOCK_PATH = tokenLockPath(BOT_TOKEN);
+const RELAY_HOST = process.env.RELAY_HOST || os.hostname();
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+let releaseLockOnExit: () => Promise<void> = async () => undefined;
+let stopBotOnExit: () => Promise<void> = async () => undefined;
+let stopLockHeartbeat: () => void = () => undefined;
+
+async function shutdown(reason: string, code = 0): Promise<void> {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
+    stopLockHeartbeat();
+  } catch (err) {
+    console.error(`[shutdown] heartbeat stop failed (${reason}):`, err);
   }
-}
-
-async function acquireLock(): Promise<boolean> {
   try {
-    await ensurePrivateDir(RELAY_DIR);
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const handle = await open(LOCK_FILE, "wx", 0o600);
-        await handle.writeFile(process.pid.toString(), "utf8");
-        await handle.close();
-        await chmod(LOCK_FILE, 0o600).catch(() => undefined);
-        return true;
-      } catch (err) {
-        if ((err as { code?: string }).code !== "EEXIST") throw err;
-
-        const existingLock = await readFile(LOCK_FILE, "utf-8").catch(() => "");
-        const pid = Number.parseInt(existingLock, 10);
-        if (isProcessAlive(pid)) {
-          console.log(`Another instance running (PID: ${pid})`);
-          return false;
-        }
-
-        console.log("Stale lock found, taking over...");
-        await unlink(LOCK_FILE).catch(() => undefined);
-      }
-    }
-
-    return false;
-  } catch (error) {
-    console.error("Lock error:", error);
-    return false;
+    await stopBotOnExit();
+  } catch (err) {
+    console.error(`[shutdown] bot stop failed (${reason}):`, err);
   }
+  try {
+    await releaseLockOnExit();
+  } catch (err) {
+    console.error(`[shutdown] lock release failed (${reason}):`, err);
+  }
+  process.exit(code);
 }
 
-async function releaseLock(): Promise<void> {
-  const existingLock = await readFile(LOCK_FILE, "utf-8").catch(() => "");
-  if (Number.parseInt(existingLock, 10) === process.pid) {
-    await unlink(LOCK_FILE).catch(() => {});
-  }
-}
+process.on("SIGINT", () => {
+  shutdown("SIGINT", 0).catch(() => process.exit(0));
+});
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM", 0).catch(() => process.exit(0));
+});
 
-// Cleanup on exit
+// Synchronous safety net: node's "exit" event only fires after all other
+// listeners returned, and async work cannot run inside it. Remove the lock
+// file directly so a crash path still surfaces an empty lock to the next
+// launchd start.
 process.on("exit", () => {
   try {
-    const fs = require("fs");
-    const existingLock = fs.readFileSync(LOCK_FILE, "utf8");
-    if (Number.parseInt(existingLock, 10) === process.pid) {
-      fs.unlinkSync(LOCK_FILE);
+    const fs = require("fs") as typeof import("fs");
+    const raw = fs.readFileSync(TOKEN_LOCK_PATH, "utf8");
+    const parsed = JSON.parse(raw) as { pid?: number };
+    if (parsed?.pid === process.pid) {
+      fs.unlinkSync(TOKEN_LOCK_PATH);
     }
-  } catch {}
-});
-process.on("SIGINT", async () => {
-  await releaseLock();
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await releaseLock();
-  process.exit(0);
+  } catch {
+    // Lock missing or unreadable: nothing to clean up.
+  }
 });
 
 // ============================================================
@@ -306,6 +296,29 @@ try {
 await ensurePrivateDir(RELAY_DIR);
 await ensurePrivateDir(TEMP_DIR);
 await ensurePrivateDir(UPLOADS_DIR);
+
+// Rotate the launchd stderr log if it grew past the threshold. launchd
+// owns the StandardErrorPath fd, so the rotator uses copy-and-truncate
+// rather than rename. Failures must never block startup — the rotator
+// is observability, not a runtime dependency.
+{
+  const errorLogPath = join(
+    process.env.RELAY_LOG_DIR || join(RELAY_DIR, "logs"),
+    "com.claude.telegram-relay.error.log",
+  );
+  const maxBytes = positiveIntEnv("RELAY_ERROR_LOG_ROTATE_MAX_BYTES", 5 * 1024 * 1024);
+  try {
+    const result = await rotateLogIfTooLarge({ path: errorLogPath, maxBytes });
+    if (result.rotated) {
+      console.log(
+        `[log-rotation] rotated relay error log path=${result.path} archive=${result.archivePath} size_bytes=${result.sizeBytes}`,
+      );
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[log-rotation] rotation failed (continuing startup): ${message}`);
+  }
+}
 
 // ============================================================
 // SUPABASE (optional — only if configured)
@@ -346,13 +359,72 @@ async function saveMessage(
   }
 }
 
-// Acquire lock
-if (!(await acquireLock())) {
-  console.error("Could not acquire lock. Another instance may be running.");
-  process.exit(1);
+// Acquire token-keyed singleton lock. The lock filename is the sha256 prefix
+// of the bot token, and the lock root is host-global (RELAY_LOCK_ROOT or
+// ~/.claude-relay/locks) — independent of RELAY_DIR, so two relays started
+// with different RELAY_DIR values still collide on the same file. The raw
+// token never lands on disk; the file holds only the hash.
+{
+  const lockResult = await acquireTokenLock({
+    token: BOT_TOKEN,
+    host: RELAY_HOST,
+    pid: process.pid,
+    now: new Date(),
+    // baseDir omitted → defaultLockRoot() is used.
+    // isLiveRelayPid checks BOTH process existence and that its `ps` cmdline
+    // mentions relay.ts — so a PID reused by some unrelated process won't
+    // falsely keep us out.
+    isLiveRelay: (pid) => isLiveRelayPid(pid),
+  });
+
+  if (!lockResult.ok) {
+    if (lockResult.reason === "held_by_live_relay") {
+      const heldFor = Math.max(
+        0,
+        Math.round((Date.now() - Date.parse(lockResult.holder.started_at)) / 1000),
+      );
+      console.error(
+        `[relay] token lock held by live relay pid=${lockResult.holder.pid} ` +
+        `host=${lockResult.holder.host} held_for_s=${heldFor} ` +
+        `path=${lockResult.path}`,
+      );
+      console.error(
+        "[relay] If that PID is wrong, remove the lock file manually after confirming no other relay is running.",
+      );
+      process.exit(75);
+    } else if (lockResult.reason === "io_error") {
+      console.error(`[relay] token lock IO error: ${lockResult.error}`);
+      process.exit(1);
+    }
+  } else {
+    // Capture the acquired payload's started_at so release can verify it
+    // against the file on disk and refuse to delete a lock that's no
+    // longer ours (PID reuse, takeover-during-shutdown race).
+    const acquiredStartedAt = lockResult.payload.started_at;
+    releaseLockOnExit = async () => {
+      await releaseTokenLock({
+        token: BOT_TOKEN,
+        pid: process.pid,
+        host: RELAY_HOST,
+        startedAt: acquiredStartedAt,
+      });
+    };
+    stopLockHeartbeat = startTokenLockHeartbeat({
+      token: BOT_TOKEN,
+      pid: process.pid,
+      host: RELAY_HOST,
+    });
+  }
 }
 
 const bot = new Bot(BOT_TOKEN);
+stopBotOnExit = async () => {
+  try {
+    await bot.stop();
+  } catch {
+    // bot.stop() throws if polling never started; safe to ignore at shutdown.
+  }
+};
 
 const seenUpdates: Set<number> = await loadSeenUpdateIds();
 const sentUpdates = new Set<number>();
@@ -459,9 +531,10 @@ function buildClaudeEnv(): Record<string, string> {
 }
 
 function sanitizeStderr(stderr: string): string {
-  return stderr
-    .replace(/(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|TELEGRAM_BOT_TOKEN)=\S+/g, "$1=[redacted]")
-    .slice(0, 4000);
+  return redactBotToken(
+    stderr.replace(/(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|TELEGRAM_BOT_TOKEN)=\S+/g, "$1=[redacted]"),
+    BOT_TOKEN,
+  ).slice(0, 4000);
 }
 
 function parseClaudeCliOutput(output: string): { text: string; sessionId?: string } {
@@ -494,26 +567,16 @@ async function callClaude(
   prompt: string,
   options?: { resume?: boolean; allowedTools?: string[]; addDirs?: string[]; cwd?: string }
 ): Promise<string> {
-  const { systemPrompt, userPrompt } = splitPromptForClaudeCli(prompt);
-  const args = [CLAUDE_PATH, "-p", userPrompt];
-
-  if (systemPrompt) {
-    args.push("--append-system-prompt", systemPrompt);
-  }
-
-  // Resume previous session if available and requested
-  if (CLAUDE_RESUME_ENABLED && options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
-  }
-
-  if (!CLAUDE_RESUME_ENABLED) {
-    args.push("--no-session-persistence");
-  }
-  args.push("--tools", (options?.allowedTools ?? []).join(","));
-  for (const dir of options?.addDirs ?? []) {
-    args.push("--add-dir", dir);
-  }
-  args.push("--output-format", "json");
+  const args = buildClaudeCliArgs({
+    claudePath: CLAUDE_PATH,
+    prompt,
+    allowedTools: options?.allowedTools ?? [],
+    addDirs: options?.addDirs ?? [],
+    resume: options?.resume === true,
+    resumeEnabled: CLAUDE_RESUME_ENABLED,
+    sessionId: session.sessionId,
+  });
+  const userPrompt = args[2] ?? "";
 
   console.log(`Calling Claude: ${userPrompt.substring(0, 80)}...`);
 
@@ -688,7 +751,15 @@ async function downloadTelegramFile(
   }
 
   const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${args.filePath}`;
-  const response = await fetch(url);
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (err) {
+    // fetch errors can include the full URL (with the bot token) in
+    // err.message; redact before rethrowing so the relay log never leaks it.
+    const safe = redactBotToken(err instanceof Error ? err.message : String(err), BOT_TOKEN);
+    throw new Error(`telegram_${args.kind}_download_fetch_failed: ${safe}`);
+  }
   if (!response.ok) {
     throw new Error(`telegram_${args.kind}_download_http_${response.status}`);
   }
@@ -743,6 +814,22 @@ function shouldAcknowledgeFeedbackWithoutClaude(userMessage: string): boolean {
     /\b(?:please\s+)?log\s+this\b[\s\S]{0,120}\b(?:un+acceptable|wrong|bad|poor)\s+response\b/i.test(userMessage) ||
     /\bthis\s+response\s+(?:is|was)\s+(?:un+acceptable|wrong|bad|poor)\b/i.test(userMessage)
   );
+}
+
+function shouldDeclineAlreadyAnsweredLastMessageDraft(
+  text: string,
+  imessageContextResult: IMessageContextResult | null,
+  draftRequest: ReturnType<typeof extractIMessageDraftRequest>,
+): boolean {
+  if (!draftRequest?.wantsPlacement || draftRequest.directBody) return false;
+  if (imessageContextResult?.status !== "found") return false;
+  if (imessageContextResult.messages[0]?.sender !== "me") return false;
+
+  const asksForLastMessageReply =
+    /\b(?:reply|respond)\b[\s\S]{0,80}\blast\s+(?:message|text|imessage|sms|one)\b/i.test(text) ||
+    /\blast\s+(?:message|text|imessage|sms|one)\b[\s\S]{0,80}\b(?:reply|respond)\b/i.test(text);
+
+  return asksForLastMessageReply;
 }
 
 interface PostClaudeResult {
@@ -870,36 +957,40 @@ bot.on("message:text", async (ctx) => {
     // Placement defaults to TRUE for any iMessage/text/SMS draft so the user
     // doesn't have to repeat "directly in the iMessage box" each time.
     const draftRequest = extractIMessageDraftRequest(text);
-    const directResolvedRecipient =
+    const directIdentifierWithoutContext =
       draftRequest?.directBody &&
       !draftRequest.wantsContext &&
-      isDirectMessageIdentifier(draftRequest.contact)
-        ? draftRequest.contact
-        : undefined;
-    const imessageContextResult: IMessageContextResult | null = directResolvedRecipient
-      ? {
-          request: {
-            contact: draftRequest!.contact,
-            limit: draftRequest!.contextLimit,
-          },
-          status: "empty",
-          messages: [],
-          resolvedRecipient: directResolvedRecipient,
-        }
-      : draftRequest
-        ? await fetchIMessageContext(PROJECT_ROOT, {
-          contact: draftRequest.contact,
-          limit: draftRequest.contextLimit,
-        })
-        : null;
+      isDirectMessageIdentifier(draftRequest.contact);
+    const imessageContextResult: IMessageContextResult | null = draftRequest
+      ? await fetchIMessageContext(PROJECT_ROOT, {
+        contact: draftRequest.contact,
+        limit: draftRequest.contextLimit,
+      })
+      : null;
+    const directResolvedRecipient = directIdentifierWithoutContext
+      ? (imessageContextResult?.resolvedRecipient ?? draftRequest?.contact)
+      : undefined;
     const wantsIMessagePlacement = draftRequest?.wantsPlacement ?? false;
-    // Inject thread context whenever there is a result and no direct body.
-    // Previously this was gated to status === "found", which silently dropped
-    // empty/error status messages and left Claude with no explanation of why
-    // context was missing — causing off-script "what's the last thing she sent
-    // you?" responses. renderIMessageContext handles all statuses gracefully.
+    // Inject thread context for named iMessage drafts, including direct-body
+    // requests like "Text Jacqueline saying ...". The supplied body is the
+    // user's core meaning, not proof we should skip the user's writing rules or
+    // the last 5-10 messages from the actual thread. Direct phone/email targets
+    // still run the helper so their handle is normalized and recency metadata
+    // reaches the checkpoint line, but they bypass prompt context injection.
+    //
+    // Previously this was gated away whenever `directBody` existed, which made
+    // the relay place literal text and skip Claude entirely. Live failure
+    // 2026-05-17: "Text jacqueline saying where you at?" wrote exactly that
+    // phrase even though the thread context was available.
+    const hasThreadContextForDrafting =
+      Boolean(imessageContextResult) &&
+      !directResolvedRecipient &&
+      (imessageContextResult!.status === "found" ||
+        imessageContextResult!.status === "empty");
     const shouldInjectContext =
-      Boolean(imessageContextResult) && !draftRequest?.directBody;
+      Boolean(imessageContextResult) &&
+      !directResolvedRecipient &&
+      (!draftRequest?.directBody || hasThreadContextForDrafting);
     const imessageContext = shouldInjectContext
       ? renderIMessageContext(imessageContextResult!)
       : "";
@@ -907,6 +998,18 @@ bot.on("message:text", async (ctx) => {
       console.log(
         `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length} render_context=${shouldInjectContext} placement=${wantsIMessagePlacement}`,
       );
+    }
+    if (wantsIMessagePlacement) {
+      const clearDraft = await clearICloudDriveDraft();
+      if (clearDraft.ok) {
+        console.log(
+          `[imessage-draft] cleared stale iCloud handoff before new placement request path=${clearDraft.path ?? "unknown"}`,
+        );
+      } else {
+        console.error(
+          `[imessage-draft] failed to clear stale iCloud handoff before new placement request: ${clearDraft.error ?? "unknown error"}`,
+        );
+      }
     }
     const recentBlock = renderRecentTurnsPlain(recentTurns, MAX_RECENT_TURNS_RENDERED, {
       suppressStaleIMessageFailures: Boolean(imessageContextResult),
@@ -947,16 +1050,25 @@ bot.on("message:text", async (ctx) => {
       .filter(Boolean)
       .join("\n\n");
     const directIMessageBody =
-      wantsIMessagePlacement && draftRequest?.directBody && !draftRequest.wantsContext
+      wantsIMessagePlacement &&
+      draftRequest?.directBody &&
+      !draftRequest.wantsContext &&
+      !hasThreadContextForDrafting
         ? draftRequest.directBody
         : undefined;
+    const alreadyAnsweredLastMessageDraft =
+      shouldDeclineAlreadyAnsweredLastMessageDraft(
+        text,
+        imessageContextResult,
+        draftRequest,
+      );
     const shouldClarifyMissingIMessageBody =
-      wantsIMessagePlacement &&
-      Boolean(draftRequest) &&
-      !directIMessageBody &&
-      !draftRequest?.wantsContext &&
-      imessageContextResult?.status !== "found" &&
-      !imessageContextResult?.resolvedRecipient;
+      shouldClarifyMissingIMessageDraftBody({
+        message: text,
+        request: draftRequest,
+        contextResult: imessageContextResult,
+        alreadyAnsweredLastMessageDraft,
+      });
 
     const enrichedPrompt = capPrompt(
       buildPrompt(text, combinedRelevant, memoryContext, {
@@ -986,9 +1098,29 @@ bot.on("message:text", async (ctx) => {
       assistantText = deterministicCatalogResponse;
     } else if (directIMessageBody) {
       assistantText = `${DRAFT_MARKER_OPEN}\n${directIMessageBody}\n${DRAFT_MARKER_CLOSE}`;
+    } else if (alreadyAnsweredLastMessageDraft) {
+      const contactLabel = draftRequest?.contact ?? "that contact";
+      const latestText = imessageContextResult?.messages[0]?.text
+        ?.replace(/\s+/g, " ")
+        .trim();
+      const clearDraft = await clearICloudDriveDraft();
+      if (clearDraft.ok) {
+        console.log(
+          `[imessage-draft] cleared stale iCloud handoff after already-answered last-message request path=${clearDraft.path ?? "unknown"}`,
+        );
+      } else {
+        console.error(
+          `[imessage-draft] failed to clear stale iCloud handoff after already-answered request: ${clearDraft.error ?? "unknown error"}`,
+        );
+      }
+      assistantText = latestText
+        ? `The latest message I can see in ${contactLabel}'s thread is already from you: "${latestText}". I did not open a new draft. Tell me what you want to add if you still want a follow up.`
+        : `The latest message I can see in ${contactLabel}'s thread is already from you. I did not open a new draft. Tell me what you want to add if you still want a follow up.`;
     } else if (shouldClarifyMissingIMessageBody) {
       const contactLabel = draftRequest?.contact ?? "that contact";
-      assistantText = `I couldn't find a Messages thread for ${contactLabel}, and I don't have the message body yet. Send me the phone/email plus what you want it to say.`;
+      assistantText = imessageContextResult?.resolvedRecipient
+        ? `I have ${contactLabel}'s Messages handle, but I don't have the message body yet. Send what you want it to say.`
+        : `I couldn't find a Messages thread for ${contactLabel}, and I don't have the message body yet. Send me the phone/email plus what you want it to say.`;
     } else if (shouldAcknowledgeFeedbackWithoutClaude(text)) {
       assistantText = "Logged.";
     } else {
@@ -1031,20 +1163,48 @@ bot.on("message:text", async (ctx) => {
 
     let imessageDraftStatus: IMessageDraftStatus | undefined;
     let imessageDraftMode:
-      | "pasted"
-      | "new_compose"
-      | "clipboard_only"
-      | "icloud_drive_file"
-      | "iphone_mirror_typed"
+      | "staging_imessage"
       | undefined;
     let imessageDraftHandoffPath: string | undefined;
-    let imessageDraftBodySha256: string | undefined;
+    let imessageDraftPayloadSha256: string | undefined;
     let imessageDraftShortcutUrl: string | undefined;
+    let imessageDraftId: string | undefined;
+    // PR 3 (Option D vault writer): the relay records every staged draft to
+    // the user's Obsidian vault. The write is fire-and-forget AFTER the
+    // Telegram reply has been sent. Staging success queues the input here,
+    // and the actual write fires below, after sendTelegramResponse and
+    // markUpdateSentAndRemember resolve. This matches the contract in
+    // src/vault-writer.ts and ensures a slow disk write can never delay or
+    // perturb the reply path. PR3.5 audit #8-timing (Codex 2026-05-21).
+    let vaultWriteAttempted = false;
+    let vaultDraftId: string | undefined;
+    let pendingVaultWriteInput:
+      | Parameters<typeof writeRelayVaultArtifacts>[0]
+      | null = null;
     if (shouldClarifyMissingIMessageBody) {
-      imessageDraftStatus = "no_recipient";
+      imessageDraftStatus = imessageContextResult?.resolvedRecipient
+        ? "empty_body"
+        : "no_recipient";
     }
-    if (wantsIMessagePlacement && !shouldClarifyMissingIMessageBody) {
-      const body = extractDraftBody(assistantText);
+    if (
+      wantsIMessagePlacement &&
+      !shouldClarifyMissingIMessageBody &&
+      !alreadyAnsweredLastMessageDraft
+    ) {
+      let body = extractDraftBody(assistantText);
+      if (body) {
+        const sanitizedBody = stripProseDashes(body);
+        if (sanitizedBody.stripped > 0) {
+          proseDashesStripped += sanitizedBody.stripped;
+          body = sanitizedBody.clean;
+          // NOTE: do NOT call rebuildAroundDraftBlock here. Each branch below
+          // performs its own rebuildAroundDraftBlock against the ORIGINAL
+          // assistantText (markers intact). A rebuild here would strip the
+          // markers, and the next rebuild would fall into the no-markers
+          // branch and duplicate the body in the user-visible reply
+          // (regression 2026-05-20, see imessage-draft.test.ts).
+        }
+      }
       const resolved = imessageContextResult?.resolvedRecipient;
       const contactLabel =
         draftRequest?.contact ?? resolved ?? "this contact";
@@ -1056,6 +1216,7 @@ bot.on("message:text", async (ctx) => {
         // the relay's "couldn't place" message isn't contradicted.
         const stripped = stripPlacementClaims(
           replaceDraftBlock(assistantText, ""),
+          { preserveNonEmpty: false },
         ).trim();
         assistantText = stripped.length > 0
           ? `${stripped}\n\n(I couldn't place this in Messages this time.)`
@@ -1064,15 +1225,14 @@ bot.on("message:text", async (ctx) => {
           `[imessage-draft] markers_missing for ${contactLabel}; resp_chars=${assistantText.length}`,
         );
       } else {
-        // Three real placement paths:
-        //   - resolved → write latest draft to the iCloud Drive container
-        //     for the iPhone Shortcut handoff.
-        //   - resolved + handoff unavailable → place into that contact's
-        //     existing Mac thread.
-        //   - genuinely unresolved contact -> open a fresh New Message compose
-        //     on the Mac with the body prefilled and the To: field blank.
+        // Staging handoff:
+        //   - resolved -> send a structured CLDRAFT/1 payload to the configured
+        //     staging iMessage handle. A Shortcuts automation watching that
+        //     thread opens the final target compose sheet.
+        //   - unresolved -> fail closed. The relay must not open a blank compose
+        //     or drive Messages UI directly from launchd.
         // Context lookup failures are setup/runtime problems, not a safe reason
-        // to open a blank-recipient compose.
+        // to guess a recipient.
         const contextStatus = imessageContextResult?.status;
         if (
           !resolved &&
@@ -1091,117 +1251,74 @@ bot.on("message:text", async (ctx) => {
           console.error(
             `[imessage-draft] no_recipient for ${contactLabel} (context_status=${contextStatus}${imessageContextResult?.error ? ` error=${JSON.stringify(imessageContextResult.error)}` : ""})`,
           );
+        } else if (!resolved) {
+          imessageDraftStatus = "no_recipient";
+          assistantText = rebuildAroundDraftBlock(
+            assistantText,
+            `${body}\n\nCouldn't stage this in Messages because I couldn't resolve ${contactLabel} to a phone number or iMessage email. Send the phone/email plus what you want it to say.`,
+          );
+          console.error(
+            `[imessage-draft] no_recipient for ${contactLabel} (context_status=${contextStatus ?? "unknown"})`,
+          );
         } else {
-          // Phone handoff:
-          //   1. Always write the CloudDocs handoff for the ClaudeDraft Shortcut.
-          //   2. iPhone Mirroring typed placement is diagnostic-only, opt-in,
-          //      and useful only when the phone is physically mirrored to this
-          //      Mac. It is not a production path for remote relay use.
-          //   3. Only use Mac Messages as a fallback when phone handoff is not
-          //      available. Mac placement is not proof of iPhone delivery.
-          const target = resolved ?? NEW_COMPOSE_SENTINEL;
-          const useIPhoneMirror =
-            Boolean(resolved) && shouldUseIPhoneMirrorPlacement();
-          const [handoff, iPhoneMirror] = await Promise.all([
-            resolved
-              ? writeICloudDriveDraft({ recipient: resolved, recipientLabel: contactLabel, body })
-              : Promise.resolve(null),
-            resolved
-              ? useIPhoneMirror
-                ? placeIPhoneMirrorDraft(resolved, body)
-                : Promise.resolve(null)
-              : Promise.resolve(null),
-          ]);
-          let placement:
-            | Awaited<ReturnType<typeof placeIMessageDraft>>
-            | undefined;
-
-          if (handoff && handoff.ok) {
-            imessageDraftHandoffPath = handoff.path;
-            imessageDraftBodySha256 = handoff.bodySha256;
-            imessageDraftShortcutUrl = handoff.shortcutUrl;
+          const staged = await stageIMessageDraft(
+            PROJECT_ROOT,
+            resolved,
+            contactLabel,
+            body,
+          );
+          if (staged.ok) {
+            imessageDraftStatus = "staging_handoff_sent";
+            imessageDraftMode = "staging_imessage";
+            imessageDraftPayloadSha256 = staged.payloadSha256;
+            imessageDraftId = staged.draftId;
+            // Surface the contact selection as a visible checkpoint above the
+            // body. The user explicitly chose silent most-recent-activity
+            // tie-breaking (no disambiguation prompt), so this line is the
+            // only confirmation they get in Telegram before the iPhone
+            // notification arrives. Show When Run on the iPhone Shortcut is
+            // the second checkpoint; the verifier asserts that flag stays on.
+            const selectionLine = buildContactSelectionLine(
+              imessageContextResult,
+              contactLabel,
+            );
+            const replacement = selectionLine
+              ? `${selectionLine}\n\n${body}`
+              : body;
+            assistantText = rebuildAroundDraftBlock(assistantText, replacement);
             console.log(
-              `[imessage-draft] icloud_drive_file for ${contactLabel} (${resolved}) path=${handoff.path} sha256=${handoff.bodySha256}`,
+              `[imessage-draft] staging_handoff_sent for ${contactLabel} (${resolved}) draft_id=${staged.draftId ?? "unknown"} payload_sha256=${staged.payloadSha256 ?? "unknown"}`,
             );
-          } else if (handoff && !handoff.ok) {
-            console.error(
-              `[imessage-draft] iCloud Drive handoff failed for ${contactLabel}: ${handoff.error ?? "unknown error"}`,
+            // Queue the vault write input. The actual write fires AFTER
+            // sendTelegramResponse and markUpdateSentAndRemember below, so a
+            // slow disk write cannot delay or perturb the Telegram reply.
+            // See src/vault-writer.ts (Option D full indexing). Its
+            // docstring is the contract this defers to. PR3.5 audit #8.
+            vaultWriteAttempted = true;
+            vaultDraftId = staged.draftId;
+            const vaultContextMessages = (imessageContextResult?.messages ?? []).map(
+              (m) => ({ ts: m.ts, sender: m.sender, text: m.text }),
             );
-          }
-
-          if (iPhoneMirror?.ok) {
-            imessageDraftStatus = "phone_handoff_ready";
-            imessageDraftMode = "iphone_mirror_typed";
-            assistantText = rebuildAroundDraftBlock(
-              assistantText,
-              `${body}\n\nDraft is in the iPhone Messages compose field for ${contactLabel}.`,
-            );
-            console.log(
-              `[imessage-draft] iphone_mirror_typed for ${contactLabel} (${resolved})`,
-            );
-          } else if (handoff?.ok) {
-            if (iPhoneMirror && !iPhoneMirror.ok) {
-              console.error(
-                `[imessage-draft] iPhone mirror placement failed for ${contactLabel}: ${iPhoneMirror.error ?? "unknown error"}`,
-              );
-            }
-            // iCloud Drive succeeded, but that only prepares the Shortcut input.
-            // It is not proof the iPhone compose box is populated.
-            imessageDraftStatus = "phone_handoff_ready";
-            imessageDraftMode = "icloud_drive_file";
-            assistantText = rebuildAroundDraftBlock(
-              assistantText,
-              `${body}\n\nPhone handoff ready for ${contactLabel} (${resolved}): ${handoff.shortcutUrl}`,
-            );
+            pendingVaultWriteInput = {
+              draftId: staged.draftId ?? "",
+              contactDisplayName:
+                imessageContextResult?.resolvedDisplayName ?? contactLabel,
+              contactHandle: resolved,
+              userInstruction: text,
+              draftBody: body,
+              contextMessages: vaultContextMessages,
+            };
           } else {
-            placement = await placeIMessageDraft(PROJECT_ROOT, target, body);
-          }
-
-          if (placement !== undefined) {
-            if (!handoff?.ok && placement.ok && placement.mode === "pasted") {
-              // iCloud Drive failed; Mac paste is the fallback.
-              imessageDraftStatus = "placed";
-              imessageDraftMode = "pasted";
-              assistantText = rebuildAroundDraftBlock(
-                assistantText,
-                `${body}\n\nDraft is in the Messages compose box on your Mac for ${contactLabel}.`,
-              );
-              console.log(
-                `[imessage-draft] pasted into compose for ${contactLabel} (${resolved}) — iCloud Drive fallback`,
-              );
-            } else if (!handoff?.ok && placement.ok && placement.mode === "new_compose") {
-              imessageDraftStatus = "placed";
-              imessageDraftMode = "new_compose";
-              assistantText = rebuildAroundDraftBlock(
-                assistantText,
-                `${body}\n\nI couldn't find a thread for ${contactLabel}, so I opened a new Messages compose on your Mac with the body prefilled. Pick the contact in the To field.`,
-              );
-              console.log(
-                `[imessage-draft] new_compose for ${contactLabel} (context_status=${imessageContextResult?.status})`,
-              );
-            } else if (!handoff?.ok && placement.ok) {
-              imessageDraftStatus = "placed";
-              imessageDraftMode = "clipboard_only";
-              const where = resolved
-                ? `Messages on your Mac is open to the ${contactLabel} thread`
-                : placement.reason === "sms_body_url_opened_unverified_new_compose"
-                  ? `Messages on your Mac opened a new compose window for ${contactLabel}`
-                : `Messages on your Mac is open — press Cmd+N for a new message, pick ${contactLabel}`;
-              assistantText = rebuildAroundDraftBlock(
-                assistantText,
-                `${body}\n\nDraft is on your clipboard and ${where}. Paste with Cmd+V.`,
-              );
-              console.log(
-                `[imessage-draft] clipboard_only fallback for ${contactLabel}: ${placement.reason ?? "no reason"}`,
-              );
-            } else {
-              imessageDraftStatus = "helper_failed";
-              assistantText = rebuildAroundDraftBlock(
-                assistantText,
-                `${body}\n\n(Couldn't place this in Messages: ${placement.error ?? "unknown error"}.)`,
-              );
-              console.error(`[imessage-draft] helper failed: ${placement.error}`);
-            }
+            imessageDraftStatus = "helper_failed";
+            imessageDraftId = staged.draftId;
+            imessageDraftPayloadSha256 = staged.payloadSha256;
+            assistantText = rebuildAroundDraftBlock(
+              assistantText,
+              `${body}\n\n(Couldn't stage this through the iMessage watcher: ${staged.error ?? "unknown error"}.)`,
+            );
+            console.error(
+              `[imessage-draft] staging helper failed for ${contactLabel} draft_id=${staged.draftId ?? "unknown"}: ${staged.error ?? "unknown error"}`,
+            );
           }
         }
       }
@@ -1228,12 +1345,40 @@ bot.on("message:text", async (ctx) => {
       errorMsg = [errorMsg, sendResult.partialFailure].filter(Boolean).join("; ");
     }
     await markUpdateSentAndRemember(updateId);
+
+    // Vault write fires only after the reply is durably sent and remembered.
+    // Fire-and-forget so a slow disk write does not delay the rest of post-
+    // send work. PR3.5 audit #8-timing (Codex 2026-05-21). See
+    // src/vault-writer.ts docstring for the AFTER-reply contract.
+    if (pendingVaultWriteInput) {
+      const queuedInput = pendingVaultWriteInput;
+      const correlator = queuedInput.draftId || "unknown";
+      void writeRelayVaultArtifacts(queuedInput)
+        .then((r) => {
+          if (r.ok) {
+            console.log(
+              `[vault-writer] ok draft_id=${correlator} per_thread=${r.perThreadPath ?? "n/a"} contact=${r.contactSummaryPath ?? "n/a"} daily=${r.dailySessionPath ?? "n/a"}`,
+            );
+          } else {
+            console.error(
+              `[vault-writer] partial_failure draft_id=${correlator} errors=${r.errors.join("; ")}`,
+            );
+          }
+        })
+        .catch((err) => {
+          console.error(
+            `[vault-writer] write threw draft_id=${correlator}:`,
+            err instanceof Error ? err.message : String(err),
+          );
+        });
+    }
+
     await saveMessage("assistant", sendableText);
     await appendTurn(chatId, { role: "assistant", content: sendableText, ts: new Date().toISOString() });
 
     // Background memory capture. Synchronous classification (regex match) so
     // the decision record can include the reason; the actual file write is
-    // fire-and-forget — never blocks the reply, never throws into the queue.
+    // fire-and-forget: never blocks the reply, never throws into the queue.
     const memoryCandidate = classifyMemoryCandidate({
       userText: text,
       assistantText: sendableText,
@@ -1282,11 +1427,17 @@ bot.on("message:text", async (ctx) => {
       imessage_context_status: imessageContextResult?.status,
       imessage_context_count: imessageContextResult?.messages.length,
       imessage_context_contact: imessageContextResult?.request.contact,
+      imessage_resolved_recipient: imessageContextResult?.resolvedRecipient,
+      imessage_resolved_display_name: imessageContextResult?.resolvedDisplayName,
+      imessage_resolved_last_messaged_at: imessageContextResult?.resolvedLastMessagedAt,
       imessage_draft_status: imessageDraftStatus,
       imessage_draft_mode: imessageDraftMode,
       imessage_draft_handoff_path: imessageDraftHandoffPath,
-      imessage_draft_body_sha256: imessageDraftBodySha256,
+      imessage_draft_payload_sha256: imessageDraftPayloadSha256,
       imessage_draft_shortcut_url: imessageDraftShortcutUrl,
+      imessage_draft_id: imessageDraftId,
+      vault_write_attempted: vaultWriteAttempted ? true : undefined,
+      vault_draft_id: vaultDraftId,
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
@@ -1679,11 +1830,11 @@ function buildPrompt(
     // Runtime context so the bot stops giving wrong macOS FDA advice. The
     // relay does not run from a terminal, and iMessage context prefetch no
     // longer routes through Claude. The protected-file reader is bun.
-    "Runtime context: you run as a macOS launchd service named com.claude.telegram-relay. You are NOT running inside Terminal, iTerm, Warp, or any GUI shell, and there is no Claude Code session attached. The relay process is bun, and it deterministically reads iMessage context before Claude runs by spawning scripts/imessage-thread.sh. If macOS denies access to ~/Library/Messages/chat.db, the relevant Full Disk Access entry is the resolved bun Cellar binary from `readlink -f \"$(which bun)\"`, not Terminal and not the Claude CLI. Do not tell the user to grant FDA to a terminal application or to ~/.local/share/claude/versions/<latest>; that will not fix this relay path.",
+    "Runtime context: you run as a macOS launchd service named com.claude.telegram-relay. You are NOT running inside Terminal, iTerm, Warp, or any GUI shell, and there is no Claude Code session attached. The relay process is bun, and it deterministically reads iMessage context before Claude runs by spawning scripts/imessage-thread.sh. If macOS denies access to ~/Library/Messages/chat.db, tell the user to run `bun run setup:verify` and grant Full Disk Access to the path printed as `FDA responsible target`. Do not tell the user to grant FDA to Terminal, a GUI shell, the Claude CLI, or to compute a path manually with `readlink`; those are not the bun binary launchd executes for this relay.",
     // Hard rule logged 2026-05-11 after the user asked for an iMessage and
     // an email draft. The bot must NEVER send; only draft. Full policy in
     // ~/.claude/projects/.../memory/feedback_drafts_never_send.md.
-    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft body as the body of your reply — no policy footer, no \"Draft above\", no \"send manually\", no \"review and send\", no \"I can't send for you\". The relay tells the user where the draft is; you do not need to remind them. If the user later says \"just send it\" or \"you send it\", refuse politely in one sentence and stop.",
+    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft body as the body of your reply with no policy footer, no \"Draft above\", no \"send manually\", no \"review and send\", and no \"I can't send for you\". The relay tells the user where the draft is; you do not need to remind them. If the user later says \"just send it\" or \"you send it\", refuse politely in one sentence and stop.",
     // Helper scripts the bot can invoke via its Bash tool. Documented in
     // docs/IMESSAGE-SETUP.md. The two draft helpers do NOT require Full Disk
     // Access; they drop the draft into the native compose surface and the
@@ -1692,9 +1843,9 @@ function buildPrompt(
     // Hard rule logged 2026-05-11 after the user asked for context-aware
     // drafts. Always read 5 to 10 prior messages before drafting a reply.
     // See feedback_context_before_drafting.md for the durable policy.
-    "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage or email REPLY to someone, work from the injected context. For iMessage, the relay always attempts to fetch the thread before you run — the result appears as an 'IMESSAGE CONTEXT FOR <name>' block above. If the block says messages were found, use them. If the block says the thread was not found or context could not be read, draft from the user's description as best you can — do NOT ask the user for a phone number, prior messages, or any other clarifying information. Do not claim you lack iMessage access; the relay owns that lookup. For email replies, ask the user to paste the most recent thread only if no context was supplied at all.",
+    "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage, text, SMS, or email to someone, work from the injected context. For iMessage/text/SMS, the relay always attempts to fetch the last 5 to 10 messages from the relevant thread before you run. The result appears as an 'IMESSAGE CONTEXT FOR <name>' block above. If the block says messages were found, use them to match the relationship, cadence, and level of warmth while preserving the user's exact intended meaning. If the block says the thread was not found or context could not be read, draft from the user's description as best you can. Do NOT ask the user for a phone number, prior messages, or any other clarifying information. Do not claim you lack iMessage access; the relay owns that lookup. For email replies, ask the user to paste the most recent thread only if no context was supplied at all.",
     "Context cleanup rule (hard): never save the fetched context to a local file. The read helper streams JSON to stdout; consume it in your working memory only. Do NOT write context to ~/Projects/claude-telegram-relay/data/ or anywhere else on disk. If you find an existing cached context file from a prior session (e.g. data/mom-imessages.json), delete it after use rather than reusing it. The user's machine is the source of truth; re-read fresh from chat.db each time rather than caching.",
-    "iMessage handling is deterministic in this runtime. The relay reads thread context before you run and places drafts after you run (using the marker pattern described below when relevant). Do NOT attempt to call scripts/imessage-thread.sh or scripts/draft-imessage.sh yourself; in headless mode you have no Bash approval surface and the call will surface as a confusing 'blocked for approval' message to the user. Just respond in text and use the markers when asked to place a draft.",
+    "iMessage handling is deterministic in this runtime. The relay reads thread context before you run and stages drafts after you run by sending a structured payload to the configured iMessage staging thread. A Shortcuts automation watches that staging thread and opens the final Messages compose sheet. Do NOT attempt to call scripts/imessage-thread.sh, scripts/stage-imessage.sh, or scripts/draft-imessage.sh yourself; in headless mode you have no Bash approval surface and the call will surface as a confusing 'blocked for approval' message to the user. Just respond in text and use the markers when asked to place a draft.",
     "For email drafts in this runtime, produce the draft text only. Do NOT call scripts/draft-email.sh or any mail client helper; ordinary Telegram turns do not expose Bash tools.",
     // Durable writing-style rules for any outgoing draft the user will send
     // under his own name. Source of truth (verbatim) lives at
@@ -1720,11 +1871,11 @@ function buildPrompt(
   if (opts?.iMessageDraftContact) {
     const contact = opts.iMessageDraftContact;
     parts.push(
-      `\niMessage handoff (this message): the user wants a draft for ${contact}. The relay will handle placement after you respond — usually by writing the draft for the iPhone Shortcut handoff, with the Mac Messages compose path as a fallback. Output the iMessage body — and only the body — between the literal marker lines below, each on its own line:`,
+      `\niMessage handoff (this message): the user wants a draft for ${contact}. The relay will handle placement after you respond by sending a structured payload to the iMessage staging thread for the Shortcut watcher. Output the iMessage body, and only the body, between the literal marker lines below, each on its own line:`,
       DRAFT_MARKER_OPEN,
       "(the iMessage body)",
       DRAFT_MARKER_CLOSE,
-      `You may add one short lead sentence BEFORE the opening marker (e.g. "Here's the draft for ${contact}:"). Write NOTHING after the closing marker. The relay appends its own handoff status line based on what actually happened (iPhone Shortcut handoff, Mac compose fallback, clipboard fallback, or failure), and any line you add will either be discarded or contradict the truth. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation — the relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval — there is no approval surface in this runtime.`,
+      `Treat any phrase after "saying", "say", or "with" in the user's message as the core meaning to preserve, not necessarily as verbatim wording. Use the injected iMessage context when present, then rewrite the body so it sounds organic, confident, warm, and human. Keep it concise enough for a real text message unless the user asks for length. Do not use hyphen, en dash, or em dash characters in the draft body. Write NOTHING before the opening marker and NOTHING after the closing marker. The relay inserts its own contact-selection line above the body (e.g. "Drafting for ${contact} (3d ago):") and a handoff status line as needed; if you also write "Here's the draft for ${contact}:" before the marker, the user sees two introduction lines for the same message. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation. The relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval. There is no approval surface in this runtime.`,
     );
   }
 
@@ -1891,6 +2042,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function runStartupTelegramProbe(): Promise<void> {
+  try {
+    const me = await bot.api.getMe();
+    console.log(`[telegram] startup probe: getMe ok username=@${me.username} pid=${process.pid}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[telegram] startup probe: getMe failed: ${message}`);
+    throw err;
+  }
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
+    console.log("[telegram] startup probe: deleteWebhook ok (idempotent, pending updates preserved)");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[telegram] startup probe: deleteWebhook failed: ${message}`);
+  }
+}
+
 async function startTelegramPolling(): Promise<void> {
   let conflictAttempts = 0;
   let firstConflictAt = 0;
@@ -1921,16 +2090,28 @@ async function startTelegramPolling(): Promise<void> {
           elapsedMs: Date.now() - firstConflictAt,
           pid: process.pid,
           retryDelayMs: TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
-          lockFile: LOCK_FILE,
+          lockFile: TOKEN_LOCK_PATH,
           pluginEnvExists,
         }),
       );
-      if (shouldEscalateTelegramPollingConflict(conflictAttempts)) {
+      if (
+        shouldPrintConflictHint(conflictAttempts) ||
+        shouldEscalateTelegramPollingConflict(conflictAttempts)
+      ) {
         console.error(formatTelegramPollingConflictHint({ diagnosis, pluginEnvExists }));
+      }
+      if (shouldExitAfterTelegramPollingConflict(conflictAttempts)) {
+        console.error(
+          `[telegram] giving up after ${conflictAttempts}/${TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS} ` +
+          "409 attempts; exiting so launchd ThrottleInterval owns restart pacing",
+        );
+        await shutdown("polling_conflict_exhausted", 75);
+        return;
       }
       await sleep(TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS);
     }
   }
 }
 
+await runStartupTelegramProbe();
 await startTelegramPolling();

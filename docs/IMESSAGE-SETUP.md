@@ -9,24 +9,44 @@ The bot will never send a message for you. That is a hard rule.
 
 These two capabilities have different macOS permission requirements. Setup is one-time per machine.
 
-## Capability 1: drop a draft (no permission grant needed)
+## Capability 1: stage an iMessage draft (Shortcuts + Automation)
 
-These work out of the box:
+The production iMessage path is the staging Shortcut handoff:
 
 ```bash
-# iMessage
-echo "Hey Peggy, ..." | scripts/draft-imessage.sh +16043154583
-
-# Email
-echo "Body text" | scripts/draft-email.sh wregan599@gmail.com "Subject line"
+echo "Hey Peggy, ..." | \
+  RELAY_IMESSAGE_STAGING_HANDLE='+15555555555' \
+  scripts/stage-imessage.sh +16043154583 Peggy
 ```
 
 Mechanism:
 
-- iMessage draft: the body is copied to your clipboard, then a `sms:<recipient>&body=...` URL opens Messages.app with the body prefilled. If macOS cannot prefill the compose field, the helper falls back to clipboard plus opening Messages.
-- Email draft: the body is URL-encoded into a `mailto:` URL, which opens your default mail client with a new draft pre-filled. The body is also copied to the clipboard as a safety net in case the URL was truncated.
+- The relay resolves the target contact, reads recent iMessage context from
+  `chat.db`, and injects Obsidian memory plus retrieval/project-anchor context
+  before Claude drafts.
+- Claude writes the draft under the user writing rules. The relay runs a final
+  prose-dash sanitizer before staging.
+- The relay sends a normal iMessage to `RELAY_IMESSAGE_STAGING_HANDLE`.
+- The staging body is a JSON payload with `version: "CLDRAFT/1"`, `to`,
+  `label`, and `body`.
+- A Shortcuts.app Message automation watches for `CLDRAFT/1`, runs
+  `ClaudeStageDraft`, and uses Send Message with `Show When Run` ON. That
+  opens the target compose sheet for manual review.
 
-No Full Disk Access, no Automation permission, no Accessibility permission. The bot can call these via its Bash tool at any time.
+This hop does not require Full Disk Access or Accessibility. It does require
+Messages to be signed in, and macOS may ask for Automation permission so
+Shortcuts can control Messages. If the relay's staging-send AppleScript
+triggers a prompt, grant Automation to the launchd bun binary printed by
+`bun run setup:verify`, not Terminal or a GUI shell.
+
+Detailed payload, Shortcut rebuild steps, and tests:
+`docs/IMESSAGE-SHORTCUT-HANDOFF.md`.
+
+Email drafts still use the mailto helper:
+
+```bash
+echo "Body text" | scripts/draft-email.sh wregan599@gmail.com "Subject line"
+```
 
 ## Capability 2: read iMessage context (requires Full Disk Access)
 
@@ -39,10 +59,10 @@ The target binary is **`bun`** at its resolved Cellar path — not the Claude CL
 1. Find the resolved bun path:
 
    ```bash
-   readlink -f "$(which bun)"
+   bun run setup:verify
    ```
 
-   On Apple Silicon + Homebrew this is typically `/opt/homebrew/Cellar/bun/<version>/bin/bun`. On Intel + Homebrew it's `/usr/local/Cellar/bun/<version>/bin/bun`. Always use the resolved Cellar path, never the `/opt/homebrew/bin/bun` or `/usr/local/bin/bun` symlink — symlinks re-point on every `brew upgrade bun` and TCC then silently denies again.
+   Look for the line `FDA responsible target: <path>`. On Apple Silicon + Homebrew this is typically `/opt/homebrew/Cellar/bun/<version>/bin/bun`; on Intel + Homebrew it's `/usr/local/Cellar/bun/<version>/bin/bun`. Always use the resolved Cellar path, never the `/opt/homebrew/bin/bun` or `/usr/local/bin/bun` symlink — symlinks re-point on every `brew upgrade bun` and TCC then silently denies again. `setup:verify` resolves the symlink for you via `fs.promises.realpath`, which works on stock macOS unlike GNU `readlink -f`.
 
    > **macOS 28 compatibility check:** Rosetta (Intel app translation) ends in macOS 28.
    > If your `bun` binary is Intel-only, both the FDA grant and the relay itself will
@@ -87,7 +107,7 @@ If you upgrade bun (`brew upgrade bun`), a new versioned folder appears under Ce
 
 - Granting FDA to Terminal.app, iTerm, Warp, Ghostty, or any GUI shell. The relay does not run inside any of them.
 - Granting FDA to the Claude CLI binary at `~/.local/share/claude/versions/<vN>`. The iMessage context prefetch no longer routes through Claude — `src/imessage-context.ts:fetchIMessageContext` spawns the helper from bun directly. Older versions of this doc (and older relay code) DID route through Claude and instructed granting FDA there; that path is gone.
-- Granting FDA only to the symlink at `/opt/homebrew/bin/bun` or `/usr/local/bin/bun`. macOS TCC may or may not follow the symlink correctly, and any `brew upgrade bun` re-points it to a new Cellar binary that has no grant. Use the resolved Cellar path from `readlink -f`.
+- Granting FDA only to the symlink at `/opt/homebrew/bin/bun` or `/usr/local/bin/bun`. macOS TCC may or may not follow the symlink correctly, and any `brew upgrade bun` re-points it to a new Cellar binary that has no grant. Use the resolved Cellar path printed by `bun run setup:verify` (the `FDA responsible target` line).
 
 ### Privacy note
 

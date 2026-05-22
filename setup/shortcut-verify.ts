@@ -57,27 +57,52 @@ function actionIdentifier(action: unknown): string | undefined {
   return asString(asRecord(action)?.WFWorkflowActionIdentifier);
 }
 
-function outputUuidFromToken(token: unknown): string | undefined {
+const ATTACHMENT_RANGE_KEY = /^\{[0-9]+, [0-9]+\}$/;
+
+interface InspectedToken {
+  uuid?: string;
+  reason?: "missing_value" | "raw_attachment" | "missing_serialization_type" |
+    "wrong_serialization_type" | "missing_attachments" |
+    "bad_range_key" | "multiple_attachments";
+}
+
+function inspectTextToken(token: unknown): InspectedToken {
   const tokenRecord = asRecord(token);
   const value = asRecord(tokenRecord?.Value);
-  if (!value) return undefined;
+  if (!value) return { reason: "missing_value" };
 
-  if (tokenRecord?.WFSerializationType === "WFTextTokenAttachment") {
-    return asString(value.OutputUUID);
+  const serializationType = tokenRecord?.WFSerializationType;
+  if (serializationType === undefined) return { reason: "missing_serialization_type" };
+
+  if (serializationType === "WFTextTokenAttachment") {
+    const uuid = asString(value.OutputUUID);
+    return { uuid, reason: "raw_attachment" };
   }
 
-  if (tokenRecord?.WFSerializationType !== "WFTextTokenString") {
-    return undefined;
+  if (serializationType !== "WFTextTokenString") {
+    return { reason: "wrong_serialization_type" };
   }
 
   const attachments = asRecord(value.attachmentsByRange);
-  const uuids = attachments
-    ? Object.values(attachments)
-      .map((attachment) => asString(asRecord(attachment)?.OutputUUID))
-      .filter((uuid): uuid is string => Boolean(uuid))
-    : [];
+  if (!attachments) return { reason: "missing_attachments" };
 
-  return uuids.length === 1 ? uuids[0] : undefined;
+  const keys = Object.keys(attachments);
+  for (const key of keys) {
+    if (!ATTACHMENT_RANGE_KEY.test(key)) return { reason: "bad_range_key" };
+  }
+  if (keys.length !== 1) return { reason: "multiple_attachments" };
+
+  const uuid = asString(asRecord(attachments[keys[0]])?.OutputUUID);
+  return { uuid };
+}
+
+function outputUuidFromToken(token: unknown): string | undefined {
+  // inspectTextToken returns the OutputUUID for both the raw_attachment
+  // shape (used by the recipient field) and the well-formed
+  // WFTextTokenString shape (used by the body field). Callers that need
+  // to distinguish should call inspectTextToken directly and check
+  // `reason` — see the body lookup in validateClaudeDraftShortcutActions.
+  return inspectTextToken(token).uuid;
 }
 
 function expectedCloudRelativeDir(draftDir: string): string | undefined {
@@ -280,6 +305,56 @@ export function validateClaudeDraftShortcutActions(
     errors.push("ClaudeDraft is missing the body dictionary lookup");
   }
 
+  // PLAN4: both recipient and body lookups MUST have explicit WFInput
+  // pointing at the dictionary parser. Implicit chaining (no WFInput)
+  // depends on action ordering and runtime behavior; that's too brittle a
+  // contract for the singleton iPhone draft path. Requiring explicit
+  // WFInput is unambiguous and survives the Shortcut editor reformatting
+  // the action list.
+  //
+  // PLAN5: missing dictionary parser UUID is a hard error (previously a
+  // silent skip — meaning a Shortcut with no dictionary UUID at all would
+  // pass validation because we couldn't compare lookup inputs against it).
+  // We only support UUID-based action references; OutputName fallback is
+  // intentionally NOT accepted because it's user-renamable and breaks the
+  // moment a user customizes their copy of the Shortcut.
+  const dictionaryUuid = dictionaryParams ? asString(dictionaryParams.UUID) : undefined;
+  if (dictionaryParams && !dictionaryUuid) {
+    errors.push(
+      "ClaudeDraft dictionary parser action is missing a UUID; " +
+      "the recipient and body lookups need an explicit UUID to reference",
+    );
+  }
+  const checkLookupInput = (
+    lookupName: string,
+    lookupParams: Record<string, unknown> | undefined,
+  ) => {
+    if (!lookupParams) return;
+    if (!dictionaryUuid) return;
+    const input = asRecord(lookupParams.WFInput);
+    if (!input) {
+      errors.push(
+        `ClaudeDraft ${lookupName} dictionary lookup is missing WFInput; ` +
+        `it must explicitly read from the dictionary parser (${dictionaryUuid})`,
+      );
+      return;
+    }
+    const inputUuid = asString(asRecord(input.Value)?.OutputUUID);
+    if (inputUuid && inputUuid !== dictionaryUuid) {
+      errors.push(
+        `ClaudeDraft ${lookupName} dictionary lookup WFInput points at ${inputUuid}, ` +
+        `expected the dictionary parser output (${dictionaryUuid})`,
+      );
+    } else if (!inputUuid) {
+      errors.push(
+        `ClaudeDraft ${lookupName} dictionary lookup WFInput is malformed; ` +
+        `expected Value.OutputUUID pointing at ${dictionaryUuid}`,
+      );
+    }
+  };
+  checkLookupInput("recipient", recipientParams);
+  checkLookupInput("body", bodyParams);
+
   const sendMessageAction = actions.find((action) => {
     return actionIdentifier(action) === SEND_MESSAGE_ACTION;
   });
@@ -300,12 +375,39 @@ export function validateClaudeDraftShortcutActions(
     if (bodyParams) {
       const bodyUuid = asString(bodyParams.UUID);
       const sendContent = asRecord(sendParams.WFSendMessageContent);
-      const sendContentUuid = outputUuidFromToken(sendContent);
-      if (
-        !bodyUuid || sendContent?.WFSerializationType !== "WFTextTokenString" ||
-        sendContentUuid !== bodyUuid
-      ) {
-        errors.push("ClaudeDraft Send Message content must wrap the body dictionary value as text");
+      const inspected = inspectTextToken(sendContent);
+      const sendContentUuid = inspected.uuid;
+      if (!bodyUuid) {
+        errors.push("ClaudeDraft body dictionary lookup is missing a UUID");
+      } else if (inspected.reason === "raw_attachment") {
+        errors.push(
+          "ClaudeDraft Send Message body is a raw WFTextTokenAttachment; " +
+          "it must wrap the body dictionary value inside WFTextTokenString.attachmentsByRange",
+        );
+      } else if (inspected.reason === "missing_serialization_type") {
+        errors.push("ClaudeDraft Send Message body is missing WFSerializationType");
+      } else if (inspected.reason === "wrong_serialization_type") {
+        errors.push(
+          "ClaudeDraft Send Message body has the wrong WFSerializationType; expected WFTextTokenString",
+        );
+      } else if (inspected.reason === "missing_attachments") {
+        errors.push(
+          "ClaudeDraft Send Message body has WFTextTokenString without attachmentsByRange",
+        );
+      } else if (inspected.reason === "bad_range_key") {
+        errors.push(
+          "ClaudeDraft Send Message body has a malformed attachmentsByRange key " +
+          "(expected '{N, M}' format)",
+        );
+      } else if (inspected.reason === "multiple_attachments") {
+        errors.push(
+          "ClaudeDraft Send Message body has multiple attachmentsByRange entries; " +
+          "expected exactly one pointing at the body dictionary value",
+        );
+      } else if (sendContentUuid !== bodyUuid) {
+        errors.push(
+          "ClaudeDraft Send Message body attachmentsByRange points at the wrong action UUID",
+        );
       }
     }
   }

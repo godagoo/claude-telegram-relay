@@ -1,14 +1,62 @@
 import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
 import { dirname, join } from "path";
 import {
   detectIMessageWriteIntent,
   extractIMessageDraftRequest,
   fetchIMessageContext,
   renderIMessageContext,
+  requestHasIMessageDraftMaterial,
+  shouldClarifyMissingIMessageDraftBody,
   type IMessageContextResult,
 } from "./imessage-context";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
+
+async function buildTempMessagesHome(
+  rows: Array<{
+    chatIdentifier: string;
+    date: number;
+    isFromMe: 0 | 1;
+    text: string;
+  }>,
+): Promise<string> {
+  const home = await mkdtemp(join(tmpdir(), "imessage-thread-home-"));
+  const messagesDir = join(home, "Library", "Messages");
+  await mkdir(messagesDir, { recursive: true });
+  const dbPath = join(messagesDir, "chat.db");
+  const sqlStmts = [
+    "CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT);",
+    "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, date INTEGER, is_from_me INTEGER, text TEXT, attributedBody BLOB, associated_message_type INTEGER);",
+    "CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);",
+  ];
+  rows.forEach((row, i) => {
+    const id = i + 1;
+    const chat = row.chatIdentifier.replace(/'/g, "''");
+    const text = row.text.replace(/'/g, "''");
+    sqlStmts.push(`INSERT INTO chat (ROWID, chat_identifier) VALUES (${id}, '${chat}');`);
+    sqlStmts.push(
+      `INSERT INTO message (ROWID, date, is_from_me, text, attributedBody, associated_message_type) VALUES (${id}, ${row.date}, ${row.isFromMe}, '${text}', NULL, 0);`,
+    );
+    sqlStmts.push(`INSERT INTO chat_message_join (chat_id, message_id) VALUES (${id}, ${id});`);
+  });
+  const proc = Bun.spawn(["sqlite3", dbPath], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin?.write(sqlStmts.join("\n"));
+  await proc.stdin?.end();
+  const [, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  expect(stderr).toBe("");
+  expect(code).toBe(0);
+  return home;
+}
 
 test("extracts contact, context flag, and placement flag from a full context+placement request", () => {
   expect(
@@ -59,6 +107,61 @@ test("returns null when there is no contact", () => {
   expect(
     extractIMessageDraftRequest("Draft a message saying hey"),
   ).toBeNull();
+});
+
+test("clarifies instead of inventing a draft when recipient resolves but body/context are empty", () => {
+  const request = extractIMessageDraftRequest("Text Peggy");
+  const context: IMessageContextResult = {
+    request: { contact: "Peggy", limit: 10 },
+    status: "empty",
+    messages: [],
+    resolvedRecipient: "+15555550123",
+  };
+
+  expect(requestHasIMessageDraftMaterial("Text Peggy", request)).toBe(false);
+  expect(
+    shouldClarifyMissingIMessageDraftBody({
+      message: "Text Peggy",
+      request,
+      contextResult: context,
+    }),
+  ).toBe(true);
+
+  const selfRequest = extractIMessageDraftRequest("Draft an iMessage to me");
+  expect(requestHasIMessageDraftMaterial("Draft an iMessage to me", selfRequest)).toBe(false);
+});
+
+test("does not clarify when thread context or user-supplied draft material exists", () => {
+  const bareRequest = extractIMessageDraftRequest("Reply to Peggy");
+  const foundContext: IMessageContextResult = {
+    request: { contact: "Peggy", limit: 10 },
+    status: "found",
+    messages: [{ id: 1, sender: "them", ts: "2026-05-20 09:00", text: "Are we still on?" }],
+    resolvedRecipient: "+15555550123",
+  };
+  expect(
+    shouldClarifyMissingIMessageDraftBody({
+      message: "Reply to Peggy",
+      request: bareRequest,
+      contextResult: foundContext,
+    }),
+  ).toBe(false);
+
+  const described = extractIMessageDraftRequest("Draft a message to Peggy about tomorrow's plan");
+  const emptyContext: IMessageContextResult = {
+    request: { contact: "Peggy", limit: 10 },
+    status: "empty",
+    messages: [],
+    resolvedRecipient: "+15555550123",
+  };
+  expect(requestHasIMessageDraftMaterial("Draft a message to Peggy about tomorrow's plan", described)).toBe(true);
+  expect(
+    shouldClarifyMissingIMessageDraftBody({
+      message: "Draft a message to Peggy about tomorrow's plan",
+      request: described,
+      contextResult: emptyContext,
+    }),
+  ).toBe(false);
 });
 
 test("'Respond to Conor saying hope all is well man' triggers iMessage draft", () => {
@@ -262,6 +365,32 @@ test("command-position proper names win over body text that contains 'to <place>
   });
 });
 
+test("command-position lowercase names trigger direct drafts", () => {
+  expect(
+    extractIMessageDraftRequest("Text jacqueline saying where you at?"),
+  ).toEqual({
+    contact: "jacqueline",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "where you at?",
+  });
+});
+
+test("command-position drafts allow short conversational lead-ins", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Okay, text Nater saying looking forward to our next fire",
+    ),
+  ).toEqual({
+    contact: "Nater",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "looking forward to our next fire",
+  });
+});
+
 test("message and ping command-position recipients trigger direct drafts", () => {
   expect(
     extractIMessageDraftRequest("Message Peggy saying thanks"),
@@ -461,6 +590,24 @@ test("renders found context without telling Claude access failed", () => {
   expect(rendered).toContain("Do not claim you lacked iMessage access");
 });
 
+test("strips NUL and other unsafe control characters from rendered context", () => {
+  const result: IMessageContextResult = {
+    request: { contact: "Bro", limit: 10 },
+    status: "found",
+    messages: [
+      { id: 1, sender: "me", ts: "2026-05-15 09:00:00", text: "\x00All good bro, can do!" },
+      { id: 2, sender: "them", ts: "2026-05-15 09:01:00", text: "ok\x07 sounds great\x7f" },
+    ],
+  };
+
+  const rendered = renderIMessageContext(result);
+  expect(rendered).not.toContain("\x00");
+  expect(rendered).not.toContain("\x07");
+  expect(rendered).not.toContain("\x7f");
+  expect(rendered).toContain("me: All good bro, can do!");
+  expect(rendered).toContain("them: ok sounds great");
+});
+
 test("renders empty lookup as contact mismatch, not FDA failure", () => {
   const result: IMessageContextResult = {
     request: { contact: "Peggy", limit: 10 },
@@ -491,6 +638,124 @@ test("imessage-thread helper rejects non-numeric LIMIT before touching chat.db",
   expect(code).toBe(64);
   expect(stdout).toBe("");
   expect(stderr).toContain("LIMIT must be a positive integer");
+});
+
+test("imessage-thread helper keeps resolver metadata for direct phone identifiers", async () => {
+  const appleDate = 200_000_000_000_000_000;
+  const home = await buildTempMessagesHome([
+    {
+      chatIdentifier: "6043154583",
+      date: appleDate,
+      isFromMe: 0,
+      text: "direct phone context row",
+    },
+  ]);
+  try {
+    const proc = Bun.spawn(
+      [join(PROJECT_ROOT, "scripts", "imessage-thread.sh"), "6043154583", "1"],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          HOME: home,
+          RELAY_MESSAGES_DB_PATH: join(home, "Library", "Messages", "chat.db"),
+          RELAY_CONTACT_ALIASES_PATH: "/nonexistent/contact-aliases.json",
+        },
+      },
+    );
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.resolved).toBe("+16043154583");
+    expect(parsed.last_messaged_at).toBe(appleDate);
+    expect(parsed.messages[0].text).toBe("direct phone context row");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("iMessage normalizer decodes attributedBody rows before stale text rows", async () => {
+  const current = "Fresh current body";
+  const bodyHex = Buffer.concat([
+    Buffer.from("prefix NSString", "utf8"),
+    Buffer.from([0x01, 0x94, 0x84, 0x01, 0x2b, Buffer.byteLength(current)]),
+    Buffer.from(current, "utf8"),
+    Buffer.from([0x86]),
+  ]).toString("hex");
+  const rows = [
+    {
+      id: 3,
+      sender: "them",
+      ts: "2026-05-17 10:00:00",
+      text: "",
+      attributed_body_hex: bodyHex,
+      associated_message_type: 0,
+    },
+    {
+      id: 4,
+      sender: "me",
+      ts: "2026-05-17 09:59:30",
+      text: "\u0000All good bro",
+      attributed_body_hex: "",
+      associated_message_type: 0,
+    },
+    {
+      id: 2,
+      sender: "me",
+      ts: "2026-05-17 09:59:00",
+      text: "Loved a message",
+      attributed_body_hex: "",
+      associated_message_type: 2000,
+    },
+    {
+      id: 1,
+      sender: "me",
+      ts: "2025-10-17 10:00:00",
+      text: "Older plain text",
+      attributed_body_hex: "",
+      associated_message_type: 0,
+    },
+  ];
+
+  const proc = Bun.spawn(
+    [
+      "python3",
+      join(PROJECT_ROOT, "scripts", "imessage-normalize-messages.py"),
+      "+15555550123",
+      "3",
+    ],
+    {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: PROJECT_ROOT,
+      env: { ...process.env },
+    },
+  );
+  proc.stdin?.write(JSON.stringify(rows));
+  await proc.stdin?.end();
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  expect(stderr).toBe("");
+  expect(code).toBe(0);
+  const parsed = JSON.parse(stdout);
+  expect(parsed.messages.map((m: { text: string }) => m.text)).toEqual([
+    current,
+    "All good bro",
+    "Older plain text",
+  ]);
 });
 
 test("contact resolver normalizes formatted AddressBook phone numbers", async () => {

@@ -9,11 +9,16 @@
 // Triggered for the 2026-05-11 lawyers/speech turn where FTS didn't surface
 // the Medicolegal-Case notes because the user's message had no shared tokens
 // with the chunks but DID mention Saint Amman / Rob Roy / MIET / lawyers.
+//
+// PLAN.md section 5: this module dispatches FTS queries to fts-worker.ts via
+// runFtsInWorker so no FTS MATCH call ever runs on the main thread. That keeps
+// the relay event loop responsive even if a future anchor set produces a slow
+// scan; the worker times out and terminates cleanly.
 
-import { Database } from "bun:sqlite";
 import { readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
+import { runFtsInWorker } from "./retrieval";
 
 // CONFIG_PATH / DB_PATH are resolved lazily so tests can set
 // PROJECT_ANCHORS_CONFIG after importing this module without racing the
@@ -23,12 +28,10 @@ function configPath(): string {
     ?? join(homedir(), "Projects", "claude-telegram-relay", "config", "project-anchors.json");
 }
 
-function dbPath(): string {
-  return process.env.INDEXER_DB
-    ?? join(homedir(), ".local-search", "metadata.db");
-}
-
 const ANCHOR_TIMEOUT_MS = Number(process.env.PROJECT_ANCHOR_TIMEOUT_MS ?? "3000");
+const ANCHOR_PER_QUERY_TIMEOUT_MS = Number(
+  process.env.PROJECT_ANCHOR_QUERY_TIMEOUT_MS ?? "1500",
+);
 const HITS_PER_PROJECT = 4;
 const MAX_CHARS_PER_HIT = 600;
 
@@ -119,81 +122,97 @@ export async function findAnchoredProjects(text: string): Promise<AnchorMatch[]>
  * pick out the relevant chunks fast). Results are pulled from the same
  * indexer DB the main retrieval path uses, scoped via `files.path LIKE`.
  */
+export type FtsWorkerRunner = (
+  sql: string,
+  params: unknown[],
+  timeoutMs: number,
+) => Promise<{ rows: unknown[]; ms: number }>;
+
+export interface RetrieveAnchoredContextOptions {
+  runFts?: FtsWorkerRunner;
+  now?: () => number;
+  totalTimeoutMs?: number;
+  perQueryTimeoutMs?: number;
+}
+
 export async function retrieveAnchoredContext(
   matches: AnchorMatch[],
+  options: RetrieveAnchoredContextOptions = {},
 ): Promise<AnchorHit[]> {
   if (matches.length === 0) return [];
 
+  const runFts: FtsWorkerRunner = options.runFts ?? ((sql, params, timeoutMs) =>
+    runFtsInWorker(sql, params, timeoutMs));
+  const now = options.now ?? (() => Date.now());
+  const totalTimeoutMs = options.totalTimeoutMs ?? ANCHOR_TIMEOUT_MS;
+  const perQueryTimeoutMs = options.perQueryTimeoutMs ?? ANCHOR_PER_QUERY_TIMEOUT_MS;
+
   const hits: AnchorHit[] = [];
-  const db = new Database(dbPath(), { readwrite: true, create: false });
-  try {
-    db.exec("PRAGMA query_only = ON;");
+  const deadline = now() + totalTimeoutMs;
 
-    const deadline = Date.now() + ANCHOR_TIMEOUT_MS;
-
-    for (const m of matches) {
-      if (Date.now() > deadline) {
-        console.error(`[project-anchors] retrieval deadline reached; skipping ${m.project.name}`);
-        break;
-      }
-
-      // Build an OR-ed phrase query from the matched anchors. Quoted to
-      // keep multi-word phrases together. FTS5 will return the best
-      // matching chunks anywhere in the corpus; the path filter below
-      // scopes it to this project's directories.
-      const ftsQuery = m.matchedAnchors
-        .map((a) => `"${a.replace(/"/g, '""')}"`)
-        .join(" OR ");
-
-      const pathClauses = m.project.paths
-        .map((_, i) => `f.path LIKE ?${i + 2}`)
-        .join(" OR ");
-
-      const sql = `
-        SELECT f.path AS path, c.chunk_index AS chunk_index,
-               substr(c.text, 1, ${MAX_CHARS_PER_HIT}) AS content,
-               bm25(chunks_fts) AS rank
-        FROM chunks_fts
-        JOIN chunks c ON c.rowid = chunks_fts.rowid
-        JOIN files f ON f.id = c.file_id
-        WHERE chunks_fts MATCH ?1
-          AND (${pathClauses})
-        ORDER BY rank
-        LIMIT ${HITS_PER_PROJECT}
-      `;
-
-      try {
-        const stmt = db.query(sql);
-        const params: (string | number)[] = [ftsQuery, ...m.project.paths];
-        const rows = stmt.all(...params) as Array<{
-          path: string;
-          chunk_index: number;
-          content: string;
-          rank: number;
-        }>;
-        if (rows.length > 0) {
-          hits.push({
-            project: m.project,
-            matchedAnchors: m.matchedAnchors,
-            chunks: rows.map((r) => ({
-              path: r.path,
-              chunkIndex: r.chunk_index,
-              content: r.content,
-            })),
-          });
-        }
-        console.log(
-          `[project-anchors] ${m.project.name}: matched=${m.matchedAnchors.length} hits=${rows.length}`,
-        );
-      } catch (err) {
-        console.error(
-          `[project-anchors] FTS query for ${m.project.name} failed:`,
-          err instanceof Error ? err.message : err,
-        );
-      }
+  for (const m of matches) {
+    const remainingBudget = deadline - now();
+    if (remainingBudget <= 0) {
+      console.error(`[project-anchors] retrieval deadline reached; skipping ${m.project.name}`);
+      break;
     }
-  } finally {
-    db.close();
+
+    // Build an OR-ed phrase query from the matched anchors. Quoted to
+    // keep multi-word phrases together. FTS5 will return the best
+    // matching chunks anywhere in the corpus; the path filter below
+    // scopes it to this project's directories.
+    const ftsQuery = m.matchedAnchors
+      .map((a) => `"${a.replace(/"/g, '""')}"`)
+      .join(" OR ");
+
+    const pathClauses = m.project.paths
+      .map((_, i) => `f.path LIKE ?${i + 2}`)
+      .join(" OR ");
+
+    const sql = `
+      SELECT f.path AS path, c.chunk_index AS chunk_index,
+             substr(c.text, 1, ${MAX_CHARS_PER_HIT}) AS content,
+             bm25(chunks_fts) AS rank
+      FROM chunks_fts
+      JOIN chunks c ON c.rowid = chunks_fts.rowid
+      JOIN files f ON f.id = c.file_id
+      WHERE chunks_fts MATCH ?1
+        AND (${pathClauses})
+      ORDER BY rank
+      LIMIT ${HITS_PER_PROJECT}
+    `;
+
+    const queryTimeoutMs = Math.min(perQueryTimeoutMs, remainingBudget);
+    const params: (string | number)[] = [ftsQuery, ...m.project.paths];
+
+    try {
+      const { rows } = await runFts(sql, params, queryTimeoutMs);
+      const typed = rows as Array<{
+        path: string;
+        chunk_index: number;
+        content: string;
+        rank: number;
+      }>;
+      if (typed.length > 0) {
+        hits.push({
+          project: m.project,
+          matchedAnchors: m.matchedAnchors,
+          chunks: typed.map((r) => ({
+            path: r.path,
+            chunkIndex: r.chunk_index,
+            content: r.content,
+          })),
+        });
+      }
+      console.log(
+        `[project-anchors] ${m.project.name}: matched=${m.matchedAnchors.length} hits=${typed.length}`,
+      );
+    } catch (err) {
+      console.error(
+        `[project-anchors] FTS query for ${m.project.name} failed:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 
   return hits;

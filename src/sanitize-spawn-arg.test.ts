@@ -1,0 +1,109 @@
+import { describe, expect, test } from "bun:test";
+import {
+  sanitizeSpawnArg,
+  sanitizeSpawnArgs,
+  containsUnsafeControlChars,
+} from "./sanitize-spawn-arg.ts";
+
+const NUL = "\x00";
+const BEL = "\x07";
+const DEL = "\x7F";
+const C1_PAD = "\x80";
+const C1_APC = "\x9F";
+
+describe("sanitizeSpawnArg", () => {
+  test("strips a single embedded NUL byte", () => {
+    expect(sanitizeSpawnArg(`hello${NUL}world`)).toBe("helloworld");
+  });
+
+  test("strips multiple NULs anywhere in the string", () => {
+    expect(sanitizeSpawnArg(`${NUL}a${NUL}b${NUL}`)).toBe("ab");
+  });
+
+  test("preserves tab, newline, and carriage return", () => {
+    expect(sanitizeSpawnArg("a\tb\nc\rd")).toBe("a\tb\nc\rd");
+  });
+
+  test("strips C0 control characters other than \\t, \\n, \\r", () => {
+    expect(sanitizeSpawnArg("a\x01b\x02c\x03d")).toBe("abcd");
+  });
+
+  test("strips ASCII DEL (U+007F)", () => {
+    expect(sanitizeSpawnArg(`danger${DEL}zone`)).toBe("dangerzone");
+  });
+
+  test("strips C1 controls (U+0080 through U+009F)", () => {
+    expect(sanitizeSpawnArg(`a${C1_PAD}b${C1_APC}c`)).toBe("abc");
+    expect(sanitizeSpawnArg("hi\x85there")).toBe("hithere");
+  });
+
+  test("preserves Latin-1 supplement and above (U+00A0+)", () => {
+    expect(sanitizeSpawnArg("café — naïve 漢字 🚀 ¡hola!")).toBe("café — naïve 漢字 🚀 ¡hola!");
+  });
+
+  test("returns empty string for empty input", () => {
+    expect(sanitizeSpawnArg("")).toBe("");
+  });
+
+  test("returns the input unchanged when there is nothing to strip", () => {
+    const clean = "Hi Mom, picking up Theo at 3pm";
+    expect(sanitizeSpawnArg(clean)).toBe(clean);
+  });
+
+  test("real iMessage-shaped row with leading NUL produces clean text", () => {
+    const raw = `me: ${NUL}All good bro, can do!`;
+    expect(sanitizeSpawnArg(raw)).toBe("me: All good bro, can do!");
+  });
+});
+
+describe("sanitizeSpawnArgs", () => {
+  test("sanitizes every string in the array", () => {
+    const result = sanitizeSpawnArgs([
+      "/usr/local/bin/claude",
+      "-p",
+      `hello${NUL}world`,
+      "--append-system-prompt",
+      `context with NUL: ${NUL}end`,
+    ]);
+    expect(result).toEqual([
+      "/usr/local/bin/claude",
+      "-p",
+      "helloworld",
+      "--append-system-prompt",
+      "context with NUL: end",
+    ]);
+  });
+
+  test("returns a new array (does not mutate input)", () => {
+    const input = [`a${NUL}`, "b"];
+    const output = sanitizeSpawnArgs(input);
+    expect(input).toEqual([`a${NUL}`, "b"]);
+    expect(output).toEqual(["a", "b"]);
+  });
+});
+
+describe("containsUnsafeControlChars", () => {
+  test("returns true when a NUL is present", () => {
+    expect(containsUnsafeControlChars(`a${NUL}b`)).toBe(true);
+  });
+
+  test("returns true for other C0 controls", () => {
+    expect(containsUnsafeControlChars(`o${BEL}k`)).toBe(true);
+  });
+
+  test("returns true for C1 controls", () => {
+    expect(containsUnsafeControlChars(`a${C1_PAD}b`)).toBe(true);
+  });
+
+  test("returns false for clean text with allowed whitespace", () => {
+    expect(containsUnsafeControlChars("line1\nline2\tcol")).toBe(false);
+  });
+
+  test("returns false for plain ASCII", () => {
+    expect(containsUnsafeControlChars("hello")).toBe(false);
+  });
+
+  test("returns false for Latin-1 supplement boundary U+00A0", () => {
+    expect(containsUnsafeControlChars("a b")).toBe(false);
+  });
+});

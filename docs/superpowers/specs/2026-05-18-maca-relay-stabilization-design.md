@@ -1,0 +1,172 @@
+# MacA Relay Stabilization — Design
+
+**Status:** approved 2026-05-18 (PLAN2.md handed back by user).
+**Branch:** `relay/maca-stabilization`.
+**Sequence:** A0 → A → B → D → C → E, single stabilization branch, one commit per phase.
+
+## Goals (in priority order)
+
+1. **A0** — eliminate the proven `ERR_INVALID_ARG_VALUE` NUL-byte spawn crash on iMessage drafts.
+2. **A** — make exactly one process hold the Telegram bot token on this host; exit cleanly on persistent 409 and let launchd own restart pacing.
+3. **B** — give the iCloud Drive draft a real contract with version, identity, expiry, and end-to-end hash; stop misleading the user with handoff boilerplate when the body is already in their Telegram reply.
+4. **D** — turn `setup:verify` from an env smoke test into a stabilization gate that fails on fresh 409/401, NUL crashes, multiple relay PIDs, missing token lock, drifted Bun realpath, broken Shortcut, missing FDA, and bad draft schema.
+5. **C** — make the launchd job durable and observable: realpath Bun, explicit env, KeepAlive policy, ThrottleInterval, dedicated logs.
+6. **E** — lock in the FTS Worker safeguards with regression tests so they cannot quietly rot.
+
+## Non-goals (this pass)
+
+- Signed `~/Applications/ClaudeRelay.app` wrapper for FDA — defer; use realpath-bun fallback.
+- Token rotation in BotFather — runbook only; user action.
+- File-per-draft or Shortcut ACK channel — larger product change.
+- Move `project-anchors.ts` SQLite FTS to a Worker — follow-up only if it appears in latency/crash logs.
+- Migrate to webhooks / Tailscale — long polling stays.
+- Hard-cut the legacy `bot.lock` semantics; the new lock fully replaces it (no dual-write).
+
+## Architecture
+
+### A0 — NUL-byte boundary sanitizer
+
+New helper `src/sanitize-spawn-arg.ts`:
+
+```
+sanitizeSpawnArg(s: string): string  // strips \x00 and C0/C1 controls except \n, \r, \t
+```
+
+Applied at exactly two boundaries:
+
+- `src/imessage-context.ts::renderIMessageContext` — sanitize each line before joining.
+- `src/relay.ts` — sanitize every string in the `spawn` args array for the Claude CLI.
+
+Regression tests:
+
+- `imessage-context.test.ts`: a message with `\x00` in body comes through clean.
+- new `sanitize-spawn-arg.test.ts`: NUL stripped, `\n\r\t` preserved, multi-byte UTF-8 intact.
+
+### A — Token-keyed singleton + bounded 409
+
+New `src/token-lock.ts`:
+
+```
+acquireTokenLock({ token, host, pid, now }): Promise<{ ok: true; path } | { ok: false; reason; holder? }>
+releaseTokenLock({ token, pid }): Promise<void>
+heartbeatTokenLock({ token, pid, now }): Promise<void>
+```
+
+- Lock path: `~/.claude-relay/locks/token-<sha256(token).slice(0,16)>.lock`.
+- Payload: `{ schema_version, token_hash, host, pid, started_at, heartbeat_at }`. `token_hash` is the full sha256 hex of the token; the filename uses the prefix; **the token itself never appears in payload or filename**.
+- Stale-lock detection: `pid` must be alive **and** its `ps` cmdline must contain `relay.ts`; otherwise take it over with a logged note. `kill(pid, 0)` alone is insufficient.
+- Released on SIGINT, SIGTERM, normal exit, and `process.on("exit")` (sync fallback for crash).
+
+Relay startup order changes:
+
+1. Resolve token, fail fast if unset.
+2. `acquireTokenLock`. If held by another live relay, exit code 75 (`EX_TEMPFAIL`) with actionable hint.
+3. `getMe()` against Telegram. Log username; redact token.
+4. `deleteWebhook({ drop_pending_updates: false })` (idempotent if no webhook).
+5. `bot.start()` with bounded 409 retry: at most `RELAY_409_MAX_ATTEMPTS` (default 5) at `TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS` spacing, then log a one-line diagnostic snapshot and exit clean (code 75). Launchd's `ThrottleInterval=30` controls the next attempt.
+
+Signal cleanup: SIGTERM/SIGINT calls `bot.stop()` (best-effort), releases lock, terminates FTS Worker, then `process.exit(0)`.
+
+Tests (`src/token-lock.test.ts`, `src/telegram-polling.test.ts`):
+- stale lock takeover when payload PID isn't a relay.
+- live lock refusal when payload PID is a live relay (mocked `ps`).
+- `token_hash` is sha256 hex and not the raw token.
+- bounded 409 attempts then clean exit (test the policy function, not the actual sleep loop).
+- signal cleanup invokes lock release.
+
+### B — CloudDocs draft contract
+
+`src/icloud-drive-draft.ts` payload becomes:
+
+```json
+{
+  "schema_version": 2,
+  "draft_id": "uuidv4",
+  "writer_host": "<hostname>",
+  "created_at": "ISO8601",
+  "expires_at": "ISO8601 (created_at + RELAY_DRAFT_TTL_MS, default 10 min)",
+  "recipient": "...",
+  "recipient_label": "...",
+  "body": "...",
+  "body_sha256": "<sha256 of body>"
+}
+```
+
+Atomic write semantics already exist; preserve them. Add hash recomputation and expiry-aware validators:
+
+- `validateICloudDriveDraftPayload(payload, { now }): { ok, errors[] }` — schema, sha256 round-trip, not expired.
+
+Relay side:
+- log line becomes `phone_handoff_ready=true` in decision-log state only; not user-visible.
+- Telegram reply: when body is already in the message, drop the trailing "Run ClaudeDraft…" footer.
+
+Verify side (D consumes this):
+- recompute `body_sha256` against payload `body`.
+- check `expires_at > now`.
+- check pending install file under both `ClaudeDraft.shortcut` and `ClaudeDraft-install.shortcut`.
+
+Tests (`src/icloud-drive-draft.test.ts`):
+- write yields schema_version 2 with all new fields populated.
+- `body_sha256` matches a recomputed hash.
+- expired payload fails validator; fresh payload passes.
+- recipient/body still required.
+
+### D — Verification gate
+
+`setup/verify.ts` adds:
+
+- **Token lock check** — `~/.claude-relay/locks/token-<prefix>.lock` exists, payload validates, `host` matches, `pid` is a live relay.
+- **Single relay PID** — already partially in place; promote multi-PID to FAIL.
+- **Bun realpath stability** — record `realpath(bun)` to `~/.claude-relay/state/bun-realpath`; FAIL when it drifts.
+- **launchd plist content** — parse `launchctl print` output; FAIL when env or KeepAlive/Throttle policy doesn't match expectations.
+- **Recent log scan** — tail last N lines of `com.claude.telegram-relay.error.log`; FAIL on fresh `409`, `401`, or `ERR_INVALID_ARG_VALUE`.
+- **chat.db probe** — open `~/Library/Messages/chat.db` read-only; if it fails with `operation not permitted`, FAIL with exact FDA target text (`realpath $(which bun)`).
+- **CloudDocs draft validation** — call the new validator (schema, sha256, expiry).
+- **Drop noisy warning** — remove the "launchd writes active logs outside repo logs/" warning (the relay's logs are correctly under `~/.claude-relay/logs`).
+- **Warn-only** — `RELAY_PYTHON` missing, Supabase disabled, voice provider disabled.
+
+### C — launchd hardening
+
+`setup/configure-launchd.ts` changes:
+
+- `findBun` returns `realpath` of the resolved Bun binary (not the `~/.bun/bin/bun` symlink).
+- `EnvironmentVariables` adds `RELAY_DIR`, `RELAY_LOG_DIR`, `RELAY_PYTHON` (if set in env or `.env`).
+- Replace `<key>KeepAlive</key><true/>` with dict form: `{ SuccessfulExit = false, Crashed = true }`.
+- `ThrottleInterval = 30`, `ExitTimeOut = 20`.
+- stdout/stderr stay under `~/.claude-relay/logs` (already the case via `LOGS_DIR`).
+- Try `launchctl bootout` + `launchctl bootstrap` first; fall back to `remove` + `unload`/`load` on older systems.
+
+Tests (`setup/configure-launchd.test.ts`):
+- generated plist contains the env block we expect.
+- KeepAlive is a dict, not a bool.
+- ThrottleInterval is 30, ExitTimeOut is 20.
+- XML escaping survives `& < > " '` in paths.
+- Bun path in plist resolves to a realpath, not the symlink.
+
+### E — FTS regression tests
+
+`src/retrieval.test.ts` adds:
+
+- Broad OR avoidance — given an input that previously generated a multi-term OR, the built query stays AND-bounded.
+- Worker timeout — `FTS_TIMEOUT_MS` small + slow query → Worker terminated, error returned, no hang.
+- Zero-hit poison query — known poison string returns empty result within timeout.
+- Verify-side zero hits — `__test__preflightFtsWorker` (or equivalent) treats zero hits as warning, not throw.
+
+Document follow-up: `src/project-anchors.ts` keeps synchronous in-process FTS for now; move to Worker only if it shows up in latency/crash logs.
+
+## Risk + rollback
+
+- Each phase is its own commit; revert by `git revert <hash>`.
+- A0 is the safest start (pure sanitization, no behaviour change for clean inputs).
+- A changes lockfile path — old `bot.lock` is removed on takeover; rolling back A leaves no orphan because the new code never wrote `bot.lock`.
+- B bumps `schema_version` from 1 → 2; verify uses the new validator. If a phone still has the old Shortcut, the body will still appear because we keep the same `recipient`/`body` keys.
+- D is read-only checks; no runtime risk.
+- C touches launchd; the plist generator writes a new file and re-bootstraps, so a bad plist surfaces in `plutil -lint` (already wired).
+- E is test-only.
+
+## Acceptance
+
+- `bun test` green.
+- `bun run test:smoke` green.
+- `bun run setup:verify` reports zero `FAIL`, only intentional `WARN`s.
+- Live: send one Telegram message → exactly one Claude response, no 409 in error log, no NUL crash, iMessage draft body present in Telegram reply, CloudDocs `latest.json` validates.

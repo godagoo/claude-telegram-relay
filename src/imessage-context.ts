@@ -7,6 +7,7 @@
 
 import { spawn } from "bun";
 import { join } from "path";
+import { sanitizeSpawnArg } from "./sanitize-spawn-arg.ts";
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 20;
@@ -35,6 +36,19 @@ export interface IMessageContextResult {
    * deterministically when placing a draft.
    */
   resolvedRecipient?: string;
+  /**
+   * AddressBook full name for the chosen contact, when known. Empty for
+   * direct-identifier inputs and for the message-text fallback path that
+   * has no contact record. Used in the Telegram surface line so the user
+   * sees who the bot picked, not just a handle.
+   */
+  resolvedDisplayName?: string;
+  /**
+   * Most recent chat.db message timestamp with this contact, in Apple-epoch
+   * nanoseconds (the raw chat.db `date` column value). Convert to Unix
+   * epoch seconds via (ns / 1e9) + 978307200. 0 when no history.
+   */
+  resolvedLastMessagedAt?: number;
   error?: string;
 }
 
@@ -124,7 +138,7 @@ const RELATIONSHIP_CONTACT_RE =
 const MULTI_RELATIONSHIP_CONTACT_RE =
   /\b(?:[Ww]ith|[Tt]o|[Ff]or|[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\s+(?:and|&)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
 const COMMAND_POSITION_CONTACT_RE =
-  /\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|with|about|letting|telling)\b))/;
+  /^\s*(?:(?:[Oo]k(?:ay)?|[Aa]lright|[Ss]ure)[,.\s]+)?(?:(?:[Pp]lease|[Pp]ls|[Cc]an you|[Cc]ould you|[Ww]ould you)\s+)?(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[a-z][a-z'\-]{1,30}(?:\s+[a-z][a-z'\-]{1,30}){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|with|about|letting|telling)\b))/;
 
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();
@@ -237,11 +251,63 @@ export interface IMessageDraftRequest {
   contextLimit: number;
   wantsPlacement: boolean;
   /**
-   * Exact body supplied by the user in this turn. When present and no prior
-   * thread context was requested, the relay can place the draft without a
-   * Claude round trip or marker compliance risk.
+   * Body instruction supplied by the user in this turn. For named contacts,
+   * the relay treats this as the core meaning and still lets Claude apply
+   * thread context plus writing-style rules. For direct phone/email targets
+   * where no local thread can be read, the relay may place this body directly.
    */
   directBody?: string;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function contactRegex(contact: string): RegExp {
+  const escapedWords = contact.trim().split(/\s+/).map(escapeRegExp).join(String.raw`\s+`);
+  return /^[A-Za-z]+(?:\s+[A-Za-z]+)*$/.test(contact.trim())
+    ? new RegExp(String.raw`\b${escapedWords}\b`, "gi")
+    : new RegExp(escapeRegExp(contact), "gi");
+}
+
+export function requestHasIMessageDraftMaterial(
+  message: string,
+  request: IMessageDraftRequest | null,
+): boolean {
+  if (!request) return false;
+  if (request.directBody) return true;
+
+  const contacts = [request.contact];
+  if (request.contact === SELF_CONTACT) contacts.push("me", "myself");
+  let remainder = message;
+  for (const contact of contacts) {
+    remainder = remainder.replace(contactRegex(contact), " ");
+  }
+
+  remainder = remainder
+    .replace(/\b(?:ok(?:ay)?|alright|sure|please|pls|can\s+you|could\s+you|would\s+you)\b/gi, " ")
+    .replace(/\b(?:draft|write|compose|send|shoot|text|message|respond|reply|ping)\b/gi, " ")
+    .replace(/\b(?:imessage|imessages|texts?|sms|messages?|chat|reply|response)\b/gi, " ")
+    .replace(/\b(?:to|for|with|back|right|a|an|the|my|our|his|her|their)\b/gi, " ")
+    .replace(/\b(?:last|recent|previous|prior|context|history|through|look|read|go)\b/gi, " ")
+    .replace(/\b(?:directly|in|into|native|open|app|compose|box|chatbox)\b/gi, " ")
+    .replace(/[+()\-\d\s]{7,}/g, " ")
+    .replace(/[^A-Za-z0-9]+/g, " ")
+    .trim();
+
+  return /[A-Za-z]/.test(remainder);
+}
+
+export function shouldClarifyMissingIMessageDraftBody(args: {
+  message: string;
+  request: IMessageDraftRequest | null;
+  contextResult: IMessageContextResult | null;
+  alreadyAnsweredLastMessageDraft?: boolean;
+}): boolean {
+  if (!args.request?.wantsPlacement) return false;
+  if (args.alreadyAnsweredLastMessageDraft) return false;
+  if (args.contextResult?.status === "found") return false;
+  return !requestHasIMessageDraftMaterial(args.message, args.request);
 }
 
 export function extractIMessageDraftRequest(
@@ -380,11 +446,23 @@ export async function fetchIMessageContext(
       typeof parsed?.resolved === "string" && parsed.resolved.length > 0
         ? parsed.resolved
         : undefined;
+    const resolvedDisplayName =
+      typeof parsed?.display_name === "string" && parsed.display_name.length > 0
+        ? parsed.display_name
+        : undefined;
+    const resolvedLastMessagedAt =
+      typeof parsed?.last_messaged_at === "number" &&
+      Number.isFinite(parsed.last_messaged_at) &&
+      parsed.last_messaged_at > 0
+        ? parsed.last_messaged_at
+        : undefined;
     return {
       request,
       status: messages.length > 0 ? "found" : "empty",
       messages,
       resolvedRecipient,
+      resolvedDisplayName,
+      resolvedLastMessagedAt,
     };
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);
@@ -398,13 +476,69 @@ export async function fetchIMessageContext(
   }
 }
 
+/**
+ * Apple-epoch nanoseconds to a short human-readable "how long ago" phrase.
+ * Returns "" when no timestamp is known so the caller can compose conditional
+ * sentences without dangling parentheticals. Resolution is intentionally
+ * coarse: the user only needs to know whether the contact is fresh in their
+ * head, not the exact minute they last replied.
+ *
+ * Apple epoch is 2001-01-01 UTC, which is 978307200 seconds after Unix epoch.
+ */
+export function formatLastMessagedHint(
+  lastMessagedAtNs: number | undefined,
+  now: Date = new Date(),
+): string {
+  if (!lastMessagedAtNs || lastMessagedAtNs <= 0) return "";
+  const unixSeconds = lastMessagedAtNs / 1e9 + 978307200;
+  const nowSeconds = now.getTime() / 1000;
+  const diffSec = nowSeconds - unixSeconds;
+  // Future timestamp: chat.db row is inconsistent or the host clock skewed.
+  // Skip the hint rather than printing "in 3 days" to the user.
+  if (diffSec < 0) return "";
+  if (diffSec < 60 * 60) return "earlier today";
+  if (diffSec < 24 * 60 * 60) return "today";
+  if (diffSec < 2 * 24 * 60 * 60) return "yesterday";
+  const days = Math.floor(diffSec / 86400);
+  if (days < 7) return `${days} days ago`;
+  if (days < 14) return "a week ago";
+  if (days < 30) return `${Math.floor(days / 7)} weeks ago`;
+  if (days < 60) return "a month ago";
+  if (days < 365) return `${Math.floor(days / 30)} months ago`;
+  if (days < 730) return "a year ago";
+  return `${Math.floor(days / 365)} years ago`;
+}
+
+/**
+ * Compose the Telegram surface line that confirms which contact the relay
+ * picked. The user explicitly accepted that contact ambiguity is resolved
+ * silently by most-recent-activity (no disambiguation prompt), so this line
+ * is the visible checkpoint before the user taps send in Messages on their
+ * iPhone. Returns "" when neither a display name nor a handle is available,
+ * which lets the caller skip prepending entirely.
+ */
+export function buildContactSelectionLine(
+  context: IMessageContextResult | null | undefined,
+  fallbackContact: string,
+  now: Date = new Date(),
+): string {
+  const displayName = context?.resolvedDisplayName;
+  const handle = context?.resolvedRecipient;
+  const name = (displayName ?? "").trim() || (handle ?? "").trim() || (fallbackContact ?? "").trim();
+  if (!name) return "";
+  const recency = formatLastMessagedHint(context?.resolvedLastMessagedAt, now);
+  return recency
+    ? `Drafting for ${name} (last messaged ${recency}).`
+    : `Drafting for ${name}.`;
+}
+
 export function renderIMessageContext(result: IMessageContextResult): string {
   const { request } = result;
 
   if (result.status === "found") {
     const chronological = [...result.messages].reverse();
     const lines = chronological.map((m) =>
-      `- ${m.ts} ${m.sender}: ${m.text.replace(/\s+/g, " ").trim()}`
+      `- ${m.ts} ${m.sender}: ${sanitizeSpawnArg(m.text).replace(/\s+/g, " ").trim()}`
     );
     return [
       `IMESSAGE CONTEXT FOR ${request.contact} (last ${result.messages.length} messages):`,

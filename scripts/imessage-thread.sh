@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# imessage-thread.sh — print the most recent iMessages with a given contact
+# imessage-thread.sh - print the most recent iMessages with a given contact
 # as JSON. Used by the bot to gather context before drafting a reply.
 #
 # Usage:
@@ -17,8 +17,9 @@
 # Requires:
 #   Full Disk Access on the process that ends up running sqlite3. The relay
 #   invokes this directly from bun before Claude runs, so FDA must be granted
-#   to the resolved bun Cellar binary (`readlink -f "$(which bun)"`), not to
-#   Terminal and not to the Claude CLI.
+#   to the resolved bun Cellar binary. Find that path by running
+#   `bun run setup:verify` and reading the "FDA responsible target" line.
+#   Do NOT grant FDA to Terminal or to the Claude CLI for this relay.
 #   See docs/IMESSAGE-SETUP.md for the one-time setup.
 #
 # Output goes to the relay's local short-term context, never to a remote
@@ -84,49 +85,25 @@ PY
 }
 
 chat_identifier_candidates_sql() {
-  local identifier="$1"
-  local digits without_country candidate seen already out
-  local -a candidates unique
-
-  candidates=("$identifier")
-
-  if [[ "$identifier" != *"@"* ]]; then
-    digits="$(printf "%s" "$identifier" | tr -cd '0-9')"
-    if [[ -n "$digits" ]]; then
-      candidates+=("$digits" "+$digits")
-      if [[ ${#digits} -eq 10 ]]; then
-        candidates+=("1$digits" "+1$digits")
-      elif [[ ${#digits} -eq 11 && "$digits" == 1* ]]; then
-        without_country="${digits#1}"
-        candidates+=("$without_country" "+$without_country")
-      fi
-    fi
-  fi
-
-  unique=()
-  for candidate in "${candidates[@]}"; do
-    [[ -n "$candidate" ]] || continue
-    already=0
-    if (( ${#unique[@]} > 0 )); then
-      for seen in "${unique[@]}"; do
-        if [[ "$seen" == "$candidate" ]]; then
-          already=1
-          break
-        fi
-      done
-    fi
-    (( already == 0 )) && unique+=("$candidate")
-  done
+  # Single source of truth lives in scripts/_phone_handle_variants.py so this
+  # script and resolve-contact.py see the same candidate set. The previous
+  # in-bash expansion produced a different set than resolve-contact.py's
+  # (identifier, +naked, naked, +1naked) tuple, which let the recency
+  # tie-breaker miss the chat row whose chat_identifier happened to use a
+  # variant only one side checked. PR3.5 audit #2 (Codex 2026-05-21).
+  local identifier="$1" candidate out
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  local helper="$script_dir/_phone_handle_variants.py"
 
   out=""
-  if (( ${#unique[@]} > 0 )); then
-    for candidate in "${unique[@]}"; do
-      if [[ -n "$out" ]]; then
-        out+=", "
-      fi
-      out+="'$(sql_string "$candidate")'"
-    done
-  fi
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if [[ -n "$out" ]]; then
+      out+=", "
+    fi
+    out+="'$(sql_string "$candidate")'"
+  done < <("$PYTHON3" "$helper" "$identifier")
   printf "%s" "$out"
 }
 
@@ -165,10 +142,6 @@ EOF
   printf "%s" "$out"
 }
 
-is_direct_identifier() {
-  [[ "$1" =~ ^[+0-9][0-9[:space:]().-]{6,}$ || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
-}
-
 allow_message_text_fallback() {
   local input_lc
   input_lc="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
@@ -188,13 +161,18 @@ allow_message_text_fallback() {
   return 0
 }
 
+# Globals populated by resolve_recipient so the rest of the script can pass
+# display_name and last_messaged_at through to the final JSON envelope. Empty
+# defaults match the pre-PR2 behavior when only a handle was available.
+RESOLVED_DISPLAY_NAME=""
+RESOLVED_LAST_MESSAGED_AT="0"
+RESOLVED_RECIPIENT=""
+
 resolve_recipient() {
   local input="$1"
-  if is_direct_identifier "$input"; then
-    printf "%s" "$input"
-    return 0
-  fi
-
+  RESOLVED_RECIPIENT=""
+  RESOLVED_DISPLAY_NAME=""
+  RESOLVED_LAST_MESSAGED_AT="0"
   # Primary resolver: a Python helper that searches every AddressBook source
   # database (iCloud/Exchange/CardDAV subdirs under
   # ~/Library/Application Support/AddressBook/Sources/*/) and fuzzy-matches
@@ -202,7 +180,9 @@ resolve_recipient() {
   # this Mac holds only the "me" record, which is why the old strict
   # substring query against just that DB always missed real contacts. The
   # helper handles direct identifiers, blocks relationship aliases, and
-  # returns an empty string if no good match exists.
+  # returns an empty string if no good match exists. Direct phone/email inputs
+  # intentionally go through this same --meta path so they still get normalized
+  # and carry last_messaged_at into the relay's checkpoint line and decision log.
   local script_dir
   script_dir="$(cd "$(dirname "$0")" && pwd)"
   local resolver="$script_dir/resolve-contact.py"
@@ -225,13 +205,34 @@ PY
     return 66
   fi
 
-  local contact err_file
+  # Call the resolver in --meta mode so we capture display_name and
+  # last_messaged_at alongside the handle. Parse the JSON via a dedicated
+  # helper that emits newline-delimited key=value pairs; bash reads those
+  # with `IFS='='`, which (unlike the previous IFS=$'\t' approach) preserves
+  # empty fields. PR3.5 audit #1 (Codex 2026-05-21).
+  local meta_output err_file emitter
+  emitter="$script_dir/_resolver-meta-emit-kv.py"
   err_file="$(mktemp "${TMPDIR:-/tmp}/resolve-contact.XXXXXX")"
-  if contact="$("$PYTHON3" "$resolver" "$input" 2>"$err_file")"; then
+  if meta_output="$("$PYTHON3" "$resolver" --meta "$input" 2>"$err_file")"; then
     rm -f "$err_file"
-    if [[ -n "$contact" ]]; then
-      printf "%s" "$contact"
-      return 0
+    if [[ -n "$meta_output" ]]; then
+      local parsed_kv
+      parsed_kv="$("$PYTHON3" "$emitter" "$meta_output")"
+      local handle=""
+      RESOLVED_DISPLAY_NAME=""
+      RESOLVED_LAST_MESSAGED_AT="0"
+      while IFS='=' read -r kv_key kv_value; do
+        case "$kv_key" in
+          handle) handle="$kv_value" ;;
+          display_name) RESOLVED_DISPLAY_NAME="$kv_value" ;;
+          last_messaged_at) RESOLVED_LAST_MESSAGED_AT="$kv_value" ;;
+        esac
+      done <<<"$parsed_kv"
+      # Defensive: if the parse glitched, fall through to fallback paths.
+      if [[ -n "$handle" ]]; then
+        RESOLVED_RECIPIENT="$handle"
+        return 0
+      fi
     fi
   else
     local status=$?
@@ -243,6 +244,24 @@ PY
     return 66
   fi
 
+  # Vault frontmatter fallback (PR3.5 #4, Codex 2026-05-21).
+  # When AddressBook returns no match, consult per-contact notes at
+  #   $RELAY_OBSIDIAN_VAULT_DIR/02-Cross-Project/people/<slug>.md
+  # for a `handle:` frontmatter field. This is the user's deterministic
+  # contact layer; aliases are maintained as filenames so a lookup is
+  # an exact slug match. The helper exits silently when no note exists.
+  local vault_helper="$script_dir/_vault_handle_lookup.py"
+  if [[ -x "$vault_helper" ]]; then
+    local vault_handle
+    vault_handle="$("$PYTHON3" "$vault_helper" "$input" 2>/dev/null)"
+    if [[ -n "$vault_handle" ]]; then
+      RESOLVED_DISPLAY_NAME="$input"
+      RESOLVED_LAST_MESSAGED_AT="0"
+      RESOLVED_RECIPIENT="$vault_handle"
+      return 0
+    fi
+  fi
+
   if ! allow_message_text_fallback "$input"; then
     return 0
   fi
@@ -252,6 +271,11 @@ PY
   # text, then use that chat identifier. Do not use this for short or
   # relationship-style aliases; those are too ambiguous to place a draft
   # safely.
+  #
+  # No display_name is recoverable on this branch (we found the handle by
+  # message-text search, not by AddressBook lookup), and last_messaged_at
+  # stays 0. The relay still surfaces the handle to the user so they can
+  # eyeball the recipient before sending.
   local q
   q="$(sql_string "$input")"
   local sql
@@ -267,16 +291,20 @@ ORDER BY MAX(m.date) DESC
 LIMIT 1;
 SQL
 )"
-  sqlite_query_or_exit "$sql"
+  RESOLVED_RECIPIENT="$(sqlite_query_or_exit "$sql")"
 }
 
-RESOLVED_RECIPIENT="$(resolve_recipient "$RECIPIENT")"
+resolve_recipient "$RECIPIENT"
 if [[ -z "$RESOLVED_RECIPIENT" ]]; then
   printf '{"resolved":"","messages":[]}\n'
   exit 0
 fi
 
 SQL_CHAT_IDENTIFIERS="$(chat_identifier_candidates_sql "$RESOLVED_RECIPIENT")"
+QUERY_LIMIT=$(( LIMIT * 4 ))
+if (( QUERY_LIMIT > 150 )); then
+  QUERY_LIMIT=150
+fi
 
 SQL_MESSAGES="$(cat <<SQL
 .mode json
@@ -284,15 +312,19 @@ SELECT
   m.ROWID AS id,
   CASE WHEN m.is_from_me = 1 THEN 'me' ELSE 'them' END AS sender,
   datetime(m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') AS ts,
-  m.text
+  COALESCE(m.text, '') AS text,
+  hex(m.attributedBody) AS attributed_body_hex,
+  COALESCE(m.associated_message_type, 0) AS associated_message_type
 FROM message m
 JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
 JOIN chat c ON c.ROWID = cmj.chat_id
 WHERE c.chat_identifier IN ($SQL_CHAT_IDENTIFIERS)
-  AND m.text IS NOT NULL
-  AND m.text != ''
+  AND (
+    (m.text IS NOT NULL AND m.text != '')
+    OR m.attributedBody IS NOT NULL
+  )
 ORDER BY m.date DESC
-LIMIT $LIMIT;
+LIMIT $QUERY_LIMIT;
 SQL
 )"
 MESSAGES_JSON="$(sqlite_query_or_exit "$SQL_MESSAGES")"
@@ -301,4 +333,12 @@ MESSAGES_JSON="$(sqlite_query_or_exit "$SQL_MESSAGES")"
 # the envelope is always valid JSON.
 [[ -z "$MESSAGES_JSON" ]] && MESSAGES_JSON='[]'
 
-printf '{"resolved":%s,"messages":%s}\n' "$(json_string "$RESOLVED_RECIPIENT")" "$MESSAGES_JSON"
+NORMALIZER="$(cd "$(dirname "$0")" && pwd)/imessage-normalize-messages.py"
+# Pass display_name and last_messaged_at through to the normalizer so the
+# final {resolved, messages, ...} envelope includes them when known. Empty
+# defaults are stripped by the normalizer so the legacy envelope shape
+# survives for callers that resolve by direct identifier.
+printf "%s" "$MESSAGES_JSON" | \
+  RELAY_RESOLVED_DISPLAY_NAME="$RESOLVED_DISPLAY_NAME" \
+  RELAY_RESOLVED_LAST_MESSAGED_AT="$RESOLVED_LAST_MESSAGED_AT" \
+  "$PYTHON3" "$NORMALIZER" "$RESOLVED_RECIPIENT" "$LIMIT"

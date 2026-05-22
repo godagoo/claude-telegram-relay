@@ -1153,7 +1153,7 @@ These are called as subprocesses by the relay. They live in the `scripts/` direc
 **Output:** JSON: `{ resolved: boolean, messages: [{sender, body, date}] }`
 **Timeout enforced by caller:** 8 seconds
 
-Why FDA is granted to bun specifically: The process tree is `launchd -> bun -> bash -> imessage-thread.sh -> sqlite3`. TCC (Transparency, Consent, and Control) checks the launching application, which is bun. FDA must be granted to the real bun binary at its Cellar path, found via `readlink -f "$(which bun)"`, NOT to the symlink at `/usr/local/bin/bun`.
+Why FDA is granted to bun specifically: The process tree is `launchd -> bun -> bash -> imessage-thread.sh -> sqlite3`. TCC (Transparency, Consent, and Control) checks the launching application, which is bun. FDA must be granted to the real bun binary at its Cellar path. Read the resolved path from `bun run setup:verify` (the `FDA responsible target` line), NOT the symlink at `/usr/local/bin/bun` or `/opt/homebrew/bin/bun`.
 
 ### scripts/draft-imessage.sh
 
@@ -1208,7 +1208,7 @@ All runtime state lives under `~/.claude-relay/`:
 | CLAUDE_TIMEOUT_MS | No | 90000 | ms before SIGTERM sent to claude |
 | CLAUDE_RESUME | No | 0 | Set to 1 to resume Claude sessions |
 | SUPABASE_URL | No | -- | Supabase project URL (enables Supabase features) |
-| SUPABASE_ANON_KEY | No | -- | Supabase anon key |
+| SUPABASE_ANON_KEY | No | -- | Supabase service_role key (env var name preserved for back-compat; the configured RLS policies grant access to service_role only) |
 | MEMORY_AUTHORITY | No | obsidian | "supabase" to enable durable memory |
 | SUPABASE_MESSAGE_HISTORY | No | 0 | "1" to persist turns to Supabase |
 | SUPABASE_RELEVANT_CONTEXT | No | 0 | "1" to enable pgvector semantic search |
@@ -1275,7 +1275,7 @@ The iCloud Drive handoff was placing the `shortcuts://run-shortcut?name=ClaudeDr
 
 ### Known Limitation: FDA for iMessage Context
 
-Reading iMessage thread history requires Full Disk Access for the bun binary. This must be granted manually in System Settings > Privacy & Security > Full Disk Access. The exact binary path must be found via `readlink -f "$(which bun)"` -- granting it to symlinks does not work.
+Reading iMessage thread history requires Full Disk Access for the bun binary. This must be granted manually in System Settings > Privacy & Security > Full Disk Access. Find the exact binary path by running `bun run setup:verify` and reading the `FDA responsible target` line — granting FDA to the bun symlink does not work because `brew upgrade bun` re-points the symlink to a fresh Cellar inode that has no grant.
 
 ### Known Limitation: Rosetta Compatibility
 

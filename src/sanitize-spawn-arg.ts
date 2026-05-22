@@ -1,0 +1,30 @@
+// Strip control characters that crash Bun/Node `spawn` argument validation.
+// The proven failure: a NUL byte in an iMessage row reached args[4] for the
+// Claude CLI and triggered ERR_INVALID_ARG_VALUE. Apply this at the two
+// boundaries where untrusted text becomes a spawn argument:
+//   - imessage-context render output
+//   - relay's Claude CLI args array
+//
+// What is stripped:
+//   - C0 controls U+0000..U+001F except \t (U+0009), \n (U+000A), \r (U+000D)
+//   - DEL U+007F
+//   - C1 controls U+0080..U+009F (PLAN3: extended sanitization scope)
+//
+// Latin-1 supplement (U+00A0+) and all higher Unicode planes are preserved.
+// The class is written using \xNN / \uNNNN escapes so the source file never
+// contains literal control bytes.
+
+const UNSAFE_CONTROL_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g;
+
+export function sanitizeSpawnArg(input: string): string {
+  return input.replace(UNSAFE_CONTROL_CHARS, "");
+}
+
+export function sanitizeSpawnArgs(args: readonly string[]): string[] {
+  return args.map(sanitizeSpawnArg);
+}
+
+export function containsUnsafeControlChars(input: string): boolean {
+  UNSAFE_CONTROL_CHARS.lastIndex = 0;
+  return UNSAFE_CONTROL_CHARS.test(input);
+}

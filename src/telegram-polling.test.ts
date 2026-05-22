@@ -1,11 +1,15 @@
 import { expect, test } from "bun:test";
 import {
   TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
+  TELEGRAM_POLLING_CONFLICT_DEFAULT_MAX_ATTEMPTS,
+  TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
   classifyTelegramPollingConflictError,
   formatTelegramPollingConflictHint,
   formatTelegramPollingConflictLog,
   isTelegramPollingConflictError,
   shouldEscalateTelegramPollingConflict,
+  shouldExitAfterTelegramPollingConflict,
+  shouldPrintConflictHint,
 } from "./telegram-polling";
 
 test("detects Telegram getUpdates 409 conflict objects", () => {
@@ -100,6 +104,37 @@ test("formats token-safe conflict diagnostics", () => {
   expect(line).toContain("attempt=10");
   expect(line).not.toContain("TELEGRAM_BOT_TOKEN");
   expect(line).not.toContain("bot123");
+});
+
+test("polling conflict has a bounded maximum attempt count", () => {
+  expect(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS).toBeGreaterThan(0);
+  expect(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS).toBeLessThan(20);
+});
+
+test("default max attempts is documented as 5", () => {
+  expect(TELEGRAM_POLLING_CONFLICT_DEFAULT_MAX_ATTEMPTS).toBe(5);
+});
+
+test("shouldPrintConflictHint surfaces hint on first attempt", () => {
+  expect(shouldPrintConflictHint(1, 5)).toBe(true);
+  expect(shouldPrintConflictHint(2, 5)).toBe(false);
+  expect(shouldPrintConflictHint(3, 5)).toBe(false);
+});
+
+test("shouldPrintConflictHint surfaces hint at the final attempt before shutdown", () => {
+  expect(shouldPrintConflictHint(4, 5)).toBe(false);
+  expect(shouldPrintConflictHint(5, 5)).toBe(true);
+  expect(shouldPrintConflictHint(6, 5)).toBe(true);
+});
+
+test("shouldExitAfterTelegramPollingConflict returns false below the limit", () => {
+  expect(shouldExitAfterTelegramPollingConflict(1)).toBe(false);
+  expect(shouldExitAfterTelegramPollingConflict(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS - 1)).toBe(false);
+});
+
+test("shouldExitAfterTelegramPollingConflict returns true at and beyond the limit", () => {
+  expect(shouldExitAfterTelegramPollingConflict(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS)).toBe(true);
+  expect(shouldExitAfterTelegramPollingConflict(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS + 5)).toBe(true);
 });
 
 test("formats actionable persistent conflict hints", () => {

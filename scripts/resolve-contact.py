@@ -8,13 +8,26 @@ abcddb (which on this Mac holds only the local "me" record). Returns the
 best-match identifier (phone or email) on stdout, or empty if no match.
 
 Match order:
-  1. Direct identifier (phone/email shape) → return as-is.
-  2. Exact case-insensitive substring against "first last nickname org" → use it.
+  1. Direct identifier (phone/email shape) -> return as-is.
+  2. Exact case-insensitive substring against "first last nickname org" -> use it.
   3. Fuzzy match (difflib SequenceMatcher) against name tokens, with a
-     similarity cutoff. Handles typos like "gailene" → "Gaileen".
+     similarity cutoff. Handles typos like "gailene" -> "Gaileen".
 
-Usage: resolve-contact.py "gailene"
-Exit codes: 0 always (no match prints empty line).
+Usage:
+  resolve-contact.py "gailene"
+      Prints just the resolved identifier (legacy default).
+  resolve-contact.py --meta "gailene"
+      Prints a JSON object on a single line:
+        {"handle": "...", "display_name": "...", "last_messaged_at": 0}
+      handle is the same string the legacy mode prints (empty when no match).
+      display_name is the AddressBook full name when known; empty when the
+      input was a direct identifier or no name could be recovered.
+      last_messaged_at is the Apple-epoch nanosecond timestamp returned by
+      _most_recent_message_date for the chosen handle (0 when no chat
+      history). Callers convert to Unix epoch by dividing by 1e9 and
+      adding 978307200.
+
+Exit codes: 0 always (no match prints empty handle).
 """
 
 from __future__ import annotations
@@ -26,6 +39,13 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+
+# Allow `from _phone_handle_variants import phone_handle_variants` when this
+# script is run directly. Both this resolver and scripts/imessage-thread.sh
+# share that helper so the chat.db candidate set is identical across the
+# Python and bash callers (PR3.5 audit #2, Codex 2026-05-21).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _phone_handle_variants import phone_handle_variants  # noqa: E402
 
 # Lower than ratio() < 0.75 misses obvious typos (e.g. "gailene" vs "Gaileen"
 # scores 0.857). Higher than 0.80 starts gating legit nicknames. 0.75 is the
@@ -154,33 +174,52 @@ def tokens(c: dict) -> list[str]:
     return out
 
 
+def _messages_db_path() -> Path:
+    """Return the chat.db path, honoring RELAY_MESSAGES_DB_PATH for tests.
+    Matches the staging helper's env-override pattern (PR3.5 audit #2)."""
+    override = os.environ.get("RELAY_MESSAGES_DB_PATH", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / "Library" / "Messages" / "chat.db"
+
+
 def _most_recent_message_date(identifier: str) -> int:
-    """Max(date) in `~/Library/Messages/chat.db` for any 1:1 chat whose
-    chat_identifier matches `identifier` (with or without leading '+', and
-    with the common '+1<naked>' US-prefix variant). Returns 0 if no messages
-    or the DB is unreadable. Used to break ties when multiple address-book
-    contacts share a name (e.g. multiple "Mark"s) — the one the user has
+    """Max(date) in chat.db for any 1:1 chat whose chat_identifier matches
+    any canonical variant of `identifier`. Returns 0 if no messages or the
+    DB is unreadable. Used to break ties when multiple address-book
+    contacts share a name (e.g. multiple "Mark"s); the one the user has
     actually been messaging wins.
+
+    PR3.5 audit #2 (Codex 2026-05-21): the previous candidate set
+    (identifier, +naked, naked, +1naked) was both incomplete (missing the
+    bare 10-digit form for an 11-digit input) and malformed (+1<naked>
+    becomes "+1<already-1-prefixed>" when naked starts with "1"). The
+    shared phone_handle_variants() helper produces the same set
+    imessage-thread.sh uses, so the recency lookup and the downstream
+    chat_identifier match agree on which row to pick.
     """
     if not identifier:
         return 0
-    naked = identifier.lstrip("+")
-    db_path = Path.home() / "Library" / "Messages" / "chat.db"
+    variants = phone_handle_variants(identifier)
+    if not variants:
+        return 0
+    db_path = _messages_db_path()
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=4.0)
     except sqlite3.Error:
         return 0
     try:
+        placeholders = ",".join(["?"] * len(variants))
         cur = conn.execute(
-            """
+            f"""
             SELECT MAX(m.date)
             FROM message m
             JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
             JOIN chat c ON c.ROWID = cmj.chat_id
-            WHERE c.chat_identifier IN (?, ?, ?, ?)
+            WHERE c.chat_identifier IN ({placeholders})
               AND c.chat_identifier NOT LIKE 'chat%'
             """,
-            (identifier, f"+{naked}", naked, f"+1{naked}"),
+            variants,
         )
         row = cur.fetchone()
         return int(row[0] or 0)
@@ -194,20 +233,43 @@ def _pick_most_recently_messaged(candidates: list[str]) -> str:
     """Of `candidates` (already deduplicated, all valid identifiers), return
     the one with the most recent chat.db activity. Stable on tie: returns
     the first candidate in iteration order. Returns the first candidate if
-    none has any activity — never returns empty when given a non-empty list.
+    none has any activity, never returns empty when given a non-empty list.
     """
     if not candidates:
         return ""
+    chosen, _, _ = _pick_most_recently_messaged_with_meta(
+        [(c, "") for c in candidates],
+    )
+    return chosen
+
+
+def _pick_most_recently_messaged_with_meta(
+    candidates: list[tuple[str, str]],
+) -> tuple[str, str, int]:
+    """Tuple-aware version of _pick_most_recently_messaged. Accepts
+    (identifier, display_name) pairs and returns
+    (chosen_identifier, chosen_display_name, last_messaged_at).
+
+    last_messaged_at is the raw chat.db `date` value (Apple-epoch
+    nanoseconds) for the winning identifier, or 0 when no activity.
+    Stable on tie: the first candidate in iteration order wins.
+    Returns ("", "", 0) for an empty candidate list.
+    """
+    if not candidates:
+        return ("", "", 0)
     if len(candidates) == 1:
-        return candidates[0]
+        ident, name = candidates[0]
+        return (ident, name, _most_recent_message_date(ident))
     best_date = -1
-    best = candidates[0]
-    for ident in candidates:
+    best_ident, best_name = candidates[0]
+    for ident, name in candidates:
         d = _most_recent_message_date(ident)
         if d > best_date:
             best_date = d
-            best = ident
-    return best
+            best_ident = ident
+            best_name = name
+    # best_date stays -1 if no candidate had any activity; normalize to 0.
+    return (best_ident, best_name, max(best_date, 0))
 
 
 ALIAS_FILE_DEFAULT = Path.home() / ".claude-relay" / "contact-aliases.json"
@@ -264,13 +326,44 @@ def load_aliases() -> dict[str, str]:
 
 
 def resolve(query: str, contacts: list[dict] | None = None) -> str:
+    """Legacy entry point: returns just the resolved identifier string.
+
+    Wraps resolve_with_meta and discards the metadata. Existing callers
+    that only need the handle stay unchanged.
+    """
+    return resolve_with_meta(query, contacts)["handle"]
+
+
+def resolve_with_meta(
+    query: str,
+    contacts: list[dict] | None = None,
+) -> dict:
+    """Return {handle, display_name, last_messaged_at} for the query.
+
+    - handle: the resolved identifier (phone or email), or "" if no match.
+    - display_name: AddressBook full name for the winning contact, or "" if
+      the input was a direct identifier or no name could be recovered.
+    - last_messaged_at: raw chat.db Apple-epoch nanosecond timestamp of the
+      most recent 1:1 message with the chosen handle, or 0 when no history.
+      Callers convert to Unix epoch seconds via (ns / 1e9) + 978307200.
+    """
+    empty = {"handle": "", "display_name": "", "last_messaged_at": 0}
     q = query.strip()
     if not q:
-        return ""
+        return empty
     if DIRECT_PHONE_RE.match(q):
-        return normalize_phone(q)
+        handle = normalize_phone(q)
+        return {
+            "handle": handle,
+            "display_name": "",
+            "last_messaged_at": _most_recent_message_date(handle),
+        }
     if DIRECT_EMAIL_RE.match(q):
-        return q
+        return {
+            "handle": q,
+            "display_name": "",
+            "last_messaged_at": _most_recent_message_date(q),
+        }
 
     q_lower = q.lower()
 
@@ -281,20 +374,25 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
     # user verbally refers to it by the other parent's name).
     aliases = load_aliases()
     if q_lower in aliases:
-        return aliases[q_lower]
+        handle = aliases[q_lower]
+        return {
+            "handle": handle,
+            "display_name": "",
+            "last_messaged_at": _most_recent_message_date(handle),
+        }
 
     if contacts is None:
         contacts = collect_contacts()
     if not contacts:
-        return ""
+        return empty
 
     # 0. Exact match against first-name OR nickname OR full name. This is
     # safe even for relationship aliases ("mom") because we're matching an
     # explicit contact card the user maintains, not fuzzy-guessing from
     # message text. William's iCloud has a contact literally named "Mom";
     # blocking it here would force him to type her phone every time.
-    # If the BEST exact match is the user's own "Me" record, skip it — that
-    # is the historical "mom → self" bug.
+    # If the BEST exact match is the user's own "Me" record, skip it, that
+    # is the historical "mom -> self" bug.
     # Collect ALL exact matches and disambiguate by chat.db activity below.
     # Live failure 2026-05-13T21:04Z: "Mark" matched a long-unused contact
     # with phone 2042956236 first (alphabetical/iteration order), so the
@@ -304,7 +402,7 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
     self_idents = {chosen_identifier(c) for c in contacts if _is_me_record(c)} \
         | {c["email"] for c in contacts if _is_me_record(c)}
     self_idents.discard("")
-    exact_candidates: list[str] = []
+    exact_candidates: list[tuple[str, str]] = []
     seen: set[str] = set()
     for c in contacts:
         if _is_me_record(c) and q_lower != "me" and q_lower != "myself":
@@ -319,19 +417,20 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
             if ident in seen:
                 continue
             seen.add(ident)
-            exact_candidates.append(ident)
+            exact_candidates.append((ident, _display_name_for(c)))
     if exact_candidates:
-        return _pick_most_recently_messaged(exact_candidates)
+        ident, name, ts = _pick_most_recently_messaged_with_meta(exact_candidates)
+        return {"handle": ident, "display_name": name, "last_messaged_at": ts}
 
     # FUZZY/substring matching is blocked for relationship aliases. Exact
     # match (above) already handles the legitimate "Mom" contact case.
     if q_lower in BLOCKED_FUZZY:
-        return ""
+        return empty
 
     # 1. Substring match (cheap, preserves prior behaviour). Skip "Me" records
     # so a contact card with notes mentioning "mom" or "wife" can't hijack
     # a relationship query. Collect all candidates, disambiguate by recency.
-    substring_candidates: list[str] = []
+    substring_candidates: list[tuple[str, str]] = []
     seen.clear()
     for c in contacts:
         if _is_me_record(c):
@@ -341,15 +440,16 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
             if not ident or ident in self_idents or ident in seen:
                 continue
             seen.add(ident)
-            substring_candidates.append(ident)
+            substring_candidates.append((ident, _display_name_for(c)))
     if substring_candidates:
-        return _pick_most_recently_messaged(substring_candidates)
+        ident, name, ts = _pick_most_recently_messaged_with_meta(substring_candidates)
+        return {"handle": ident, "display_name": name, "last_messaged_at": ts}
 
     # 2. Fuzzy match against name tokens. Pick the contact whose best token
     # similarity is highest, gated by FUZZY_CUTOFF. Skip "Me" records.
     # Among contacts tied at the top score (e.g. two contacts with a token
     # "Sara" both scoring 1.0 against "Sara"), still disambiguate by recency.
-    scored: list[tuple[float, str]] = []
+    scored: list[tuple[float, str, str]] = []
     for c in contacts:
         if _is_me_record(c):
             continue
@@ -362,19 +462,33 @@ def resolve(query: str, contacts: list[dict] | None = None) -> str:
             if score > c_best:
                 c_best = score
         if c_best >= FUZZY_CUTOFF:
-            scored.append((c_best, ident))
+            scored.append((c_best, ident, _display_name_for(c)))
     if scored:
-        top = max(score for score, _ in scored)
+        top = max(score for score, _, _ in scored)
         # Pull all ties at the top score (within 0.01 to absorb float noise)
         # and disambiguate by chat.db recency.
-        top_candidates: list[str] = []
+        top_candidates: list[tuple[str, str]] = []
         seen.clear()
-        for score, ident in scored:
+        for score, ident, name in scored:
             if score >= top - 0.01 and ident not in seen:
                 seen.add(ident)
-                top_candidates.append(ident)
-        return _pick_most_recently_messaged(top_candidates)
-    return ""
+                top_candidates.append((ident, name))
+        ident, name, ts = _pick_most_recently_messaged_with_meta(top_candidates)
+        return {"handle": ident, "display_name": name, "last_messaged_at": ts}
+    return empty
+
+
+def _display_name_for(c: dict) -> str:
+    """Best human-readable name from a contact record. Prefer full name,
+    fall back to nickname, then organization. Used for the Telegram
+    surface line so the user sees who the bot picked, not just a handle."""
+    name = (c.get("name") or "").strip()
+    if name:
+        return name
+    nick = (c.get("nickname") or "").strip()
+    if nick:
+        return nick
+    return (c.get("org") or "").strip()
 
 
 def _is_me_record(c: dict) -> bool:
@@ -397,10 +511,27 @@ def _is_me_record(c: dict) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print("", end="")
+    args = argv[1:]
+    meta = False
+    if args and args[0] == "--meta":
+        meta = True
+        args = args[1:]
+    if not args:
+        if meta:
+            import json
+            print(json.dumps({"handle": "", "display_name": "", "last_messaged_at": 0}))
+        else:
+            print("", end="")
         return 0
-    print(resolve(argv[1]))
+    query = args[0]
+    if meta:
+        import json
+        result = resolve_with_meta(query)
+        # Compact single-line JSON so shell consumers can parse it without
+        # whitespace gymnastics.
+        print(json.dumps(result, separators=(",", ":")))
+    else:
+        print(resolve(query))
     return 0
 
 

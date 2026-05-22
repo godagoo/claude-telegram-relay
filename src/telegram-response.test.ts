@@ -6,33 +6,42 @@ import {
   splitTelegramResponseText,
 } from "./telegram-response";
 
-test("prepareTelegramResponseText applies fallback and phone handoff formatting", () => {
+test("prepareTelegramResponseText falls back when input is blank", () => {
   expect(prepareTelegramResponseText("   ")).toBe(DEFAULT_EMPTY_RESPONSE);
+});
+
+test("prepareTelegramResponseText strips handoff lines without adding instructions", () => {
   expect(
     prepareTelegramResponseText(
       "Draft\n\nPhone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("Draft\n\nRun ClaudeDraft in Shortcuts on your iPhone.");
+  ).toBe("Draft");
   expect(
     prepareTelegramResponseText(
       "heading to London\n\nPhone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("heading to London\n\nRun ClaudeDraft in Shortcuts on your iPhone.");
+  ).toBe("heading to London");
   expect(
     prepareTelegramResponseText(
       "heading to London\n\nPhone handoff ready for dad (+16048092405): shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("heading to London\n\nDrafting to dad (+16048092405). Run ClaudeDraft in Shortcuts on your iPhone.");
+  ).toBe("heading to London");
   expect(
     prepareTelegramResponseText(
       "Phone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("Run ClaudeDraft in Shortcuts on your iPhone.");
+  ).toBe(DEFAULT_EMPTY_RESPONSE);
   expect(
     prepareTelegramResponseText(
       "Draft\n\nOpen on iPhone: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("Draft\n\nRun ClaudeDraft in Shortcuts on your iPhone.");
+  ).toBe("Draft");
+});
+
+test("prepareTelegramResponseText preserves the actionable install-pending warning", () => {
+  const visible =
+    "heading to London\n\nClaudeDraft is not installed on your iPhone yet. Open Files > iCloud Drive > ClaudeDraft.shortcut, tap Replace or Add Shortcut, then run ClaudeDraft. Draft target: dad (+16048092405).";
+  expect(prepareTelegramResponseText(visible)).toBe(visible);
 });
 
 test("splitTelegramResponseText never emits empty chunks on hard boundaries", () => {

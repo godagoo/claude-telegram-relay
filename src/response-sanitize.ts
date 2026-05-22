@@ -42,6 +42,20 @@ export function stripWrapperTags(text: string): { clean: string; stripped: numbe
 
 export function stripProseDashes(text: string): { clean: string; stripped: number } {
   let stripped = 0;
+  const monthName = String.raw`(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)`;
+  const monthDayRange = new RegExp(
+    String.raw`\b(${monthName}\s+\d{1,2}(?:,?\s+\d{4})?)\s*[—–]\s*(${monthName}\s+\d{1,2}(?:,?\s+\d{4})?)\b`,
+    "gi",
+  );
+  const monthRange = new RegExp(
+    String.raw`\b(${monthName})\s*[—–]\s*(${monthName})(\s+\d{4})?\b`,
+    "gi",
+  );
+  const rangeToken = String.raw`(?:[$€£])?(?:\d{1,2}:\d{2}|\d+(?:\.\d+)?)(?:\s?(?:a\.?m\.?|p\.?m\.?|%|[A-Za-zµ]+))?`;
+  const numericRange = new RegExp(
+    String.raw`(^|[^A-Za-z0-9_])(${rangeToken})\s*[—–]\s*(${rangeToken})(?=$|[^A-Za-z0-9_])`,
+    "gi",
+  );
   const parts = text.split(
     /(```[\s\S]*?```|`[^`\n]*`|<pre\b[\s\S]*?<\/pre>|^>>>[^\n]*(?:\n>>>[^\n]*)*)/gim,
   );
@@ -49,11 +63,33 @@ export function stripProseDashes(text: string): { clean: string; stripped: numbe
     .map((part, index) => {
       if (index % 2 === 1) return part;
       return part
-        .replace(/(\d)\s*–\s*(\d)/g, (_match, left, right) => {
+        // Ranges are semantic, not prose punctuation. Convert them before the
+        // catch-all dash-to-comma pass so "9am–5pm" never becomes a list.
+        .replace(monthDayRange, (_match, left, right) => {
           stripped++;
           return `${left} to ${right}`;
         })
-        .replace(/\s*[—–]\s*/g, () => {
+        .replace(monthRange, (_match, left, right, suffix = "") => {
+          stripped++;
+          return `${left} to ${right}${suffix}`;
+        })
+        .replace(numericRange, (_match, prefix, left, right) => {
+          stripped++;
+          return `${prefix}${left} to ${right}`;
+        })
+        .replace(/[ \t]*[—–][ \t]*([,.!?;:])/g, (_match, punctuation) => {
+          stripped++;
+          return punctuation;
+        })
+        .replace(/[ \t]*[—–][ \t]*$/gm, () => {
+          stripped++;
+          return "";
+        })
+        .replace(/(^|\n)[ \t]*[—–][ \t]*/g, (_match, prefix) => {
+          stripped++;
+          return prefix;
+        })
+        .replace(/[ \t]*[—–][ \t]*/g, () => {
           stripped++;
           return ", ";
         });

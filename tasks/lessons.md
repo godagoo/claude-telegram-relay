@@ -1383,6 +1383,12 @@
   file must not change the user-facing response for every Telegram draft.
   `setup:verify` already fails on that artifact, which is the correct place to
   surface the pending-install problem.
+- 2026-05-17 correction: if the phone has just lost/deleted all shortcuts and
+  the fixed `ClaudeDraft.shortcut` install artifact is present, a plain "Run
+  ClaudeDraft" status is misleading because the iPhone target may not exist.
+  Surface `phone_shortcut_install_pending` with the exact Files -> iCloud Drive
+  -> `ClaudeDraft.shortcut` install/replace instruction until the artifact is
+  removed after a real iPhone compose-body verification.
 - Do not expose `shortcuts://run-shortcut?...` in Telegram copy. Telegram
   rejects custom schemes in inline keyboards and does not make custom-scheme
   message text a reliable trigger. Keep the runtime wording simple:
@@ -1652,3 +1658,367 @@
   indications, not a role paraphrase. Helper lives in `src/prompt-split.ts`
   so it can be unit-tested without triggering relay's top-level lock
   acquisition.
+
+## 2026-05-17 — Anesthesia corpus portability and gate-boundary regression test
+
+- `ANESTHESIA_CORPUS_ROOT` was a literal `/Users/williamregan/Desktop/...`
+  string baked into `src/anesthesia-corpus.ts`. It compiled, ran, and passed
+  tests on the only Mac that mattered today, but the runtime instruction
+  block told Claude only one root existed while `retrieval.ts` actually
+  searched two roots (`~/Desktop/...` and `~/Downloads/...`). Citations
+  from the Downloads root were valid retrievals but Claude had been told
+  that root did not exist.
+- Fix: derive `ANESTHESIA_CORPUS_ROOTS` from `homedir()`, expose it as a
+  readonly array, and rebuild `ANESTHESIA_CORPUS_INSTRUCTIONS` to mention
+  both roots. Keep `ANESTHESIA_CORPUS_ROOT` as a back-compat alias for the
+  primary root so existing imports keep building.
+- Added a `prepareFtsQuery` test that pins the corpus gate boundary: a set
+  of benign non-medical queries ("set a reminder for 10pm", "what is on my
+  calendar tomorrow") must return `corpusScoped: false` and must NOT
+  include the textbook roots in `scopePatterns`. This is the regression
+  guard for `isAnesthesiaCorpusQuery` accidentally widening to match
+  everything, which would silently scope every retrieval to the textbook
+  corpus and starve general-conversation answers.
+- Documented the classifier's known false positives ("airway" in allergy
+  context, "RSI" as repetitive strain injury, "epidural" steroid
+  injection for back pain) as accepted tradeoffs in tests, so future
+  contributors do not narrow the patterns without weighing the user-side
+  tradeoff (terse anesthesia queries like "RSI dosing for rocuronium"
+  must keep routing to FTS without explicit textbook framing).
+
+## 2026-05-17 — iPhone Shortcut verification needs exact UI state checks
+
+- Mirroir OCR coordinates are labels, not always the tappable control. A loose
+  regex for `OK` matched the `Quick Look` shortcut label and tapped the wrong
+  tile. For permission prompts, match exact quoted button labels from OCR lines
+  or use fixed coordinates from a screenshot after visual confirmation.
+- When `ClaudeDraft` opens Messages, the Shortcuts tile can remain in a running
+  state with a small stop control. Subsequent taps on the shortcut body may do
+  nothing until that stale run is stopped. If a rerun is needed, return to
+  Shortcuts, tap the stop control in the top-right of the `ClaudeDraft` tile,
+  then tap the tile body again.
+- Keep the iCloud install marker (`~/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut`)
+  until a real iPhone compose-body verification has been observed. After the
+  phone opens Messages with the expected recipient and body, move or remove the
+  marker and rerun `bun run setup:verify`; otherwise the relay should keep
+  surfacing `phone_shortcut_install_pending`.
+
+## 2026-05-17 — Command-position iMessage names can be lowercase
+
+- Live Telegram command `Text jacqueline saying where you at?` was received
+  by the relay but fell through to the generic Claude path because
+  `COMMAND_POSITION_CONTACT_RE` only accepted capitalized proper names,
+  phone numbers, and emails. Direct draft commands typed on a phone are often
+  lowercase and should not depend on Claude marker compliance.
+- The fix must stay command-position only. Allowing lowercase names in the
+  generic `to/with` branch reintroduces old false positives like "text
+  messages with Peggy" and "Draft a message saying hey". Anchor the lowercase
+  allowance to request-start commands such as `Text`, `Message`, or `Ping`
+  with an optional polite prefix.
+
+## 2026-05-17 — Direct text bodies still need thread context and writing rules
+
+- Do not treat `Text <contact> saying <body>` as a verbatim placement request
+  for named contacts. Live issue: after the lowercase parser fix, Jacqueline
+  resolved and the iPhone compose box was verified, but the relay wrote the
+  literal body `where you at?` because `directBody` suppressed context
+  injection and bypassed Claude.
+- For named contacts, treat the direct body as the core meaning. Still inject
+  the last 5 to 10 iMessages when the resolver can read the thread, then let
+  Claude apply the user's human-writing rules. Preserve the intent, but match
+  the relationship, cadence, and warmth from the actual thread.
+- Keep the direct-body bypass only for direct phone/email recipients or runtime
+  failures where no safe thread can be read. That preserves a deterministic
+  fallback while preventing ordinary named-contact drafts from skipping context.
+
+## 2026-05-17 — Modern Messages rows store text in `attributedBody`
+
+- Live issue: `Respond to Conor's last message` drafted `ha might need a full
+  neuro exam at this point` because the context helper filtered on
+  `message.text IS NOT NULL`. Current Conor rows in `chat.db` had NULL
+  `message.text` with the visible body inside `message.attributedBody`, so the
+  relay skipped April 2026 context and fell back to an October 2025 message:
+  `May have to check his reflexes`.
+- Any iMessage context reader must decode `attributedBody` before deciding the
+  thread is stale or empty. Also skip tapback rows (`associated_message_type`
+  nonzero) so "Loved ..." reactions do not masquerade as real message bodies.
+- For vague commands like `reply/respond to <person>'s last message`, decline
+  automatic placement when the latest decoded thread message is already from
+  the user. That is safer than inventing a new follow-up to an already answered
+  thread.
+
+## 2026-05-17 — Clear stale iPhone handoffs before every new draft attempt
+
+- Live issue: after Jacqueline's draft was written to `latest.json`, a later
+  Nater command fell through the non-draft path and then failed the first
+  fixed draft run because a decoded Messages row contained a null byte. During
+  both failures, `latest.json` still pointed at Jacqueline, so ClaudeDraft
+  reopened the wrong compose even though Telegram showed a new Nater draft.
+- Fix pattern: as soon as the relay recognizes a new iMessage placement
+  request, delete the old CloudDocs `latest.json` before Claude runs. If the
+  new request fails, ClaudeDraft should find no stale handoff rather than a
+  previous recipient/body.
+- Also sanitize decoded iMessage text for null/control bytes before injecting
+  it into the Claude CLI prompt. Bun refuses spawn args containing null bytes,
+  so raw `attributedBody` extraction must never feed `\0` into `callClaude`.
+
+## 2026-05-17 — Architectural decision: keep single-slot handoff, reject queues and IDs
+
+After five iMessage-handoff failures in one session and an open question of whether to replace `latest.json` with draft ids, a queue, or pointer files, Kimi K 2.6 reviewed the architecture in `tasks/telegram-relay-architecture-investigation-prompt-2026-05-17.md` and articulated why the existing minimal design is correct. We are codifying its conclusions as durable architectural rules so a future contributor under bug pressure does not reinvent the draft-id / queue temptation.
+
+### The four principles (decoupling of notification from payload transport)
+
+1. **Telegram is the signal, not the payload.** Telegram delivers "run the ClaudeDraft shortcut now." The body of the draft never travels through Telegram persistence; it travels through iCloud Drive. Embedding the draft body in Telegram (deep links, encoded URIs, inline keyboard data) is rejected — Telegram is the wrong substrate for that.
+2. **iCloud Drive is the synchronization primitive.** `~/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json` is bidirectionally synced by the OS. The relay writes; the iPhone reads when the Shortcut runs. No custom server, no push notifications, no pairing logic.
+3. **Pull-based flow.** The iPhone only pulls when the user runs the Shortcut. That means no race between write and read once the relay's Telegram reply has been delivered, no queueing/history requirement (overwrite is sufficient), and the user is in the right mental context to review.
+4. **The safety contract is one OS toggle.** Show When Run = ON in the Shortcut's Send Message action. That is the entire "never auto-send" guarantee. No custom confirmation dialogs in the chain, no relay-side timer guards, no wrapper logic. The iOS compose sheet IS the human-in-the-loop.
+
+### The open architecture question, resolved
+
+The handover at `tasks/HANDOVER-2026-05-17-late-session-imessage-handoff-reliability.md` listed five "likely better options":
+
+1. `latest.json` as a pointer to an active draft id
+2. `drafts/<draft_id>.json` files
+3. ClaudeDraft consumes the newest unconsumed draft
+4. Archive or delete a draft after ClaudeDraft reads it
+5. Add `request_id`, `draft_id`, `body_sha256` to logs and Telegram replies
+
+Decision: **reject 1, 2, 3, 4. Accept 5 (logging only).**
+
+- Options 1-4 introduce additional state machines, queueing semantics, or consumption protocols. Each is a new failure surface on a substrate (iCloud Drive) the relay does not own. The five failures this session were all fixable inside the single-slot model.
+- Option 5 (additional fields in logs and decision-log JSONL) is observability, not architecture. It does not violate Kimi's principles because it changes nothing the iPhone sees. `body_sha256` is already logged; `request_id` and explicit `draft_id` would be small additions worth doing in a future small PR.
+
+### Known tradeoffs left in place by this decision
+
+These are NOT bugs. They are recorded so the choice is explicit, not implicit.
+
+- **Clear-before-write vs trust-the-overwrite.** `src/relay.ts:942` calls `clearICloudDriveDraft()` whenever `wantsIMessagePlacement` is true, BEFORE Claude generates the new draft. This protects against the "user taps ClaudeDraft during a slow Claude call and sees the stale prior recipient" race. The cost is: when Claude fails to emit draft markers (`markers_missing` path at `src/relay.ts:1126`), the previous valid draft is permanently lost. We accept this tradeoff because the stale-wrong-recipient race is the more dangerous failure (the prior draft is plausible and could be sent in error), while the lost-prior-draft case is recoverable (the user re-issues the prior command).
+- **Single-slot means no concurrent drafts.** Two pending drafts cannot coexist. If the user wants to keep a Jacqueline draft and prepare a Nater draft separately, only one slot is available. We accept this because the user's workflow is "issue one draft command, review on iPhone, send or discard, issue the next." Concurrent drafts would require option 2 (per-id files) and the queueing semantics that come with it.
+- **`clearICloudDriveDraft()` at `src/relay.ts:1046`** (the `alreadyAnsweredLastMessageDraft` branch) is redundant with the earlier clear at line 942 (line 942 already fires whenever this branch runs, because `wantsIMessagePlacement` is the precondition for `alreadyAnsweredLastMessageDraft`). It is harmless defense-in-depth. Leave it; do not impulsively remove it.
+
+### Hard "do not do" list (under the four principles)
+
+Future contributors must NOT, without first re-reading the Kimi analysis at `tasks/telegram-relay-architecture-investigation-prompt-2026-05-17.md`:
+
+- Embed the draft body in a Telegram message persistence layer.
+- Attempt to auto-open the ClaudeDraft Shortcut from Telegram (the `shortcuts://` deep link in Telegram message text is known unreliable; the user manually opens Shortcuts).
+- Add a relay-side "confirm send" dialog or timer that bypasses Show When Run.
+- Introduce a queue, draft-id directory, or pointer file in iCloud Drive.
+- Add an iCloud Drive consumption protocol (relay deletes after the Shortcut reads).
+- Replace iCloud Drive transport with a custom server, push notification service, or pairing system.
+
+If you find yourself wanting to do any of the above, the architecture is telling you the problem is somewhere else (a stale text decoder, a brittle parser, a missed cleanup) — fix that instead.
+
+## 2026-05-19 — Token-lock and cutover hardening (PLAN4–PLAN8 distillation)
+
+Five rounds of senior review across PLAN4–PLAN8 surfaced a recurring set of mistakes in lock semantics, error handling, and operator docs. These are the patterns to catch on first pass next time, not on round five.
+
+### Concurrency: atomic-claim over check-then-act
+
+- A `read → decide → write/unlink` flow against a shared file is a TOCTOU window, even when each step looks atomic. The buggy stale-takeover did `readPayloadOrNull → unlink → tryAtomicCreate`; PLAN4's race harness measured 13 double-successes in 500 pairs. The fix is `rename(path, claim-<pid>-<uuid>)` — POSIX-atomic on the source, so only one process wins; everyone else gets ENOENT and bails. Apply the same pattern to release and heartbeat, not just acquire.
+- After winning the atomic claim, verify the file you grabbed matches what you expected to grab (`pid`, `token_hash`, `started_at`/`heartbeat_at`). A third process may have replaced the file between your read and your rename.
+- After the verify passes, recreate via `tryAtomicCreate` (O_EXCL) at the original path. If a third process slipped in during the window between your rename and your recreate, leave their lock alone — do not overwrite. The fix here was `tryRestoreClaim`, which uses `tryAtomicCreate` instead of blind `rename(claim, path)`.
+- Restore-on-mismatch must also be no-overwrite. Blind `rename(claim, path)` during the mismatch branch will destroy whoever raced ahead. Use `tryAtomicCreate(claimed)` and discard the claim if path is occupied. PLAN6 reproduced this exact bug.
+
+### Liveness: PID alone is not enough
+
+- `kill(pid, 0)` is true for any process with that PID. macOS reuses PIDs aggressively. Combine `kill(pid, 0)` with a `ps -o command= -p <pid>` cmdline-contains-relay.ts check before declaring a lock "held by a live relay". The token-lock module's `isLiveRelayPid` does this; the inline `kill` in `relay.ts` did not until N+O.
+- Heartbeat must update the lock atomically so a delayed heartbeat from an old holder cannot clobber a new holder. PLAN5 demonstrated this clobber by hand: read existing → state changes underneath → `rename(tmp, path)` overwrites the new holder. Replace any heartbeat that uses `read-then-writePayloadAtomic` with the same atomic-claim pattern acquire uses.
+- Release has the same race. A's release reads existing=A, pauses (GC, scheduler), B takes over, A's `unlink(path)` deletes B's lock. Fix: atomic claim + verify + unlink-the-claim (not unlink-at-path). Add optional `startedAt` to defend against PID reuse: same PID + host can match between unrelated processes, but `started_at` won't.
+
+### Error handling: silent swallow in long-lived daemons is malpractice
+
+- `.catch(() => undefined)` on a heartbeat interval means the operator's first signal of `ENOSPC`/`EACCES`/`EROFS`/`EIO` is the stale-by-age threshold (120s default) letting a peer take over the lock. The senior post-PLAN7 review found this; AO surfaced it. For a daemon, swallow only the errors you can prove are expected (ENOENT when the lock was already released). Log everything else, even from interval ticks.
+- `tryAtomicCreate` throws on non-`EEXIST` errors (`ENOSPC`, `EROFS`, `EACCES`). Code that wraps it in `.catch(() => undefined)` silently turns disk-full into "heartbeat works fine".
+- TypeScript non-null assertions (`existing!`) lie about runtime state. If `existing` is `null` and you `?? existing!`, the API gets a `null` masquerading as the required type. Always emit a synthetic-but-real value (`makeSyntheticHolder`) rather than casting away nullability.
+
+### Source hygiene: encode controls, don't embed them
+
+- Literal NUL/DEL/BEL bytes baked into `.ts`/`.md` source survived four review rounds (PLAN3 caught them in five files). Test fixtures need NUL? Use `"\x00"` or `String.fromCharCode(0)`. The bytes only exist in the running process, never on disk.
+- Add a repo-hygiene test that fails the build on any tracked file containing `U+0000–U+001F` (except `\t`, `\n`, `\r`) or `U+007F`. See `src/no-control-bytes-in-source.test.ts`. Without it, a stray paste from a terminal re-introduces the regression.
+- The sanitizer must cover C1 controls (`U+0080–U+009F`) in addition to C0 and DEL. PLAN3 caught this; the original regex was scoped to C0 only. Latin-1 supplement (`U+00A0+`) stays.
+- Token redaction must cover both the raw token AND every URL shape that embeds it (`api.telegram.org/bot<TOKEN>/…`, `api.telegram.org/file/bot<TOKEN>/…`). Network errors from `fetch` typically include the full URL in `err.message`. See `src/redact-token.ts`.
+
+### Operator docs and runtime prompt
+
+- `readlink -f` is GNU. macOS shipped it eventually but the operator advice was wrong across multiple docs and lived in the runtime prompt the LLM sees. Replace with `bun run setup:verify` and read the `FDA responsible target` line. `fs.promises.realpath` does the same job in code without spawning a subprocess.
+- TCC attaches grants to resolved inodes, not symlinks. Granting FDA to `~/.bun/bin/bun` or `/opt/homebrew/bin/bun` survives until the next `brew upgrade bun` re-points the symlink to a fresh Cellar inode. Document the resolved Cellar path; have `setup:verify` print it.
+- `setup:verify` should be read-only. Recording state (e.g. `bun-realpath` baseline) during a verify run hides drift — a bun upgrade silently overwrites the recorded baseline instead of failing the next verify. Move the write to `setup:launchd` at install time.
+- The FDA target string must come from the installed launchd plist's `ProgramArguments[0]`, not from env. Env tells you what someone configured; ProgramArguments[0] tells you what launchd will actually execute.
+- Documentation drift recurs. The "the iPhone Shortcut rejects expired drafts" claim survived three review rounds even though the Shortcut never reads `expires_at`. When prose says "X enforces Y", grep the code for evidence that X actually does enforce Y.
+- `FOR ALL USING (true)` is a misnomer. It permits every Postgres role, not just service_role. RLS lockdown needs `FOR ALL TO service_role USING (true) WITH CHECK (true)` with idempotent `DROP POLICY IF EXISTS` guards.
+
+### Dead code lurks after refactors
+
+- After replacing a primitive (e.g. PLAN5's atomic-claim heartbeat replacing `writePayloadAtomic`), grep for the old function's name. If no live caller remains, delete the function and any imports it required. Dead `defaultBaseDir` and `writePayloadAtomic` survived three review rounds before AO removed them.
+- Helper functions with branches that all return the same value (`if (reason === "x") return uuid; return uuid;`) are leftover scaffolding from incomplete refactors. Replace with the simplest expression; add a docstring naming who should call the richer primitive instead.
+
+### Reviewing the reviewer
+
+- Subagent code reviews confabulate. Two of the senior-review subagent's P0 claims in this cycle were false positives: it conflated declaration order with execution order (`findBunSync` "uninitialized" — actually mutated in `main()` before any reader runs) and over-generalized a host-default invariant. Read the actual call sites before acting on agent-flagged findings.
+- The right framing is "trust but verify": let the agent triage, then read the lines yourself. The cost of a false-positive P0 is wasted work and confidence damage; the cost of accepting one is shipping a non-bug "fix" that introduces a new bug.
+
+### Production interface notes carried by AB–AO
+
+- `releaseTokenLock` accepts optional `startedAt`; production must pass `lockResult.payload.started_at` (relay.ts already does). Without it, the PID-reuse defense is silently skipped.
+- `_testHooks` / `_testHookAfterRead` / `_testHookAfterClaim` are part of the production type signatures because TypeScript needs them visible at the call site. Production code must not pass them. They are clearly underscore-prefixed and `_test`-named; if this ever ships in a real path, add a runtime guard.
+- `setup:wrapper` remains experimental. The shell-script-in-`.app` is not a verified TCC identity across macOS versions. Direct Bun realpath FDA is the documented cutover path. Defer wrapper-first rollout until a native Mach-O launcher or `SMAppService` helper exists, or until real-world TCC attribution proves the ad-hoc-signed shell wrapper binds as expected.
+
+## 2026-05-19 - PLAN10: observability and runtime hygiene
+
+### launchd stderr rotation must be copy-and-truncate
+
+- launchd opens `StandardErrorPath` with `O_APPEND` and keeps that fd for the relay's lifetime. `rename(path, archive)` would move the inode out from under the fd: launchd keeps writing to the moved file while the live path looks empty. `src/log-rotation.ts` uses `copyFile(path, archive)` followed by `truncate(path, 0)`. O_APPEND drives the next launchd write back to byte 0 of the now-empty file.
+- Be honest about the contract: this is best-effort observability hygiene, not lossless concurrent archival. A line appended by the relay between `copyFile` and `truncate(path, 0)` can be absent from both the archive and the active log. The rotator runs once at startup before the bot begins polling, so the race window is small, but call sites must not assume zero loss.
+- Rotation failures log a warning and startup continues; the rotator is never a runtime dependency.
+- Threshold is `RELAY_ERROR_LOG_ROTATE_MAX_BYTES`, default 5 MiB. Decision logs are out of scope; rotating them belongs in a later pass if disk usage demands it.
+
+### Health checks must be read-only and reuse verifier predicates
+
+- `setup/health-check.ts` owns the relay-process predicate, the token-lock health check, and the recent-error-log scan. `setup/verify.ts` imports those helpers so the predicate has exactly one definition. The next predicate change lands in one file, not two.
+- Read-only means no log deletion, no lock rewrites, no `launchctl bootstrap/bootout/kickstart`, and no `.env` writes. A monitor that mutates state is not a monitor; if a future check wants to repair state, it belongs in a separate tool, not folded into the read-only path.
+- Standalone exit codes are tiered: `0` no failures, `1` runtime health failure, `2` configuration error (currently missing `TELEGRAM_BOT_TOKEN`). The config tier is separate so callers can route `exit 2` to a "fix .env" hint without parsing log lines.
+
+### Stress harnesses must fail on every documented failure class
+
+- `scripts/stress-token-lock.ts` tracked `totalIoErrors` but never gated on it. A trial returning `successes=1, ioErrors=1` (the rare ENOSPC or EACCES branch) silently counted as a clean exactly-one winner and the harness reported PASS. Any harness whose docs name a failure mode must fail when that mode fires, or the docs are lying.
+- Track exact-one winners with an explicit counter (`totalExactOne`). Arithmetic-derived counts like `total - doubles - zeros` hide newly-introduced failure classes the same way they hide bugs.
+
+### `setup:verify` stays the operator-facing gate
+
+- PLAN10 folds health-check output into `setup:verify` rather than shipping a parallel workflow. The standalone CLI at `scripts/health-check.ts` exists for scripting and spot checks, but `setup:verify` remains the canonical operator entry point. Operators should not need two command names to learn one fact.
+- Verify calls the shared check in `mode: "embedded"` so zero relay processes stays advisory (warn). The standalone CLI runs in `mode: "standalone"` where zero relays is a hard fail. Same logic, different exit policy at the boundary.
+
+### Verifier truthfulness: never confuse "saw nothing" with "confirmed absence"
+
+- Embedded "no relay" warnings must escalate to fails when launchd reports the job as loaded. A passing verify with `launchdRelayLoaded && relayProcessCount === 0` is a false-green readiness claim. `checkSingletonRelay` now accepts `launchdRelayLoaded` and the `Active relay PID count: 0` summary line follows the same policy: fail when launchd is loaded, warn when it is not, never an unconditional pass.
+- Relay-process detection must inspect argv, not substrings. The previous predicate accepted any ps line containing `bun run src/relay.ts`, which means `grep "bun run src/relay.ts"`, `rg "bun run src/relay.ts"`, and `/bin/sh -c 'echo bun run src/relay.ts'` all looked like a live relay. The strict predicate splits on whitespace and requires `<bun-exe> run src/relay.ts` in the argv slots.
+- Log scanning must follow the path the running job is actually writing to, not the plist on disk or the verifier's environment. `defaultErrorLogPath(process.env)` ignored launchd entirely, so a custom `RELAY_LOG_DIR` in the launchd job let the scanner read an empty file and report "clean" while the real error log filled with `409`s. `resolveRelayErrorLogPath` now ranks live `launchctl print` stderr (the bootstrapped job's actual fd target) above the installed plist `StandardErrorPath` (what disk says should be used), then the `RELAY_LOG_DIR` and `.env` tiers.
+- The installed plist on disk can drift from the bootstrapped launchd job. If someone edits the plist file but never re-bootstraps, `launchctl print` reports one stderr path while `parseLaunchdPlistJson(plist)` reports another. Trusting only the plist hides real error evidence written to the live path. Keep `liveLaunchdStandardErrorPath` and `launchdPlistStandardErrorPath` as separate variables so the plist parse cannot overwrite the live signal.
+
+### Cutover operations (recorded 2026-05-19)
+
+- `bun run setup:launchd` is a one-shot unload + install + load. `configure-launchd.ts:installService` already calls `unloadExistingService` (which does `launchctl bootout`, `launchctl remove`, `launchctl unload`) and then `launchctl bootstrap` on the new plist. Operator runbooks that layer an explicit `launchctl bootout` and `launchctl bootstrap` on top of `setup:launchd` double-restart the relay for no benefit and create a window with no live relay. Treat steps "bootout" and "bootstrap" as already handled by `setup:launchd` unless you have a specific reason to interpose state changes between them.
+- The old pre-PLAN-A relay's SIGTERM/exit handler unlinks its own legacy `~/.claude-relay/bot.lock` on shutdown. The first proper `launchctl bootout` after upgrade is usually enough to clear it. Explicit `rm` is belt-and-suspenders, not a load-bearing step.
+- For a stale iCloud `latest.json` after a schema bump, prefer `clearICloudDriveDraft` over hand-writing a v2 stub. `validateICloudDriveDraftPayload` rejects drafts whose `expires_at` has passed, so migrated v1 content with the original timestamps would fail anyway; a synthetic placeholder risks an iPhone Shortcut firing on the wrong recipient. Deleting the file demotes the verifier line from a fail to a warn, and the next real draft from the relay writes a valid v2 file.
+- Post-cutover green signature on this relay: exactly one relay PID (different from the pre-cutover PID), token lock present at `~/.claude-relay/locks/token-<hash>.lock` with `pid` matching the live process, host matching `os.hostname()`, error log near zero bytes containing no `telegram_409` / `telegram_401` / `spawn_nul_crash` lines, and `setup:verify` printing "Your bot is ready!" with exit 0. Treat any future deviation from this signature as a regression to investigate before claiming readiness.
+
+## 2026-05-20 - iMessage staging Shortcut handoff replaces direct compose placement
+
+- The reliable architecture is a two-hop handoff: relay sends a normal
+  iMessage to a staging handle, then a Shortcuts Message automation parses the
+  staging payload and opens the target Messages compose sheet. The relay should
+  not drive the target compose field through `sms:&body=`, AppleScript UI
+  scripting, or iPhone Mirroring in the production path.
+- The full architecture is: Telegram request -> relay resolves Messages
+  contact -> relay reads recent iMessage context from `chat.db` -> relay
+  injects Obsidian memory, project anchors, and retrieval context -> Claude
+  drafts under William's style rules -> relay strips prose em/en dashes ->
+  relay sends staging iMessage -> Shortcuts parses it -> Send Message opens
+  the final target chatbox with `Show When Run` enabled.
+- Staging payloads are deliberately human-readable JSON with
+  `version: "CLDRAFT/1"`, `to`, `label`, and `body`. The `CLDRAFT/1` value is
+  both the schema marker and the Shortcuts `Message Contains` trigger filter.
+- `scripts/stage-imessage.sh` is the write-side helper. It reads the draft
+  body from stdin, sends the staging payload to
+  `RELAY_IMESSAGE_STAGING_HANDLE`, and returns JSON without printing the body.
+  Dry-run tests use `RELAY_STAGE_IMESSAGE_DRY_RUN_PATH`.
+- `setup:verify` should validate the staging helper and warn about the manual
+  Shortcuts automation, not fail the relay on stale CloudDocs/ClaudeDraft
+  state. The old CloudDocs shortcut can remain installed, but it is no longer
+  the runtime draft-placement contract.
+
+## 2026-05-20 - Staff-engineer audit: direct-body duplication and dash-range fixes
+
+- `rebuildAroundDraftBlock` is destructive on its first call: it strips the
+  IMESSAGE_DRAFT marker pair when inlining the replacement. Calling it twice
+  on the same `assistantText` falls into the no-markers branch on the second
+  pass and APPENDS the replacement again, producing a duplicated body in the
+  user-visible reply. The relay's text handler had an extra rebuild between
+  the prose-dash strip and the staging-success rebuild — only fired when the
+  user provided a `directIMessageBody` (e.g. "Text +1555... saying X — Y")
+  with em/en dashes, because Claude-path responses had their dashes already
+  stripped in `sanitizeClaudeResponse`. Fix: update the `body` variable after
+  `stripProseDashes`, but do NOT rebuild yet; let each branch's existing
+  rebuild handle marker removal in one pass.
+- `stripProseDashes` treated em-dash and en-dash inconsistently in numeric
+  ranges. The numeric-range pre-rule matched only en-dash (`(\d)\s*–\s*(\d)`),
+  so `27—476 CE` collapsed to `27, 476 CE` (range turned into a list) while
+  `27–476 CE` correctly became `27 to 476 CE`. Authors mix the two dash forms
+  freely; treat them the same in the range pre-rule (`[—–]`) so the downstream
+  dash-to-comma replacer never sees a numeric-range dash.
+- `setup:verify` queries against `Shortcuts.sqlite` and `TCC.db` had no
+  per-command timeout. Both databases can be held by their owning apps
+  (Shortcuts.app, tccd) while a UI sheet is open, and a wedged probe blocks
+  the entire verifier. Pin every macOS-side sqlite read to a 5s budget,
+  matching the chat.db probe convention. Surface a clear "DB locked, close
+  the app and re-run" warn-level message instead of a generic warning when
+  the timeout fires (code 124).
+
+## 2026-05-20 - Follow-up audit: staging failure-path and sanitizer edge cases
+
+- `stripPlacementClaims` has two valid modes. Whole-response cleanup should
+  preserve a non-empty all-boilerplate response so Telegram never gets an
+  empty reply. Fragment cleanup inside `rebuildAroundDraftBlock` and
+  `markers_missing` should allow an all-claim fragment to become empty,
+  because the relay is about to append its own authoritative status. Do not
+  use the whole-response safety guard on placement fragments.
+- A resolved recipient is not the same as enough material to draft. If the
+  user says only `Text Peggy` or `Text +1555...`, and there is no found thread
+  context plus no user-supplied draft material, ask what the message should
+  say instead of letting Claude invent a body and staging it.
+- The staging helper's SHA is over the full CLDRAFT/1 payload, not the body
+  alone. Log it as `imessage_draft_payload_sha256`; reserve
+  `imessage_draft_body_sha256` for a future actual body-only hash.
+- The staging handle must not equal the final target recipient. Failing closed
+  with `staging_handle_matches_recipient` prevents a misconfigured environment
+  from sending the human-readable JSON draft payload to the person being
+  texted. Use `RELAY_IMESSAGE_ALLOW_SELF_STAGING=1` only for deliberate tests.
+- Prose dash cleanup must preserve ranges beyond bare digits: `9am–5pm`,
+  `May–June`, `10%–20%`, and `5 mg–10 mg` are ranges, not comma-separated
+  lists. The catch-all dash replacement also needs punctuation awareness so it
+  never creates `, .`, `, !`, or dangling trailing commas.
+- `setup:verify` timeout branches should say which probe timed out or failed.
+  A `chat.db` timeout is not Full Disk Access denial, a TCC sqlite error is
+  not the same as a missing Automation grant, and a Shortcuts schema/query
+  error is not the same as a missing automation.
+
+## 2026-05-20 - Shortcuts Message trigger content extraction
+
+- A macOS Shortcuts Message automation passes a structured `Message` object,
+  not raw text. `Get Dictionary from Shortcut Input` and `Get Text from Input`
+  both produce empty `to`/`body` unless the `Shortcut Input` variable is
+  changed from `Message` to `Content`. The visible symptom is a Messages
+  compose sheet with `To: No recipients` and a blank body.
+- The correct first action in `ClaudeStageDraft` is `Get Text from Content`,
+  where `Content` is the `Shortcut Input` variable property. In the shortcut
+  plist this is `WFPropertyVariableAggrandizement` with
+  `PropertyName=Content`; `setup:verify` must check for that, not just for
+  the presence of `CLDRAFT/1` and `Send Message`.
+- A successful staging send can still look like a timeout to the relay if
+  Messages/Shortcuts opens the final compose sheet while the AppleScript send
+  process remains blocked. Treat the exact CLDRAFT/1 payload appearing in
+  `chat.db` after the helper starts as the source of truth. If the payload row
+  exists, kill the lingering `osascript` process and return success instead of
+  reporting `imessage_stage_timeout_*` back to Telegram.
+
+## 2026-05-21 - iPhone nested shortcut input must be explicit and accepted
+
+- iPhone Personal Automations can show `Receive messages as input` and still
+  run a nested shortcut with an empty value. In the automation's `Run Shortcut`
+  action, expand the shortcut name and set `Input` to `Shortcut Input`; a stale
+  deleted `Text` variable is displayed in red and produces a blank Messages
+  compose sheet.
+- The nested `ClaudeStageDraft` helper also needs saved shortcut metadata that
+  declares it accepts input. A shortcut plist can visually contain the
+  `Shortcut Input` token while `ZINPUTCLASSESDATA` is empty and
+  `ZHASSHORTCUTINPUTVARIABLES=0`; iOS then passes nothing to the helper.
+  `setup:verify` must catch this, because action-shape validation alone is not
+  enough.
+- Empirical iPhone Mirroring test showed that even after fixing the automation
+  input and helper metadata, iOS could still open a blank compose through the
+  nested `ClaudeStageDraft` message-content parser. The reliable iPhone path is
+  staging iMessage as wake-up signal plus `ClaudeDraft` reading
+  `iCloud Drive/claude-relay-drafts/latest.json`. Verified 2026-05-21 with a
+  Madison smoke test: the body landed in the iPhone Messages text box and was
+  not sent.

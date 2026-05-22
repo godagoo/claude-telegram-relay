@@ -3,6 +3,43 @@
 // competing poller stops instead of waiting through a multi-minute backoff.
 export const TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS = 1_000;
 
+// Bounded retry budget before the relay gives up and exits cleanly. launchd
+// throttle policy (ThrottleInterval=30) then owns the restart cadence so the
+// process never spins indefinitely against a token another consumer holds.
+export const TELEGRAM_POLLING_CONFLICT_DEFAULT_MAX_ATTEMPTS = 5;
+
+function parsePositiveIntEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  const floored = Math.floor(parsed);
+  return floored > 0 ? floored : fallback;
+}
+
+export const TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS = parsePositiveIntEnv(
+  process.env.RELAY_409_MAX_ATTEMPTS,
+  TELEGRAM_POLLING_CONFLICT_DEFAULT_MAX_ATTEMPTS,
+);
+
+export function shouldExitAfterTelegramPollingConflict(
+  attempt: number,
+  maxAttempts: number = TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
+): boolean {
+  return attempt >= maxAttempts;
+}
+
+/**
+ * The hint is the only thing that tells the user how to recover; it must be
+ * surfaced *before* the bounded shutdown, not buried behind a separate
+ * escalation ladder that only fires at attempt 10+ when the budget is 5.
+ */
+export function shouldPrintConflictHint(
+  attempt: number,
+  maxAttempts: number = TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
+): boolean {
+  return attempt === 1 || attempt >= maxAttempts;
+}
+
 export type TelegramPollingConflictKind =
   | "competing_poller"
   | "webhook_active"

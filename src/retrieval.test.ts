@@ -142,6 +142,30 @@ test("anesthesia-domain FTS is scoped to converted textbook markdown", () => {
   );
 });
 
+test("non-medical queries are not scoped to the anesthesia corpus", () => {
+  // Pin the gate boundary: a query that isAnesthesiaCorpusQuery rejects must
+  // fall through to the default SCOPE_PATTERNS, never to the textbook roots.
+  // Regression guard for the corpusQuery widening Codex shipped in PR #5:
+  // if isAnesthesiaCorpusQuery accidentally grew to match everything, this
+  // would silently scope all retrieval to ~/Desktop/.../anes-textbooks-markdown
+  // and starve every non-medical answer.
+  for (const benign of [
+    "set a reminder for 10pm",
+    "what is on my calendar tomorrow",
+    "remind me to call alex",
+    "what is the weather in toronto today",
+  ]) {
+    const prepared = __test__prepareFtsQuery(benign);
+    expect(prepared.corpusScoped).toBe(false);
+    expect(prepared.scopePatterns).not.toContain(
+      `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/%`,
+    );
+    expect(prepared.scopePatterns).not.toContain(
+      `${process.env.HOME}/Downloads/anes-textbooks-markdown/%`,
+    );
+  }
+});
+
 test("corpus-scoped fallback pairs the strongest token with later clinical terms", () => {
   expect(
     __test__relaxedCorpusQueries(["rocuronium", "pediatric", "dosing", "adult", "onset"]),

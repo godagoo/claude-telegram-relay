@@ -144,7 +144,14 @@ export async function preflight(): Promise<void> {
 
   const hits = await search('"anesthesia" "textbook"', 1);
   if (hits.length === 0) {
-    throw new Error("preflight: FTS returned 0 hits for anesthesia textbook catalog probe");
+    // PLAN.md section 5: zero-hit preflight is a warning, not fatal. A user
+    // without the anesthesia corpus indexed should not see the relay crash;
+    // they just lose textbook retrieval until they index.
+    console.warn(
+      "[preflight] FTS returned 0 hits for the anesthesia textbook catalog probe. " +
+      "Textbook retrieval is degraded until the corpus is reindexed.",
+    );
+    return;
   }
   console.log("[preflight] FTS sanity: textbook catalog probe returns hits");
 }
@@ -316,9 +323,10 @@ function toHit(row: RetrievedRow): Hit {
   };
 }
 
-async function runFtsInWorker(
+export async function runFtsInWorker(
   sql: string,
   params: unknown[],
+  timeoutMs: number = FTS_TIMEOUT_MS,
 ): Promise<{ rows: unknown[]; ms: number }> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./fts-worker.ts", import.meta.url).href);
@@ -329,8 +337,8 @@ async function runFtsInWorker(
       } catch {
         // Already gone.
       }
-      reject(new Error(`fts_timeout_${FTS_TIMEOUT_MS}ms`));
-    }, FTS_TIMEOUT_MS);
+      reject(new Error(`fts_timeout_${timeoutMs}ms`));
+    }, timeoutMs);
 
     worker.onmessage = (event: MessageEvent) => {
       clearTimeout(timer);
@@ -662,6 +670,7 @@ function filterPathAnchorRows(
 }
 
 export const __test__filterPathAnchorRows = filterPathAnchorRows;
+export const __test__withTimeout = withTimeout;
 
 const MAX_HITS_INJECTED = 3;
 const MAX_CHARS_PER_HIT = 900;
