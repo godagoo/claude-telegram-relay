@@ -4,6 +4,17 @@ Date: 2026-05-20
 
 Project: `/Users/williamregan/Projects/claude-telegram-relay`
 
+> **Update 2026-05-22 (partially superseded).** The current production path
+> uses the **iPhone** `ClaudeDraft` shortcut (not the Mac `ClaudeStageDraft`)
+> with iCloud Drive `claude-relay-drafts/latest.json` as the payload store and
+> the staging iMessage as the wake signal. The Mac `ClaudeStageDraft` shortcut
+> documented below is now an **optional Mac-side diagnostic**, not the runtime.
+> See `docs/IMESSAGE-SHORTCUT-HANDOFF.md` for the canonical current flow. The
+> "do not reintroduce CloudDocs `latest.json`" rule in the Do Not Regress
+> section below is rewritten accordingly: `latest.json` is now production
+> *when paired with the staging iMessage as the wake signal*; the regression
+> to avoid is using `latest.json` *without* the staging wake.
+
 ## Executive Summary
 
 The production iMessage draft path must be:
@@ -329,8 +340,9 @@ the staging send so macOS prompts for the correct Automation grant.
 - Do not use `sms:&body=` as production success.
 - Do not use iPhone Mirroring as production placement.
 - Do not use System Events or UI scripting from launchd.
-- Do not reintroduce CloudDocs `latest.json` / manual `ClaudeDraft` as the
-  runtime path.
+- Do not use CloudDocs `latest.json` / manual `ClaudeDraft` *without* the
+  staging iMessage as the wake signal (the staging-paired pattern IS the
+  current production path; standalone manual-launch ClaudeDraft is not).
 - Do not let Claude call helper scripts from the prompt. The relay owns all
   side effects.
 - Do not expose helper failure details in a way that implies Claude tried and

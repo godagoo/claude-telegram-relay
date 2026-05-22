@@ -37,6 +37,7 @@ import { launchdPath } from "./launchd-env.ts";
 import { runCommandWithTimeout } from "./process-timeout.ts";
 import { getSupabaseFeatureConfig } from "../src/supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "../src/arch-check.ts";
+import { shortcutInstallPath } from "../src/icloud-drive-draft.ts";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 const RELAY_DIR = process.env.RELAY_DIR || join(homedir(), ".claude-relay");
@@ -660,6 +661,14 @@ async function main() {
       ? pass("RELAY_IMESSAGE_STAGING_HANDLE is set")
       : warn("RELAY_IMESSAGE_STAGING_HANDLE not set - iMessage draft staging is disabled until configured");
 
+    const pendingShortcutInstall = shortcutInstallPath("ClaudeDraft");
+    if (existsSync(pendingShortcutInstall)) {
+      warn(
+        `Pending iPhone ClaudeDraft install artifact exists: ${pendingShortcutInstall}. ` +
+        "Replace/Add this shortcut on the iPhone, allow access to claude-relay-drafts, then delete the artifact after the compose body is verified.",
+      );
+    }
+
     if (existsSync(stageScript)) {
       const dryRunRoot = await mkdtemp(join(os.tmpdir(), "relay-stage-verify-"));
       const dryRunPayload = join(dryRunRoot, "payload.txt");
@@ -858,22 +867,24 @@ print("ok")
         ],
         { timeoutMs: 5_000 },
       );
+      // This check covers the OPTIONAL Mac-side diagnostic shortcut
+      // (ClaudeStageDraft). Production is the iPhone path: a Personal
+      // Automation triggers ClaudeDraft, which reads iCloud Drive
+      // claude-relay-drafts/latest.json and opens the target compose sheet.
+      // See docs/IMESSAGE-SHORTCUT-HANDOFF.md. A missing/disabled Mac
+      // diagnostic does NOT block production; flag it informationally.
       if (shortcutCheck.code === 0) {
-        pass("Shortcuts Message automation installed for CLDRAFT/1 -> ClaudeStageDraft");
+        pass("Mac diagnostic ClaudeStageDraft is installed for CLDRAFT/1 (optional)");
       } else if (shortcutCheck.code === 124) {
         warn(`Shortcuts.sqlite query timed out (DB likely locked by Shortcuts.app). Close Shortcuts.app and re-run setup:verify.`);
-      } else if (shortcutCheck.code !== 0) {
-        warn(`Shortcuts Message automation check failed: ${commandFailureText(shortcutCheck)}`);
       } else {
-        warn("Manual check: Shortcuts.app Automation must have Message Contains=CLDRAFT/1, Run Immediately, Shortcut Input > Content, and Send Message Show When Run=ON");
+        warn(
+          `Optional Mac diagnostic ClaudeStageDraft not configured (production path is iPhone ClaudeDraft + iCloud latest.json): ${commandFailureText(shortcutCheck)}`,
+        );
       }
-      // The above only covers the Mac diagnostic copy. The iPhone production
-      // Shortcut (ClaudeDraft) lives on the phone and is not reachable from
-      // here. Surface the manual requirement on every run so an accidental
-      // toggle on iPhone can never silently turn the relay into an auto-send.
-      // The user explicitly accepted in PR 2 planning that contact ambiguity
-      // is resolved silently by most-recent-activity, which makes this flag
-      // the load-bearing safety net.
+      // iPhone Show-When-Run is the load-bearing safety boundary that prevents
+      // the relay from ever turning into an auto-send. It cannot be inspected
+      // from this Mac, so surface the manual reminder on every verify run.
       warn("Manual check (iPhone): the ClaudeDraft Shortcut's Send Message action must have Show When Run = ON. The Mac check above does not reach the phone.");
     } else {
       warn(`Shortcuts database not found: ${shortcutsDb}`);

@@ -157,7 +157,7 @@ if (import.meta.main) {
   try {
     const outputPath = await exportClaudeDraftShortcut(parseArgs(Bun.argv.slice(2)));
     console.log(`Created verified iPhone install file: ${outputPath}`);
-    console.log("Install it on iPhone from Files, then delete it after the body appears in Messages.");
+    console.log("Install it on iPhone from Files by choosing Replace/Add Shortcut, allow access to claude-relay-drafts, then delete it after the body appears in Messages.");
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
