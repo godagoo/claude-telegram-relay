@@ -50,6 +50,8 @@ const TELL_ME_REQUEST_RE =
 // a state query in practice.
 const META_QUESTION_LEAD_RE =
   /^\s*(why|is|are|was|were|did|does|do|have|has|had|where|when|how|what)\b/i;
+const PAST_DRAFT_REFERENCE_LEAD_RE =
+  /^\s*(?:regarding|about|re:?\s+|on)\s+(?:the|that|this|your|my|our|last|previous|earlier|prior)\s+(?:draft|message|reply|response|text|imessage|sms)\s+(?:to|for|with|about)\b/i;
 
 /**
  * Cheap heuristic — true when the message PLAUSIBLY wants a draft. Designed
@@ -69,6 +71,7 @@ export function looksLikeDraftIntent(message: string): boolean {
   // an LLM call to be told "no" on every "why didn't you..." or "is the
   // draft done?".
   if (META_QUESTION_LEAD_RE.test(message)) return false;
+  if (PAST_DRAFT_REFERENCE_LEAD_RE.test(message)) return false;
   return true;
 }
 
