@@ -160,10 +160,12 @@ const COMMAND_POSITION_CONTACT_RE =
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();
   const commandHead = draftCommandHead(message);
-  if (EMAIL_REPLY_ALL_RE.test(m)) return false;
-  const hasExplicitMessageMedium = DRAFT_VERB_RE.test(m) && EXPLICIT_MESSAGE_MEDIUM_RE.test(m);
+  const commandHeadLower = commandHead.toLowerCase();
+  if (EMAIL_REPLY_ALL_RE.test(commandHeadLower)) return false;
+  const hasExplicitMessageMedium =
+    DRAFT_VERB_RE.test(m) && EXPLICIT_MESSAGE_MEDIUM_RE.test(m);
   if (FOLLOWING_TO_CONTACT_RE.test(message) || CONTACT_THEN_FOLLOWING_RE.test(message)) return true;
-  if (EMAIL_TYPE_RE.test(m) && !hasExplicitMessageMedium && !COMMAND_POSITION_CONTACT_RE.test(message)) {
+  if (EMAIL_TYPE_RE.test(commandHeadLower) && !hasExplicitMessageMedium && !COMMAND_POSITION_CONTACT_RE.test(message)) {
     return false;
   }
   // Scope past-draft / meta-question suppression to the command head so a body
@@ -228,6 +230,10 @@ function cleanDirectDraftBody(raw: string): string | undefined {
 
 function draftCommandHead(message: string): string {
   return message.split(/\b(?:saying|say|with|asking|ask|letting|telling)\b/i)[0] || message;
+}
+
+function bodyBoundaryCommandHead(message: string): string {
+  return message.split(/\b(?:saying|say|asking|ask|letting|telling)\b/i)[0] || message;
 }
 
 /**
@@ -361,6 +367,7 @@ export function extractIMessageDraftRequest(
   if (!hasDraftVerbAndType(message)) return null;
   if (MULTI_RELATIONSHIP_CONTACT_RE.test(message)) return null;
   const commandHead = draftCommandHead(message);
+  const bodyBoundaryHead = bodyBoundaryCommandHead(message);
 
   // Self-recipient first: "Reply to myself saying X" must not require a
   // proper-noun match to count. See SELF_RECIPIENT_RE comment above.
@@ -370,7 +377,7 @@ export function extractIMessageDraftRequest(
       contact: SELF_CONTACT,
       wantsContext: false,
       contextLimit: parseLimit(message),
-      wantsPlacement: !detectPlacementSuppression(message),
+      wantsPlacement: !detectPlacementSuppression(commandHead),
       ...(directBody ? { directBody } : {}),
     };
   }
@@ -389,7 +396,7 @@ export function extractIMessageDraftRequest(
     ? null
     : message.match(FOLLOWING_TO_CONTACT_RE) ?? message.match(CONTACT_THEN_FOLLOWING_RE);
   const commandPosition = relationship || followingContact ? null : message.match(COMMAND_POSITION_CONTACT_RE);
-  const explicit = relationship || followingContact || commandPosition ? null : message.match(
+  const explicit = relationship || followingContact || commandPosition ? null : bodyBoundaryHead.match(
     /\b(?:[Ww]ith|[Tt]o)\s+([+()\-\d\s]{7,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/,
   );
   // Natural-language fallback: legitimate body-only relationship references
@@ -415,7 +422,7 @@ export function extractIMessageDraftRequest(
 
   const m = message.toLowerCase();
   const wantsContext = CONTEXT_SIGNAL_RE.test(m);
-  const wantsPlacement = !detectPlacementSuppression(message);
+  const wantsPlacement = !detectPlacementSuppression(commandHead);
   const directBody = wantsContext ? undefined : extractDirectDraftBody(message, contact);
 
   return {

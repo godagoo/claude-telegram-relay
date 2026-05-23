@@ -457,6 +457,56 @@ test("email words inside an explicit text body do not suppress iMessage placemen
   });
 });
 
+test("email and reply-all words inside the body do not suppress reply placement", () => {
+  expect(
+    extractIMessageDraftRequest("Respond to John saying email me when you can"),
+  ).toEqual({
+    contact: "John",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "email me when you can",
+  });
+
+  expect(
+    extractIMessageDraftRequest("Reply to Sarah saying please reply all to the group email"),
+  ).toEqual({
+    contact: "Sarah",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "please reply all to the group email",
+  });
+});
+
+test("body-only placement suppression words do not disable a fresh placement request", () => {
+  expect(
+    extractIMessageDraftRequest("Text Peggy saying no placement for the table at dinner"),
+  ).toEqual({
+    contact: "Peggy",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "no placement for the table at dinner",
+  });
+
+  expect(
+    extractIMessageDraftRequest("Just show me the text of a message to Peggy saying no placement for the table at dinner"),
+  ).toMatchObject({
+    contact: "Peggy",
+    wantsPlacement: false,
+  });
+});
+
+test("proper nouns after the body boundary are not recovered as missing recipients", () => {
+  expect(
+    extractIMessageDraftRequest("Draft a message saying I went to Peggy yesterday"),
+  ).toBeNull();
+  expect(
+    detectLikelyIMessageDraftIntent("Draft a message saying I went to Peggy yesterday"),
+  ).toBe(true);
+});
+
 test("meta complaint about missing compose placement does not create a new draft", () => {
   expect(
     extractIMessageDraftRequest(
