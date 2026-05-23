@@ -5,6 +5,25 @@ import { dirname, join } from "path";
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 const RELAY_PATH = join(PROJECT_ROOT, "src", "relay.ts");
 
+function blockForIf(source: string, ifNeedle: string): string {
+  const ifIdx = source.indexOf(ifNeedle);
+  expect(ifIdx).toBeGreaterThanOrEqual(0);
+  const openIdx = source.indexOf("{", ifIdx);
+  expect(openIdx).toBeGreaterThanOrEqual(0);
+
+  let depth = 0;
+  for (let i = openIdx; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "{") depth += 1;
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(openIdx, i + 1);
+    }
+  }
+
+  throw new Error(`Could not find closing brace for ${ifNeedle}`);
+}
+
 // PR3.5 audit #8-timing regression (Codex 2026-05-21).
 //
 // src/vault-writer.ts:16-17 docstring is the contract:
@@ -136,4 +155,17 @@ test("relay.ts gates resolved iMessage recipients before any placement transport
   expect(stagingIdx).toBeGreaterThanOrEqual(0);
   expect(gateIdx).toBeLessThan(mirrorIdx);
   expect(gateIdx).toBeLessThan(stagingIdx);
+});
+
+test("relay.ts allowlist failure branch cannot queue placement or vault side effects", async () => {
+  const source = await readFile(RELAY_PATH, "utf8");
+  const failureBranch = blockForIf(source, "if (!recipientGate.ok)");
+
+  expect(failureBranch).toContain('imessageDraftStatus = "recipient_not_allowlisted"');
+  expect(failureBranch).toContain("approved iMessage recipient list");
+  expect(failureBranch).not.toContain("await placeIPhoneMirrorDraft(");
+  expect(failureBranch).not.toContain("await stageIMessageDraft(");
+  expect(failureBranch).not.toContain("queueVaultWrite(");
+  expect(failureBranch).not.toContain("pendingVaultWriteInput");
+  expect(failureBranch).not.toContain("vaultWriteAttempted = true");
 });
