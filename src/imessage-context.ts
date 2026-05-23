@@ -420,8 +420,7 @@ export function extractIMessageDraftRequest(
       : normalizeRelationshipContact(relationshipMatch![1] || relationshipMatch![2]);
   if (!contact) return null;
 
-  const m = message.toLowerCase();
-  const wantsContext = CONTEXT_SIGNAL_RE.test(m);
+  const wantsContext = CONTEXT_SIGNAL_RE.test(commandHead.toLowerCase());
   const wantsPlacement = !detectPlacementSuppression(commandHead);
   const directBody = wantsContext ? undefined : extractDirectDraftBody(message, contact);
 

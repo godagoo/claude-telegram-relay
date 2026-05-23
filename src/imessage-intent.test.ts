@@ -45,6 +45,7 @@ describe("looksLikeDraftIntent (heuristic gate for LLM fallback)", () => {
     expect(looksLikeDraftIntent("Are you still working on your draft?")).toBe(false);
     expect(looksLikeDraftIntent("Where is the draft?")).toBe(false);
     expect(looksLikeDraftIntent("Did you text mom?")).toBe(false);
+    expect(looksLikeDraftIntent("Regarding the text to Mom earlier, can you clarify?")).toBe(false);
   });
 });
 
