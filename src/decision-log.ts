@@ -37,6 +37,24 @@ export interface DecisionRecord {
   prompt_chars?: number;
   turn_buffer_size_before?: number;
   timeout_kind?: "fts" | "claude";
+  /**
+   * Outcome of the two-tier intent classifier introduced 2026-05-22 to end
+   * the regex-patch treadmill (see src/imessage-intent.ts). One of:
+   *   - "not_attempted": regex hit on the fast path, no LLM call needed.
+   *   - "resolved":      regex missed, heuristic fired, LLM classified a draft.
+   *   - "not_draft":     regex missed, heuristic fired, LLM said "not a draft".
+   *   - "unresolved":    regex missed, heuristic fired, LLM errored or could
+   *                      not extract a recipient — the relay then surfaces a
+   *                      clarification reply instead of silent-dropping.
+   * Together with imessage_draft_status this lets us measure precision/recall
+   * of the hybrid classifier. The consensus-architect critique (2026-05-22)
+   * named this the single load-bearing missing telemetry.
+   */
+  intent_classifier_status?:
+    | "not_attempted"
+    | "resolved"
+    | "not_draft"
+    | "unresolved";
   imessage_context_status?: "found" | "empty" | "fda_denied" | "error" | "timeout";
   imessage_context_count?: number;
   imessage_context_contact?: string;
@@ -59,7 +77,9 @@ export interface DecisionRecord {
     | "markers_missing"
     | "empty_body"
     | "no_recipient"
+    | "recipient_not_allowlisted"
     | "helper_failed"
+    | "unparsed_intent"
     | "no_intent";
   imessage_draft_mode?:
     | "pasted"

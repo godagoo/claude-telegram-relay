@@ -118,7 +118,9 @@ export type IMessageDraftStatus =
   | "markers_missing"
   | "empty_body"
   | "no_recipient"
+  | "recipient_not_allowlisted"
   | "helper_failed"
+  | "unparsed_intent"
   | "no_intent";
 
 /** Sentinel passed to the helper when the contact could not be resolved.

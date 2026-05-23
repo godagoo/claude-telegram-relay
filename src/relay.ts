@@ -45,8 +45,10 @@ import {
 import { loadTurns, appendTurn } from "./short-term.ts";
 import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
 import { sanitizeClaudeResponse, stripProseDashes } from "./response-sanitize.ts";
+import { gateForIMessageRecipient } from "./draft-router.ts";
 import {
   buildContactSelectionLine,
+  detectLikelyIMessageDraftIntent,
   extractIMessageDraftRequest,
   fetchIMessageContext,
   renderIMessageContext,
@@ -63,6 +65,14 @@ import {
   stripPlacementClaims,
   type IMessageDraftStatus,
 } from "./imessage-draft.ts";
+import {
+  placeIPhoneMirrorDraft,
+  shouldUseIPhoneMirrorPlacement,
+} from "./iphone-mirror-draft.ts";
+import {
+  classifyIMessageDraftIntent,
+  looksLikeDraftIntent,
+} from "./imessage-intent.ts";
 import {
   clearUpdateMarker,
   loadSeenUpdateIds,
@@ -956,7 +966,33 @@ bot.on("message:text", async (ctx) => {
     // context fetched + whether the draft should be placed in Messages.app.
     // Placement defaults to TRUE for any iMessage/text/SMS draft so the user
     // doesn't have to repeat "directly in the iMessage box" each time.
-    const draftRequest = extractIMessageDraftRequest(text);
+    let draftRequest = extractIMessageDraftRequest(text);
+    let intentClassifierStatus:
+      | "not_attempted"
+      | "resolved"
+      | "not_draft"
+      | "unresolved" = "not_attempted";
+    if (!draftRequest && looksLikeDraftIntent(text)) {
+      const classifiedIntent = await classifyIMessageDraftIntent(text);
+      if (classifiedIntent.kind === "draft") {
+        draftRequest = classifiedIntent.request;
+        intentClassifierStatus = "resolved";
+        console.log(
+          `[intent] classifier resolved imessage draft contact=${draftRequest.contact} placement=${draftRequest.wantsPlacement} direct_body=${Boolean(draftRequest.directBody)}`,
+        );
+      } else if (classifiedIntent.kind === "not_draft") {
+        intentClassifierStatus = "not_draft";
+      } else {
+        intentClassifierStatus = "unresolved";
+        console.error(
+          `[intent] classifier could not resolve likely draft intent: ${classifiedIntent.reason}`,
+        );
+      }
+    }
+    const likelyUnparsedIMessageDraftIntent =
+      !draftRequest &&
+      (detectLikelyIMessageDraftIntent(text) ||
+        intentClassifierStatus === "unresolved");
     const directIdentifierWithoutContext =
       draftRequest?.directBody &&
       !draftRequest.wantsContext &&
@@ -999,7 +1035,7 @@ bot.on("message:text", async (ctx) => {
         `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length} render_context=${shouldInjectContext} placement=${wantsIMessagePlacement}`,
       );
     }
-    if (wantsIMessagePlacement) {
+    if (wantsIMessagePlacement || likelyUnparsedIMessageDraftIntent) {
       const clearDraft = await clearICloudDriveDraft();
       if (clearDraft.ok) {
         console.log(
@@ -1086,6 +1122,7 @@ bot.on("message:text", async (ctx) => {
     let scaffoldingTagsStripped = 0;
     let turnMarkersStripped = 0;
     let proseDashesStripped = 0;
+    let preliminaryIMessageDraftStatus: IMessageDraftStatus | undefined;
     let errorMsg: string | undefined;
     const deterministicTextbookResponse = buildSkippedTextbookResponse(text, ftsHits, {
       referentialFired: referential,
@@ -1121,6 +1158,10 @@ bot.on("message:text", async (ctx) => {
       assistantText = imessageContextResult?.resolvedRecipient
         ? `I have ${contactLabel}'s Messages handle, but I don't have the message body yet. Send what you want it to say.`
         : `I couldn't find a Messages thread for ${contactLabel}, and I don't have the message body yet. Send me the phone/email plus what you want it to say.`;
+    } else if (likelyUnparsedIMessageDraftIntent) {
+      preliminaryIMessageDraftStatus = "unparsed_intent";
+      assistantText =
+        "I did not stage an iMessage because I could not reliably identify one recipient and message body. Use: `text <name> saying <message>`.";
     } else if (shouldAcknowledgeFeedbackWithoutClaude(text)) {
       assistantText = "Logged.";
     } else {
@@ -1161,10 +1202,12 @@ bot.on("message:text", async (ctx) => {
     }
     const claudeMs = Date.now() - tClaude0;
 
-    let imessageDraftStatus: IMessageDraftStatus | undefined;
     let imessageDraftMode:
       | "staging_imessage"
+      | "iphone_mirror_typed"
       | undefined;
+    let imessageDraftStatus: IMessageDraftStatus | undefined =
+      preliminaryIMessageDraftStatus;
     let imessageDraftHandoffPath: string | undefined;
     let imessageDraftPayloadSha256: string | undefined;
     let imessageDraftShortcutUrl: string | undefined;
@@ -1261,64 +1304,106 @@ bot.on("message:text", async (ctx) => {
             `[imessage-draft] no_recipient for ${contactLabel} (context_status=${contextStatus ?? "unknown"})`,
           );
         } else {
-          const staged = await stageIMessageDraft(
-            PROJECT_ROOT,
-            resolved,
-            contactLabel,
-            body,
-          );
-          if (staged.ok) {
-            imessageDraftStatus = "staging_handoff_sent";
-            imessageDraftMode = "staging_imessage";
-            imessageDraftPayloadSha256 = staged.payloadSha256;
-            imessageDraftId = staged.draftId;
-            // Surface the contact selection as a visible checkpoint above the
-            // body. The user explicitly chose silent most-recent-activity
-            // tie-breaking (no disambiguation prompt), so this line is the
-            // only confirmation they get in Telegram before the iPhone
-            // notification arrives. Show When Run on the iPhone Shortcut is
-            // the second checkpoint; the verifier asserts that flag stays on.
-            const selectionLine = buildContactSelectionLine(
-              imessageContextResult,
-              contactLabel,
-            );
-            const replacement = selectionLine
-              ? `${selectionLine}\n\n${body}`
-              : body;
-            assistantText = rebuildAroundDraftBlock(assistantText, replacement);
-            console.log(
-              `[imessage-draft] staging_handoff_sent for ${contactLabel} (${resolved}) draft_id=${staged.draftId ?? "unknown"} payload_sha256=${staged.payloadSha256 ?? "unknown"}`,
-            );
-            // Queue the vault write input. The actual write fires AFTER
-            // sendTelegramResponse and markUpdateSentAndRemember below, so a
-            // slow disk write cannot delay or perturb the Telegram reply.
-            // See src/vault-writer.ts (Option D full indexing). Its
-            // docstring is the contract this defers to. PR3.5 audit #8.
-            vaultWriteAttempted = true;
-            vaultDraftId = staged.draftId;
-            const vaultContextMessages = (imessageContextResult?.messages ?? []).map(
-              (m) => ({ ts: m.ts, sender: m.sender, text: m.text }),
-            );
-            pendingVaultWriteInput = {
-              draftId: staged.draftId ?? "",
-              contactDisplayName:
-                imessageContextResult?.resolvedDisplayName ?? contactLabel,
-              contactHandle: resolved,
-              userInstruction: text,
-              draftBody: body,
-              contextMessages: vaultContextMessages,
-            };
-          } else {
-            imessageDraftStatus = "helper_failed";
-            imessageDraftId = staged.draftId;
-            imessageDraftPayloadSha256 = staged.payloadSha256;
+          const recipientGate = await gateForIMessageRecipient(resolved);
+          if (!recipientGate.ok) {
+            imessageDraftStatus = "recipient_not_allowlisted";
             assistantText = rebuildAroundDraftBlock(
               assistantText,
-              `${body}\n\n(Couldn't stage this through the iMessage watcher: ${staged.error ?? "unknown error"}.)`,
+              `${body}\n\nCouldn't stage this in Messages because ${contactLabel} is not on the approved iMessage recipient list.`,
             );
             console.error(
-              `[imessage-draft] staging helper failed for ${contactLabel} draft_id=${staged.draftId ?? "unknown"}: ${staged.error ?? "unknown error"}`,
+              `[imessage-draft] recipient_not_allowlisted for ${contactLabel}`,
             );
+          } else {
+            const stagedReplacement = () => {
+              const selectionLine = buildContactSelectionLine(
+                imessageContextResult,
+                contactLabel,
+              );
+              return selectionLine
+                ? `${selectionLine}\n\n${body}`
+                : body;
+            };
+            const queueVaultWrite = (draftId: string) => {
+              vaultWriteAttempted = true;
+              vaultDraftId = draftId;
+              const vaultContextMessages = (imessageContextResult?.messages ?? []).map(
+                (m) => ({ ts: m.ts, sender: m.sender, text: m.text }),
+              );
+              pendingVaultWriteInput = {
+                draftId,
+                contactDisplayName:
+                  imessageContextResult?.resolvedDisplayName ?? contactLabel,
+                contactHandle: resolved,
+                userInstruction: text,
+                draftBody: body,
+                contextMessages: vaultContextMessages,
+              };
+            };
+
+            let placedByMirror = false;
+            if (shouldUseIPhoneMirrorPlacement(process.env)) {
+              const mirrored = await placeIPhoneMirrorDraft(resolved, body, {
+                projectRoot: PROJECT_ROOT,
+              });
+              if (mirrored.ok) {
+                placedByMirror = true;
+                imessageDraftStatus = "placed";
+                imessageDraftMode = "iphone_mirror_typed";
+                imessageDraftId = randomUUID();
+                assistantText = rebuildAroundDraftBlock(
+                  assistantText,
+                  stagedReplacement(),
+                );
+                console.log(
+                  `[imessage-draft] iphone_mirror_typed for ${contactLabel} (${resolved}) draft_id=${imessageDraftId}`,
+                );
+                queueVaultWrite(imessageDraftId);
+              } else {
+                console.error(
+                  `[imessage-draft] iphone mirror placement failed for ${contactLabel}; falling back to staging handoff: ${mirrored.error ?? "unknown error"}`,
+                );
+              }
+            }
+
+            if (!placedByMirror) {
+              const staged = await stageIMessageDraft(
+                PROJECT_ROOT,
+                resolved,
+                contactLabel,
+                body,
+              );
+              if (staged.ok) {
+                imessageDraftStatus = "staging_handoff_sent";
+                imessageDraftMode = "staging_imessage";
+                imessageDraftPayloadSha256 = staged.payloadSha256;
+                imessageDraftId = staged.draftId;
+                assistantText = rebuildAroundDraftBlock(
+                  assistantText,
+                  stagedReplacement(),
+                );
+                console.log(
+                  `[imessage-draft] staging_handoff_sent for ${contactLabel} (${resolved}) draft_id=${staged.draftId ?? "unknown"} payload_sha256=${staged.payloadSha256 ?? "unknown"}`,
+                );
+                // Queue the vault write input. The actual write fires AFTER
+                // sendTelegramResponse and markUpdateSentAndRemember below, so a
+                // slow disk write cannot delay or perturb the Telegram reply.
+                // See src/vault-writer.ts (Option D full indexing). Its
+                // docstring is the contract this defers to. PR3.5 audit #8.
+                queueVaultWrite(staged.draftId ?? randomUUID());
+              } else {
+                imessageDraftStatus = "helper_failed";
+                imessageDraftId = staged.draftId;
+                imessageDraftPayloadSha256 = staged.payloadSha256;
+                assistantText = rebuildAroundDraftBlock(
+                  assistantText,
+                  `${body}\n\n(Couldn't stage this through the iMessage watcher: ${staged.error ?? "unknown error"}.)`,
+                );
+                console.error(
+                  `[imessage-draft] staging helper failed for ${contactLabel} draft_id=${staged.draftId ?? "unknown"}: ${staged.error ?? "unknown error"}`,
+                );
+              }
+            }
           }
         }
       }
@@ -1424,6 +1509,7 @@ bot.on("message:text", async (ctx) => {
       prompt_chars: enrichedPrompt.length,
       turn_buffer_size_before: turnBufferSizeBefore,
       timeout_kind: timeoutKind,
+      intent_classifier_status: intentClassifierStatus,
       imessage_context_status: imessageContextResult?.status,
       imessage_context_count: imessageContextResult?.messages.length,
       imessage_context_contact: imessageContextResult?.request.contact,

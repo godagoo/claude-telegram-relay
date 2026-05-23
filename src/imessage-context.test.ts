@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { dirname, join } from "path";
 import {
   detectIMessageWriteIntent,
+  detectLikelyIMessageDraftIntent,
   extractIMessageDraftRequest,
   fetchIMessageContext,
   renderIMessageContext,
@@ -414,6 +415,48 @@ test("command-position drafts allow asking phrasing without losing placement", (
   });
 });
 
+test("'text the following to <contact>:' extracts contact and body (regression 2026-05-22)", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Please text the following to madison: your memory was correct about the motion timelines. I was just going through my notes and specifics on the timeline for the motion.",
+    ),
+  ).toEqual({
+    contact: "madison",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody:
+      "your memory was correct about the motion timelines. I was just going through my notes and specifics on the timeline for the motion.",
+  });
+});
+
+test("'send the following text to <contact>:' triggers the iMessage path without the word text as a verb", () => {
+  expect(
+    extractIMessageDraftRequest("Please send the following text to Mom: hello there"),
+  ).toEqual({
+    contact: "Mom",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "hello there",
+  });
+});
+
+test("email words inside an explicit text body do not suppress iMessage placement", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Please send a text to my mom saying hey mom, I just got off the phone with rogers and unfortunately you will have to cancel the account. They said I don't have the authority to do this. Once you call and cancel the account they will then email you the labels which you can forward to me so that I can deliver the hardware to them. Their phone number is: 1-877-224-9832 and the account # is: 658129244",
+    ),
+  ).toEqual({
+    contact: "mom",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody:
+      "hey mom, I just got off the phone with rogers and unfortunately you will have to cancel the account. They said I don't have the authority to do this. Once you call and cancel the account they will then email you the labels which you can forward to me so that I can deliver the hardware to them. Their phone number is: 1-877-224-9832 and the account # is: 658129244",
+  });
+});
+
 test("meta complaint about missing compose placement does not create a new draft", () => {
   expect(
     extractIMessageDraftRequest(
@@ -425,6 +468,29 @@ test("meta complaint about missing compose placement does not create a new draft
       "Why didn’t you write anything in Nater’s iMessage chatbox like you did when we text my dad?",
     ),
   ).toBeNull();
+});
+
+test("relationship phrasing inside the body does not hijack a named recipient", () => {
+  // Live failure family: body-scope guards that should be command-head-scope.
+  // "with my mom's address" must not steer the recipient from Jacqueline to mom.
+  const r = extractIMessageDraftRequest(
+    "Text Jacqueline with my mom's address 123 main st",
+  );
+  expect(r).not.toBeNull();
+  expect(r!.contact).toBe("Jacqueline");
+  expect(r!.wantsPlacement).toBe(true);
+});
+
+test("past-draft phrasing inside the body does not suppress a fresh draft request", () => {
+  // Live failure family: PAST_DRAFT_REFERENCE_RE catches "your last message
+  // about ..." anywhere in the message. Scoped to commandHead, this body
+  // phrase no longer cancels the staging request.
+  const r = extractIMessageDraftRequest(
+    "Text mom saying I'm replying to your last message about the trip",
+  );
+  expect(r).not.toBeNull();
+  expect(r!.contact).toBe("mom");
+  expect(r!.wantsPlacement).toBe(true);
 });
 
 test("message and ping command-position recipients trigger direct drafts", () => {
@@ -553,6 +619,7 @@ test("relationship contact wins over proper noun inside direct body", () => {
 test("multi-relationship requests do not silently choose one recipient", () => {
   expect(extractIMessageDraftRequest("Please reply to mom and dad's message")).toBeNull();
   expect(extractIMessageDraftRequest("Text mom and dad saying hi")).toBeNull();
+  expect(detectLikelyIMessageDraftIntent("Text mom and dad saying hi")).toBe(true);
 });
 
 test("self-recipient still respects placement suppression", () => {

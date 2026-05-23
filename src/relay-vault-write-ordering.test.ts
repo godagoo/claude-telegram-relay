@@ -85,3 +85,55 @@ test("relay.ts never schedules a vault write inside the staging-success branch",
   // but must not fire the write. The call site sits outside, after the awaits.
   expect(branchText).not.toMatch(/void\s+writeRelayVaultArtifacts\s*\(/);
 });
+
+test("relay.ts wires opt-in iPhone Mirror placement before staging fallback", async () => {
+  const source = await readFile(RELAY_PATH, "utf8");
+
+  expect(source).toContain("shouldUseIPhoneMirrorPlacement(process.env)");
+  expect(source).toContain("await placeIPhoneMirrorDraft(resolved, body");
+  expect(source).toContain('imessageDraftMode = "iphone_mirror_typed"');
+  expect(source).toContain("falling back to staging handoff");
+
+  const mirrorCallIdx = source.indexOf("await placeIPhoneMirrorDraft(resolved, body");
+  const stagingCallIdx = source.indexOf("await stageIMessageDraft(");
+  expect(mirrorCallIdx).toBeGreaterThanOrEqual(0);
+  expect(stagingCallIdx).toBeGreaterThanOrEqual(0);
+  expect(mirrorCallIdx).toBeLessThan(stagingCallIdx);
+});
+
+test("relay.ts fail-closes likely iMessage drafts the parser cannot resolve", async () => {
+  const source = await readFile(RELAY_PATH, "utf8");
+
+  expect(source).toContain("detectLikelyIMessageDraftIntent");
+  expect(source).toContain("classifyIMessageDraftIntent");
+  expect(source).toContain("looksLikeDraftIntent");
+  expect(source).toContain("likelyUnparsedIMessageDraftIntent");
+  expect(source).toContain('preliminaryIMessageDraftStatus = "unparsed_intent"');
+  expect(source).toContain("I did not stage an iMessage because I could not reliably identify one recipient and message body");
+
+  const classifierIdx = source.indexOf("await classifyIMessageDraftIntent(text)");
+  const guardIdx = source.indexOf("likelyUnparsedIMessageDraftIntent");
+  const callClaudeIdx = source.indexOf("await callClaude(enrichedPrompt");
+  expect(classifierIdx).toBeGreaterThanOrEqual(0);
+  expect(guardIdx).toBeGreaterThanOrEqual(0);
+  expect(callClaudeIdx).toBeGreaterThanOrEqual(0);
+  expect(classifierIdx).toBeLessThan(guardIdx);
+  expect(guardIdx).toBeLessThan(callClaudeIdx);
+});
+
+test("relay.ts gates resolved iMessage recipients before any placement transport", async () => {
+  const source = await readFile(RELAY_PATH, "utf8");
+
+  expect(source).toContain("gateForIMessageRecipient");
+  expect(source).toContain('imessageDraftStatus = "recipient_not_allowlisted"');
+  expect(source).toContain("approved iMessage recipient list");
+
+  const gateIdx = source.indexOf("await gateForIMessageRecipient(resolved)");
+  const mirrorIdx = source.indexOf("await placeIPhoneMirrorDraft(resolved, body");
+  const stagingIdx = source.indexOf("await stageIMessageDraft(");
+  expect(gateIdx).toBeGreaterThanOrEqual(0);
+  expect(mirrorIdx).toBeGreaterThanOrEqual(0);
+  expect(stagingIdx).toBeGreaterThanOrEqual(0);
+  expect(gateIdx).toBeLessThan(mirrorIdx);
+  expect(gateIdx).toBeLessThan(stagingIdx);
+});

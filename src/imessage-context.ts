@@ -87,6 +87,7 @@ function detectPlacementSuppression(message: string): boolean {
 
 const DRAFT_VERB_RE = /\b(draft|write|compose|send|shoot|text|message|respond|reply|ping)\b/;
 const MESSAGE_TYPE_RE = /\b(imessage|imessages|text\s+messages?|texts?|sms|message|messages|chat\s+message|reply|response)\b/;
+const EXPLICIT_MESSAGE_MEDIUM_RE = /\b(imessage|imessages|text\s+messages?|texts?|sms|message|messages|chat\s+message)\b/;
 const CONTEXT_SIGNAL_RE = /\b(last|recent|previous|prior|context|history|go\s+through|look\s+through|read\s+(?:my|our|the))\b/;
 // "Respond to Conor saying hi" and "Reply to Conor" clearly mean iMessage —
 // no explicit "message" type keyword is required. We still defer to an email
@@ -143,22 +144,46 @@ const RELATIONSHIP_CONTACT_RE =
   /\b(?:[Ww]ith|[Tt]o|[Ff]or)\s+(?:(?:my|our|the)\s+)?(mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b|\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
 const MULTI_RELATIONSHIP_CONTACT_RE =
   /\b(?:[Ww]ith|[Tt]o|[Ff]or|[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\s+(?:and|&)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
+const LOOSE_CONTACT_TARGET =
+  String.raw`([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Za-z][A-Za-z'\-]{1,30}(?:\s+[A-Za-z][A-Za-z'\-]{1,30}){0,3})`;
+const FOLLOWING_TO_CONTACT_RE = new RegExp(
+  String.raw`^\s*(?:(?:ok(?:ay)?|alright|sure|actually)[,.\s]+)?(?:(?:please|pls|can you|could you|would you)\s+)?(?:text|message|send|draft|write|compose)\s+(?:the\s+)?following(?:\s+(?:imessage|text|sms|message))?\s+(?:to|for|with)\s+${LOOSE_CONTACT_TARGET}\s*:`,
+  "i",
+);
+const CONTACT_THEN_FOLLOWING_RE = new RegExp(
+  String.raw`^\s*(?:(?:ok(?:ay)?|alright|sure|actually)[,.\s]+)?(?:(?:please|pls|can you|could you|would you)\s+)?(?:text|message|send|draft|write|compose)\s+${LOOSE_CONTACT_TARGET}\s+(?:the\s+)?following\s*:`,
+  "i",
+);
 const COMMAND_POSITION_CONTACT_RE =
   /^\s*(?:(?:[Oo]k(?:ay)?|[Aa]lright|[Ss]ure|[Aa]ctually)[,.\s]+)?(?:(?:[Pp]lease|[Pp]ls|[Cc]an you|[Cc]ould you|[Ww]ould you)\s+)?(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+([+()\-\d][+()\-\d\s]{6,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[a-z][a-z'\-]{1,30}(?:\s+[a-z][a-z'\-]{1,30}){0,2})(?=\s*(?:$|[,.;:!?]|\b(?:saying|say|asking|ask|with|about|letting|telling)\b))/;
 
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();
-  if (EMAIL_TYPE_RE.test(m)) return false;
+  const commandHead = draftCommandHead(message);
   if (EMAIL_REPLY_ALL_RE.test(m)) return false;
-  // Suppress when the message references a prior draft — meta-question, not
-  // a new draft request. Critical: this runs BEFORE the implicit-verb path
+  const hasExplicitMessageMedium = DRAFT_VERB_RE.test(m) && EXPLICIT_MESSAGE_MEDIUM_RE.test(m);
+  if (FOLLOWING_TO_CONTACT_RE.test(message) || CONTACT_THEN_FOLLOWING_RE.test(message)) return true;
+  if (EMAIL_TYPE_RE.test(m) && !hasExplicitMessageMedium && !COMMAND_POSITION_CONTACT_RE.test(message)) {
+    return false;
+  }
+  // Scope past-draft / meta-question suppression to the command head so a body
+  // phrase like "I'm replying to your last message about the trip" inside a
+  // fresh draft request does NOT cancel staging. Same scoping principle as
+  // SELF_RECIPIENT_RE below — body content must not steer the guard.
+  // Suppress when the COMMAND HEAD references a prior draft — meta-question,
+  // not a new draft request. Critical: this runs BEFORE the implicit-verb path
   // so "in your reply to Peggy did you..." doesn't get hijacked by the
   // `reply to` heuristic.
-  if (isPastDraftReference(message)) return false;
+  if (isPastDraftReference(commandHead)) return false;
   if (SELF_DRAFT_INTENT_RE.test(message)) return true;
   if (IMPLICIT_MESSAGE_VERB_RE.test(m)) return true;
   if (COMMAND_POSITION_CONTACT_RE.test(message)) return true;
   return DRAFT_VERB_RE.test(m) && MESSAGE_TYPE_RE.test(m);
+}
+
+export function detectLikelyIMessageDraftIntent(message: string): boolean {
+  if (MULTI_RELATIONSHIP_CONTACT_RE.test(message)) return true;
+  return hasDraftVerbAndType(message);
 }
 
 function parseLimit(message: string): number {
@@ -201,6 +226,10 @@ function cleanDirectDraftBody(raw: string): string | undefined {
   return body.length > 0 ? body : undefined;
 }
 
+function draftCommandHead(message: string): string {
+  return message.split(/\b(?:saying|say|with|asking|ask|letting|telling)\b/i)[0] || message;
+}
+
 /**
  * Extracts an exact draft body when the user supplies one in the same turn:
  * "Reply to myself saying testing", "Text me with hello", or
@@ -218,6 +247,16 @@ function extractDirectDraftBody(
   message: string,
   contact?: string,
 ): string | undefined {
+  const followingTo = message.match(
+    /\b(?:text|message|send|draft|write|compose)\s+(?:the\s+)?following(?:\s+(?:imessage|text|sms|message))?\s+(?:to|for|with)\s+[^:\n]{1,100}:\s+([\s\S]+)$/i,
+  );
+  if (followingTo) return cleanDirectDraftBody(followingTo[1]);
+
+  const contactThenFollowing = message.match(
+    /\b(?:text|message|send|draft|write|compose)\s+[^:\n]{1,80}\s+(?:the\s+)?following:\s+([\s\S]+)$/i,
+  );
+  if (contactThenFollowing) return cleanDirectDraftBody(contactThenFollowing[1]);
+
   const saying = message.match(/\b(?:saying|say)\s+([\s\S]+)$/i);
   if (saying) return cleanDirectDraftBody(saying[1]);
 
@@ -321,10 +360,11 @@ export function extractIMessageDraftRequest(
 ): IMessageDraftRequest | null {
   if (!hasDraftVerbAndType(message)) return null;
   if (MULTI_RELATIONSHIP_CONTACT_RE.test(message)) return null;
+  const commandHead = draftCommandHead(message);
 
   // Self-recipient first: "Reply to myself saying X" must not require a
   // proper-noun match to count. See SELF_RECIPIENT_RE comment above.
-  if (SELF_DRAFT_INTENT_RE.test(message) || SELF_RECIPIENT_RE.test(message)) {
+  if (SELF_DRAFT_INTENT_RE.test(commandHead) || SELF_RECIPIENT_RE.test(commandHead)) {
     const directBody = extractDirectDraftBody(message, SELF_CONTACT);
     return {
       contact: SELF_CONTACT,
@@ -340,18 +380,37 @@ export function extractIMessageDraftRequest(
   // "Nono it needs to be in my iMessages compose box" to capture "be in my"
   // as a three-word "proper noun" — case-insensitive [A-Z] matches lowercase.
   // The email branch stays case-insensitive via explicit [A-Za-z].
-  const relationship = message.match(RELATIONSHIP_CONTACT_RE);
-  const commandPosition = relationship ? null : message.match(COMMAND_POSITION_CONTACT_RE);
-  const explicit = relationship || commandPosition ? null : message.match(
+  // Scope relationship detection to the command head so body phrasing like
+  // "Text Jacqueline with my mom's address" does NOT silently hijack the
+  // recipient from the named contact to "mom". Same fix family as the
+  // SELF_RECIPIENT_RE scoping above and the email-guard fix.
+  const relationship = commandHead.match(RELATIONSHIP_CONTACT_RE);
+  const followingContact = relationship
+    ? null
+    : message.match(FOLLOWING_TO_CONTACT_RE) ?? message.match(CONTACT_THEN_FOLLOWING_RE);
+  const commandPosition = relationship || followingContact ? null : message.match(COMMAND_POSITION_CONTACT_RE);
+  const explicit = relationship || followingContact || commandPosition ? null : message.match(
     /\b(?:[Ww]ith|[Tt]o)\s+([+()\-\d\s]{7,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/,
   );
-  if (!explicit && !relationship && !commandPosition) return null;
+  // Natural-language fallback: legitimate body-only relationship references
+  // like "open my recent imessages with my mom and draft a response" still
+  // resolve, because none of commandPosition / explicit / commandHead-scoped
+  // relationship caught a contact. The hijack case is already blocked above:
+  // if a named recipient is in command position, commandPosition matches FIRST
+  // and bodyRelationship is never consulted.
+  const bodyRelationship = (!relationship && !commandPosition && !explicit)
+    ? message.match(RELATIONSHIP_CONTACT_RE)
+    : null;
+  if (!explicit && !relationship && !followingContact && !commandPosition && !bodyRelationship) return null;
 
+  const relationshipMatch = relationship ?? bodyRelationship;
   const contact = explicit
     ? cleanContact(explicit[1])
+    : followingContact
+      ? cleanContact(followingContact[1])
     : commandPosition
       ? cleanContact(commandPosition[1])
-      : normalizeRelationshipContact(relationship![1] || relationship![2]);
+      : normalizeRelationshipContact(relationshipMatch![1] || relationshipMatch![2]);
   if (!contact) return null;
 
   const m = message.toLowerCase();

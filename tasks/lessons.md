@@ -2022,3 +2022,98 @@ Five rounds of senior review across PLAN4–PLAN8 surfaced a recurring set of mi
   `iCloud Drive/claude-relay-drafts/latest.json`. Verified 2026-05-21 with a
   Madison smoke test: the body landed in the iPhone Messages text box and was
   not sent.
+
+## 2026-05-22 - Natural-language placement must prove parser entry, not just staging transport
+
+- A green self-staging smoke does not prove a Telegram request entered iMessage
+  placement. `Please text nater asking if he wants to fire this weekend.` was
+  handled as a normal Telegram reply because the command-position parser did
+  not include `asking|ask`; the decision log had no `imessage_context_*` fields,
+  no `imessage_draft_status`, and `chat.db` had no `CLDRAFT/1` row.
+- Treat connector verbs like `asking` and `ask` as placement syntax and strip
+  them from the contact candidate before resolution. Add exact parser
+  regression tests for natural user phrasing, not only canonical
+  `text <name> saying ...` examples.
+- For iPhone staging, verify all three layers before calling the path fixed:
+  decision log placement fields, expected `CLDRAFT/1` payload in Messages
+  `chat.db`, and iPhone Mirroring confirmation that the target compose sheet
+  opened with the right recipient/body. Mac-side logs alone cannot prove the
+  iPhone UI rendered until the Shortcut writes an explicit ack.
+
+## 2026-05-22 - Body words must not steer parser guards or recipient selection
+
+- `Please send a text to my mom saying ... they'll email you the labels ...`
+  failed because the global email guard saw `email` inside the SMS body and
+  suppressed iMessage placement before parsing the explicit `send a text to my
+  mom` command. Email guards must distinguish command-head intent from body
+  content: explicit SMS/iMessage/text/message medium wins even when the body
+  mentions email.
+- Recipient guards must also be command-head-scoped. Body phrases like
+  `forward those to me`, `with my mom's address`, or `your last message about`
+  must not hijack the recipient or suppress a fresh draft request. Parse the
+  command head first; only fall back to body relationship parsing when no
+  command-position or explicit recipient was found.
+- CLDRAFT/1 plus `latest.json` can be correct while the iPhone Personal
+  Automation still fails to open the compose sheet. When iPhone Mirroring is
+  available, the relay should try the opt-in mirror placement path first and
+  fall back to CLDRAFT/Shortcuts only if mirror verification fails.
+
+## 2026-05-22 - Parser misses must fail closed, not become fake completed drafts
+
+- The 18:04 Madison failure was not an iPhone Shortcut failure. The request
+  `Please text the following to madison: ...` returned `null` from
+  `extractIMessageDraftRequest`, so the relay never fetched iMessage context,
+  never wrote `latest.json`, and never sent a `CLDRAFT/1` staging payload. The
+  Telegram answer was just Claude prose, which made the later "draft is done"
+  claim look real even though no placement path ran.
+- Treat `text/send the following to <contact>:` and
+  `send the following text to <contact>:` as first-class draft syntax. Exact
+  natural-language regressions matter more than canonical examples because the
+  failures come from real user phrasing, not docs phrasing.
+- Do not keep solving unbounded natural language with regex alone. Keep the
+  deterministic extractor as the fast path, then run a cheap structured
+  classifier for draft-like messages the extractor missed. The classifier must
+  return a typed draft request or an explicit not-draft/unresolved result; the
+  relay should fail closed on unresolved likely drafts instead of letting
+  Claude claim a draft exists.
+- The relay must fail closed for likely iMessage draft requests that the parser
+  cannot resolve, such as multi-recipient `Text mom and dad saying hi`. Clear
+  stale handoff state, skip Claude, log `imessage_draft_status:
+  "unparsed_intent"`, and tell the user the canonical shape. Do not let a
+  likely placement request fall through to normal chat, because Claude can
+  then hallucinate that a draft exists.
+- `RELAY_IPHONE_MIRROR_PLACEMENT` should stay off in production until the
+  bridge is proven reliable. It is a diagnostic fallback, not the durable
+  answer to Shortcuts reliability.
+- Classifier fallback gates must not treat ordinary assistant phrasings as
+  draft intent. `tell` is useful for `Tell mom I'll call her`, but `Tell me
+  about ...` is normal chat/retrieval and should bypass the classifier to avoid
+  unnecessary latency.
+
+## 2026-05-23 - Claude Code policy refusals can come from control wording, not repo bugs
+
+- The screenshot failure was an API refusal on the user prompt, not a relay
+  runtime error. The blocked turn combined `permissionMode: bypassPermissions`
+  with override-style instruction wording and a real Telegram/iMessage staging
+  task. Treat that combination as a prompt-level tripwire.
+- Keep relay project sessions in `acceptEdits` mode by default, but leave
+  bypass mode available for explicit manual selection. The relay can still run
+  tests and edit files, while ordinary new sessions avoid carrying the riskiest
+  permission posture by default.
+- Project memory should encode working standards in neutral engineering
+  language. Preserve the expectations - direct debugging, verification, and
+  concise output - without copying jailbreak-shaped phrases into prompts.
+
+## 2026-05-23 - Recipient allowlist gate must sit before every placement transport
+
+- The iMessage recipient allowlist existed in `draft-router.ts`, but staging
+  could still proceed directly through iPhone Mirroring or CLDRAFT because the
+  hot path never called the gate. A tested helper is not a safety control until
+  the placement branch actually uses it.
+- Gate the resolved handle before both placement transports. If the allowlist
+  is missing, malformed, or does not include the resolved handle, the relay must
+  rebuild the draft reply with `recipient_not_allowlisted` and skip all
+  placement I/O.
+- Seed `~/.claude-relay/imessage-allowlist.json` from the existing contact alias
+  values with mode 0600 so the known family aliases keep working while unknown
+  recipients fail closed until explicitly added.
