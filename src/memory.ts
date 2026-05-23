@@ -27,10 +27,13 @@ export async function processMemoryIntents(
 
   // [REMEMBER: fact to store]
   for (const match of response.matchAll(/\[REMEMBER:\s*(.+?)\]/gi)) {
-    await supabase.from("memory").insert({
+    const { error } = await supabase.from("memory").insert({
       type: "fact",
       content: match[1],
     });
+    if (error) {
+      console.error(`[memory] REMEMBER insert dropped: ${error.message}`);
+    }
     clean = clean.replace(match[0], "");
   }
 
@@ -38,31 +41,41 @@ export async function processMemoryIntents(
   for (const match of response.matchAll(
     /\[GOAL:\s*(.+?)(?:\s*\|\s*DEADLINE:\s*(.+?))?\]/gi
   )) {
-    await supabase.from("memory").insert({
+    const { error } = await supabase.from("memory").insert({
       type: "goal",
       content: match[1],
       deadline: match[2] || null,
     });
+    if (error) {
+      console.error(`[memory] GOAL insert dropped: ${error.message}`);
+    }
     clean = clean.replace(match[0], "");
   }
 
   // [DONE: search text for completed goal]
   for (const match of response.matchAll(/\[DONE:\s*(.+?)\]/gi)) {
-    const { data } = await supabase
+    const { data, error: selectError } = await supabase
       .from("memory")
       .select("id")
       .eq("type", "goal")
       .ilike("content", `%${match[1]}%`)
       .limit(1);
 
+    if (selectError) {
+      console.error(`[memory] DONE lookup dropped: ${selectError.message}`);
+    }
+
     if (data?.[0]) {
-      await supabase
+      const { error: updateError } = await supabase
         .from("memory")
         .update({
           type: "completed_goal",
           completed_at: new Date().toISOString(),
         })
         .eq("id", data[0].id);
+      if (updateError) {
+        console.error(`[memory] DONE update dropped: ${updateError.message}`);
+      }
     }
     clean = clean.replace(match[0], "");
   }
@@ -83,6 +96,13 @@ export async function getMemoryContext(
       supabase.rpc("get_facts"),
       supabase.rpc("get_active_goals"),
     ]);
+
+    if (factsResult.error) {
+      console.error(`[memory] get_facts failed: ${factsResult.error.message}`);
+    }
+    if (goalsResult.error) {
+      console.error(`[memory] get_active_goals failed: ${goalsResult.error.message}`);
+    }
 
     const parts: string[] = [];
 
@@ -129,7 +149,11 @@ export async function getRelevantContext(
       body: { query, match_count: 5, table: "messages" },
     });
 
-    if (error || !data?.length) return "";
+    if (error) {
+      console.error(`[memory] relevant-context search failed: ${error.message}`);
+      return "";
+    }
+    if (!data?.length) return "";
 
     return (
       "RELEVANT PAST MESSAGES:\n" +

@@ -7,11 +7,14 @@
  * Usage: bun run setup/install.ts
  */
 
-import { existsSync, mkdirSync, copyFileSync } from "fs";
+import { existsSync, mkdirSync, copyFileSync, chmodSync } from "fs";
 import { join, dirname } from "path";
+import { homedir } from "os";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
-const REQUIRED_DIRS = ["logs", "temp", "uploads"];
+const RELAY_DIR = process.env.RELAY_DIR || join(homedir(), ".claude-relay");
+const REQUIRED_PROJECT_DIRS = ["logs"];
+const REQUIRED_RELAY_DIRS = ["logs", "temp", "uploads", "state", join("state", "chats"), join("state", "updates")];
 
 // Colors
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
@@ -90,13 +93,28 @@ async function installDeps(): Promise<boolean> {
 }
 
 function createDirs(): void {
-  for (const dir of REQUIRED_DIRS) {
+  for (const dir of REQUIRED_PROJECT_DIRS) {
     const fullPath = join(PROJECT_ROOT, dir);
     if (!existsSync(fullPath)) {
       mkdirSync(fullPath, { recursive: true });
       console.log(`  ${PASS} Created ${dir}/`);
     } else {
       console.log(`  ${PASS} ${dir}/ ${dim("(exists)")}`);
+    }
+  }
+
+  for (const dir of REQUIRED_RELAY_DIRS) {
+    const fullPath = join(RELAY_DIR, dir);
+    if (!existsSync(fullPath)) {
+      mkdirSync(fullPath, { recursive: true, mode: 0o700 });
+      console.log(`  ${PASS} Created ${fullPath}`);
+    } else {
+      console.log(`  ${PASS} ${fullPath} ${dim("(exists)")}`);
+    }
+    try {
+      chmodSync(fullPath, 0o700);
+    } catch {
+      console.log(`  ${WARN} Could not chmod ${fullPath} to 0700`);
     }
   }
 }

@@ -7,15 +7,17 @@ You message it. Claude responds. Text, photos, documents, voice. It remembers ac
 **Created by [Goda Go](https://youtube.com/@GodaGo)** | [AI Productivity Hub Community](https://skool.com/autonomee)
 
 ```
-You ──▶ Telegram ──▶ Relay ──▶ Claude Code CLI ──▶ Response
-                                    │
-                              Supabase (memory)
+You -> Telegram -> Relay -> Claude Code CLI -> Response
+                         |
+              Obsidian durable memory
+                         |
+              Supabase optional history/search
 ```
 
 ## What You Get
 
 - **Relay**: Send messages on Telegram, get Claude responses back
-- **Memory**: Semantic search over conversation history, persistent facts and goals via Supabase
+- **Memory**: Durable rules and lessons in Obsidian, with optional Supabase history/search
 - **Proactive**: Smart check-ins that know when to reach out (and when not to)
 - **Briefings**: Daily morning summary with goals and schedule
 - **Voice**: Transcribe voice messages (Groq cloud or local Whisper — your choice)
@@ -41,7 +43,7 @@ claude
 Claude Code reads `CLAUDE.md` and walks you through setup conversationally:
 
 1. Create a Telegram bot via BotFather
-2. Set up Supabase for persistent memory
+2. Keep Obsidian as durable memory; optionally add Supabase for history/search
 3. Personalize your profile
 4. Test the bot
 5. Configure always-on services
@@ -89,7 +91,8 @@ CLAUDE.md                    # Guided setup (Claude Code reads this)
 src/
   relay.ts                   # Core relay daemon
   transcribe.ts              # Voice transcription (Groq / whisper.cpp)
-  memory.ts                  # Persistent memory (facts, goals, semantic search)
+  memory-capture.ts          # Obsidian-first durable memory capture
+  memory.ts                  # Optional Supabase history/search helpers
 examples/
   smart-checkin.ts           # Proactive check-ins
   morning-briefing.ts        # Daily briefing
@@ -125,7 +128,71 @@ The relay does three things:
 
 Claude Code gives you full power: tools, MCP servers, web search, file access. Not just a model — an AI with hands.
 
-Your bot remembers between sessions via Supabase. Every message gets an embedding (via OpenAI, stored in Supabase) so the bot can semantically search past conversations for relevant context. It also tracks facts and goals — Claude detects when you mention something worth remembering and stores it automatically.
+The durable memory source of truth is Obsidian. Relay lessons, behavior rules, project facts, and iMessage safety constraints live as Markdown in the vault. Supabase is optional and complementary: use it for Telegram message history and semantic search over prior conversations. Supabase durable facts/goals are disabled unless you intentionally set `MEMORY_AUTHORITY=supabase`.
+
+## iMessage Staging Handoff
+
+For iMessage draft requests, the relay reads recent thread context, asks Claude
+for the draft body with Obsidian and retrieval context injected, then sends a
+normal iMessage to one staging handle. A Shortcuts automation watches that
+staging thread and opens the target Messages compose sheet. The relay does not
+drive the final compose field directly, and it never sends the target message.
+
+Required architecture:
+
+```text
+Telegram request
+  -> relay resolves the Messages contact
+  -> relay reads recent iMessage thread context from chat.db
+  -> relay injects Obsidian memory, project anchors, and retrieval context
+  -> Claude drafts under the writing rules
+  -> relay strips prose dashes
+  -> relay writes the final draft to iCloud Drive latest.json
+  -> relay sends JSON to the staging iMessage handle as the phone wake-up signal
+  -> the iPhone Shortcuts automation runs ClaudeDraft
+  -> ClaudeDraft reads latest.json and opens the final chatbox with Show When Run enabled
+```
+
+Payload sent to the staging thread:
+
+```json
+{
+  "version": "CLDRAFT/1",
+  "to": "+15195551234",
+  "label": "Conor",
+  "body": "Hey Conor, thanks for sending that over. I can take a look tonight."
+}
+```
+
+Configure the relay with:
+
+```bash
+RELAY_IMESSAGE_STAGING_HANDLE=+15555555555
+```
+
+The staging handle must be different from the final target recipient. The
+helper refuses to send CLDRAFT/1 JSON to the target handle; set
+`RELAY_IMESSAGE_ALLOW_SELF_STAGING=1` only for a deliberate self-staging test.
+
+Build the watcher in Shortcuts.app:
+
+1. Automation -> plus -> Message.
+2. Message Contains: `CLDRAFT/1`.
+3. Sender: the staging handle if you want to restrict it; `Any Sender` works
+   because the version marker is specific.
+4. Run Immediately.
+5. On iPhone, run `ClaudeDraft`. It reads the synced iCloud Drive
+   `claude-relay-drafts/latest.json` file and uses Send Message with
+   `Show When Run` ON.
+
+The older `ClaudeStageDraft` parser remains useful on macOS, where the Message
+automation reliably exposes the incoming message content. On iPhone, the
+Message automation fired but repeatedly passed blank content through nested
+shortcuts, so the production phone path uses the staging iMessage as the wake
+signal and iCloud Drive as the payload source.
+
+Details, exact Shortcut steps, TCC notes, and dry-run/live tests are in
+[`docs/IMESSAGE-SHORTCUT-HANDOFF.md`](docs/IMESSAGE-SHORTCUT-HANDOFF.md).
 
 ## Environment Variables
 
@@ -135,8 +202,13 @@ See `.env.example` for all options. The essentials:
 # Required
 TELEGRAM_BOT_TOKEN=     # From @BotFather
 TELEGRAM_USER_ID=       # From @userinfobot
+MEMORY_AUTHORITY=obsidian
+
+# Optional Supabase history/search
 SUPABASE_URL=           # From Supabase dashboard
 SUPABASE_ANON_KEY=      # From Supabase dashboard
+SUPABASE_MESSAGE_HISTORY=1
+SUPABASE_RELEVANT_CONTEXT=1
 
 # Recommended
 USER_NAME=              # Your first name

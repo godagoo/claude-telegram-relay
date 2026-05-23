@@ -1,0 +1,27 @@
+{
+  "$schema": "Each entry maps a project to anchor terms. When a user message contains any anchor (word-boundary, case-insensitive), the relay scopes an FTS retrieval to that project's paths and injects the top hits into the prompt. Keep anchor lists tight to avoid false positives.",
+  "projects": [
+    {
+      "name": "Medicolegal-Case",
+      "paths": [
+        "/Users/williamregan/ObsidianVault/01-Projects/Medicolegal-Case/%",
+        "/Users/williamregan/Desktop/Appeal_Case/%"
+      ],
+      "anchors": [
+        "lawyer", "lawyers", "attorney", "attorneys", "counsel",
+        "appeal", "appeals", "appellant",
+        "probation", "supervisor", "supervising",
+        "Saint Amman", "St. Amman", "Mark Saint",
+        "Rob Roy", "Dr. Roy",
+        "MIET",
+        "CaRMS",
+        "procedural unfairness", "procedural fairness",
+        "Natalie",
+        "Madison",
+        "residency program", "residency match", "match list",
+        "exhibit", "exhibits"
+      ],
+      "context_label": "MEDICOLEGAL-CASE CONTEXT (William's appeal of a residency-program decision; lawyers Natalie/Madison, supervisor Mark Saint Amman, Dr. Rob Roy in procedural-unfairness arguments):"
+    }
+  ]
+}

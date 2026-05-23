@@ -7,17 +7,113 @@
  * Run: bun run src/relay.ts
  */
 
-import { Bot, Context } from "grammy";
+import { Bot } from "grammy";
 import { spawn } from "bun";
-import { writeFile, mkdir, readFile, unlink } from "fs/promises";
-import { join, dirname } from "path";
+import { constants, existsSync } from "fs";
+import { writeFile, mkdir, readFile, unlink, access, open, chmod, rm } from "fs/promises";
+import { join, dirname, basename, extname } from "path";
+import * as os from "os";
+import { homedir } from "os";
+import { randomUUID } from "crypto";
+import { AsyncLocalStorage } from "async_hooks";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { buildClaudeCliArgs } from "./claude-cli-args.ts";
+import { redactBotToken } from "./redact-token.ts";
 import { transcribe } from "./transcribe.ts";
+import {
+  ANESTHESIA_CORPUS_INSTRUCTIONS,
+  isAnesthesiaCorpusQuery,
+} from "./anesthesia-corpus.ts";
 import {
   processMemoryIntents,
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
+import { search as ftsSearch, renderContext as renderFtsContext, preflight as retrievalPreflight } from "./retrieval.ts";
+import {
+  findAnchoredProjects,
+  retrieveAnchoredContext,
+  renderAnchoredContext,
+} from "./project-anchors.ts";
+import { isReferential } from "./trigger.ts";
+import {
+  buildSearchQuery,
+  countContentTokens,
+  ENGLISH_ONLY_DIRECTIVE,
+  type Turn,
+} from "./query-builder.ts";
+import { loadTurns, appendTurn } from "./short-term.ts";
+import { buildCatalogResponse, buildSkippedTextbookResponse } from "./textbook-response.ts";
+import { sanitizeClaudeResponse, stripProseDashes } from "./response-sanitize.ts";
+import { gateForIMessageRecipient } from "./draft-router.ts";
+import {
+  buildContactSelectionLine,
+  detectLikelyIMessageDraftIntent,
+  extractIMessageDraftRequest,
+  fetchIMessageContext,
+  renderIMessageContext,
+  shouldClarifyMissingIMessageDraftBody,
+  type IMessageContextResult,
+} from "./imessage-context.ts";
+import {
+  DRAFT_MARKER_CLOSE,
+  DRAFT_MARKER_OPEN,
+  extractDraftBody,
+  rebuildAroundDraftBlock,
+  replaceDraftBlock,
+  stageIMessageDraft,
+  stripPlacementClaims,
+  type IMessageDraftStatus,
+} from "./imessage-draft.ts";
+import {
+  placeIPhoneMirrorDraft,
+  shouldUseIPhoneMirrorPlacement,
+} from "./iphone-mirror-draft.ts";
+import {
+  classifyIMessageDraftIntent,
+  looksLikeDraftIntent,
+} from "./imessage-intent.ts";
+import {
+  clearUpdateMarker,
+  loadSeenUpdateIds,
+  logDecision,
+  markUpdateStarted,
+  markUpdateSent,
+  sweepOldDecisionLogs,
+  type DecisionRecord,
+} from "./decision-log.ts";
+import {
+  clearICloudDriveDraft,
+} from "./icloud-drive-draft.ts";
+import {
+  classifyMemoryCandidate,
+  writeMemoryCandidate,
+} from "./memory-capture.ts";
+import { writeRelayVaultArtifacts } from "./vault-writer.ts";
+import {
+  prepareTelegramResponseText,
+  sendTelegramResponse,
+} from "./telegram-response.ts";
+import {
+  TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
+  TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
+  classifyTelegramPollingConflictError,
+  formatTelegramPollingConflictHint,
+  formatTelegramPollingConflictLog,
+  shouldEscalateTelegramPollingConflict,
+  shouldExitAfterTelegramPollingConflict,
+  shouldPrintConflictHint,
+} from "./telegram-polling.ts";
+import {
+  acquireTokenLock,
+  isLiveRelayPid,
+  releaseTokenLock,
+  startTokenLockHeartbeat,
+  tokenLockPath,
+} from "./token-lock.ts";
+import { getSupabaseFeatureConfig } from "./supabase-config.ts";
+import { checkRelayBinaries, archLabel } from "./arch-check.ts";
+import { rotateLogIfTooLarge } from "./log-rotation.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -27,20 +123,66 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
-const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
+const DEFAULT_CLAUDE_PATH = join(homedir(), ".local", "bin", "claude");
+const CLAUDE_PATH = process.env.CLAUDE_PATH || DEFAULT_CLAUDE_PATH;
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
+// Pin the cwd for every `claude` spawn so future --resume work (Phase 1.1)
+// can locate session JSONLs in a stable project bucket. Per
+// platform.claude.com/docs/en/agent-sdk/sessions, sessions are stored under
+// ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl with non-alphanumerics
+// replaced by '-'. Inheriting launchd's cwd ('/') would scatter sessions.
+const RELAY_CWD = process.env.PROJECT_DIR || process.env.RELAY_CWD || PROJECT_ROOT;
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
+const CLAUDE_TIMEOUT_MS = positiveIntEnv("CLAUDE_TIMEOUT_MS", 90_000);
+const SESSION_TIMEOUT_ROTATE = process.env.SESSION_TIMEOUT_ROTATE !== "0";
+const MAX_PROMPT_CHARS = 120_000;
+const MAX_RECENT_TURNS_RENDERED = 6;
+const CLAUDE_RESUME_ENABLED = process.env.CLAUDE_RESUME === "1";
 
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
+const MAX_VOICE_BYTES = 25 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES = 40 * 1024 * 1024;
 
 // Session tracking for conversation continuity
 const SESSION_FILE = join(RELAY_DIR, "session.json");
 
 interface SessionState {
   sessionId: string | null;
+  createdAt?: string;
   lastActivity: string;
+}
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function isUnsetPlaceholder(value: string): boolean {
+  return !value.trim() || /^your_/i.test(value.trim());
+}
+
+function isDirectMessageIdentifier(value: string): boolean {
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(trimmed) ||
+    /^\+?[()\-\d\s]{7,}$/.test(trimmed);
+}
+
+async function ensurePrivateDir(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await chmod(path, 0o700).catch(() => undefined);
+}
+
+function declaredSizeTooLarge(size: number | undefined, maxBytes: number): boolean {
+  return typeof size === "number" && Number.isFinite(size) && size > maxBytes;
+}
+
+function formatBytes(n: number): string {
+  return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
 // ============================================================
@@ -57,57 +199,79 @@ async function loadSession(): Promise<SessionState> {
 }
 
 async function saveSession(state: SessionState): Promise<void> {
-  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2));
+  await ensurePrivateDir(RELAY_DIR);
+  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(SESSION_FILE, 0o600).catch(() => undefined);
 }
 
 let session = await loadSession();
 
+async function resetClaudeSession(reason: string): Promise<void> {
+  console.log(`[session] reset Claude session: ${reason}`);
+  session = { sessionId: null, lastActivity: new Date().toISOString() };
+  await unlink(SESSION_FILE).catch(() => undefined);
+}
+
+async function rotateClaudeSessionAfterTimeout(): Promise<void> {
+  if (!SESSION_TIMEOUT_ROTATE) return;
+  await resetClaudeSession("claude_timeout");
+}
+
 // ============================================================
-// LOCK FILE (prevent multiple instances)
+// LOCK FILE (token-keyed singleton)
 // ============================================================
 
-const LOCK_FILE = join(RELAY_DIR, "bot.lock");
+const TOKEN_LOCK_PATH = tokenLockPath(BOT_TOKEN);
+const RELAY_HOST = process.env.RELAY_HOST || os.hostname();
 
-async function acquireLock(): Promise<boolean> {
+let releaseLockOnExit: () => Promise<void> = async () => undefined;
+let stopBotOnExit: () => Promise<void> = async () => undefined;
+let stopLockHeartbeat: () => void = () => undefined;
+
+async function shutdown(reason: string, code = 0): Promise<void> {
   try {
-    const existingLock = await readFile(LOCK_FILE, "utf-8").catch(() => null);
-
-    if (existingLock) {
-      const pid = parseInt(existingLock);
-      try {
-        process.kill(pid, 0); // Check if process exists
-        console.log(`Another instance running (PID: ${pid})`);
-        return false;
-      } catch {
-        console.log("Stale lock found, taking over...");
-      }
-    }
-
-    await writeFile(LOCK_FILE, process.pid.toString());
-    return true;
-  } catch (error) {
-    console.error("Lock error:", error);
-    return false;
+    stopLockHeartbeat();
+  } catch (err) {
+    console.error(`[shutdown] heartbeat stop failed (${reason}):`, err);
   }
+  try {
+    await stopBotOnExit();
+  } catch (err) {
+    console.error(`[shutdown] bot stop failed (${reason}):`, err);
+  }
+  try {
+    await releaseLockOnExit();
+  } catch (err) {
+    console.error(`[shutdown] lock release failed (${reason}):`, err);
+  }
+  process.exit(code);
 }
 
-async function releaseLock(): Promise<void> {
-  await unlink(LOCK_FILE).catch(() => {});
-}
+process.on("SIGINT", () => {
+  shutdown("SIGINT", 0).catch(() => process.exit(0));
+});
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM", 0).catch(() => process.exit(0));
+});
 
-// Cleanup on exit
+// Synchronous safety net: node's "exit" event only fires after all other
+// listeners returned, and async work cannot run inside it. Remove the lock
+// file directly so a crash path still surfaces an empty lock to the next
+// launchd start.
 process.on("exit", () => {
   try {
-    require("fs").unlinkSync(LOCK_FILE);
-  } catch {}
-});
-process.on("SIGINT", async () => {
-  await releaseLock();
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await releaseLock();
-  process.exit(0);
+    const fs = require("fs") as typeof import("fs");
+    const raw = fs.readFileSync(TOKEN_LOCK_PATH, "utf8");
+    const parsed = JSON.parse(raw) as { pid?: number };
+    if (parsed?.pid === process.pid) {
+      fs.unlinkSync(TOKEN_LOCK_PATH);
+    }
+  } catch {
+    // Lock missing or unreadable: nothing to clean up.
+  }
 });
 
 // ============================================================
@@ -123,9 +287,48 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
+if (isUnsetPlaceholder(ALLOWED_USER_ID) || !/^\d+$/.test(ALLOWED_USER_ID.trim())) {
+  console.error("TELEGRAM_USER_ID must be set to your numeric Telegram user ID.");
+  console.log("\nThis relay can spawn a local Claude Code process, so it refuses to run without an explicit Telegram allowlist.");
+  console.log("Get your ID from @userinfobot and set TELEGRAM_USER_ID in .env.");
+  process.exit(1);
+}
+
+try {
+  await access(RELAY_CWD, constants.R_OK);
+} catch {
+  console.error(`RELAY_CWD is not readable: ${RELAY_CWD}`);
+  console.log("Set PROJECT_DIR or RELAY_CWD to the relay workspace path.");
+  process.exit(1);
+}
+
 // Create directories
-await mkdir(TEMP_DIR, { recursive: true });
-await mkdir(UPLOADS_DIR, { recursive: true });
+await ensurePrivateDir(RELAY_DIR);
+await ensurePrivateDir(TEMP_DIR);
+await ensurePrivateDir(UPLOADS_DIR);
+
+// Rotate the launchd stderr log if it grew past the threshold. launchd
+// owns the StandardErrorPath fd, so the rotator uses copy-and-truncate
+// rather than rename. Failures must never block startup — the rotator
+// is observability, not a runtime dependency.
+{
+  const errorLogPath = join(
+    process.env.RELAY_LOG_DIR || join(RELAY_DIR, "logs"),
+    "com.claude.telegram-relay.error.log",
+  );
+  const maxBytes = positiveIntEnv("RELAY_ERROR_LOG_ROTATE_MAX_BYTES", 5 * 1024 * 1024);
+  try {
+    const result = await rotateLogIfTooLarge({ path: errorLogPath, maxBytes });
+    if (result.rotated) {
+      console.log(
+        `[log-rotation] rotated relay error log path=${result.path} archive=${result.archivePath} size_bytes=${result.sizeBytes}`,
+      );
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[log-rotation] rotation failed (continuing startup): ${message}`);
+  }
+}
 
 // ============================================================
 // SUPABASE (optional — only if configured)
@@ -135,32 +338,147 @@ const supabase: SupabaseClient | null =
   process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
     : null;
+const supabaseFeatures = getSupabaseFeatureConfig(process.env);
+
+if (supabase) {
+  console.log(
+    `[supabase] configured history=${supabaseFeatures.messageHistory} relevant_context=${supabaseFeatures.relevantContext} durable_memory=${supabaseFeatures.durableMemory} memory_authority=${supabaseFeatures.memoryAuthority}`,
+  );
+}
 
 async function saveMessage(
   role: string,
   content: string,
   metadata?: Record<string, unknown>
 ): Promise<void> {
-  if (!supabase) return;
+  if (!supabase || !supabaseFeatures.messageHistory) return;
   try {
-    await supabase.from("messages").insert({
+    const { error } = await supabase.from("messages").insert({
       role,
       content,
       channel: "telegram",
       metadata: metadata || {},
     });
+    if (error) {
+      console.error(
+        `[supabase] message insert failed role=${role}: ${error.message}`,
+      );
+    }
   } catch (error) {
     console.error("Supabase save error:", error);
   }
 }
 
-// Acquire lock
-if (!(await acquireLock())) {
-  console.error("Could not acquire lock. Another instance may be running.");
-  process.exit(1);
+// Acquire token-keyed singleton lock. The lock filename is the sha256 prefix
+// of the bot token, and the lock root is host-global (RELAY_LOCK_ROOT or
+// ~/.claude-relay/locks) — independent of RELAY_DIR, so two relays started
+// with different RELAY_DIR values still collide on the same file. The raw
+// token never lands on disk; the file holds only the hash.
+{
+  const lockResult = await acquireTokenLock({
+    token: BOT_TOKEN,
+    host: RELAY_HOST,
+    pid: process.pid,
+    now: new Date(),
+    // baseDir omitted → defaultLockRoot() is used.
+    // isLiveRelayPid checks BOTH process existence and that its `ps` cmdline
+    // mentions relay.ts — so a PID reused by some unrelated process won't
+    // falsely keep us out.
+    isLiveRelay: (pid) => isLiveRelayPid(pid),
+  });
+
+  if (!lockResult.ok) {
+    if (lockResult.reason === "held_by_live_relay") {
+      const heldFor = Math.max(
+        0,
+        Math.round((Date.now() - Date.parse(lockResult.holder.started_at)) / 1000),
+      );
+      console.error(
+        `[relay] token lock held by live relay pid=${lockResult.holder.pid} ` +
+        `host=${lockResult.holder.host} held_for_s=${heldFor} ` +
+        `path=${lockResult.path}`,
+      );
+      console.error(
+        "[relay] If that PID is wrong, remove the lock file manually after confirming no other relay is running.",
+      );
+      process.exit(75);
+    } else if (lockResult.reason === "io_error") {
+      console.error(`[relay] token lock IO error: ${lockResult.error}`);
+      process.exit(1);
+    }
+  } else {
+    // Capture the acquired payload's started_at so release can verify it
+    // against the file on disk and refuse to delete a lock that's no
+    // longer ours (PID reuse, takeover-during-shutdown race).
+    const acquiredStartedAt = lockResult.payload.started_at;
+    releaseLockOnExit = async () => {
+      await releaseTokenLock({
+        token: BOT_TOKEN,
+        pid: process.pid,
+        host: RELAY_HOST,
+        startedAt: acquiredStartedAt,
+      });
+    };
+    stopLockHeartbeat = startTokenLockHeartbeat({
+      token: BOT_TOKEN,
+      pid: process.pid,
+      host: RELAY_HOST,
+    });
+  }
 }
 
 const bot = new Bot(BOT_TOKEN);
+stopBotOnExit = async () => {
+  try {
+    await bot.stop();
+  } catch {
+    // bot.stop() throws if polling never started; safe to ignore at shutdown.
+  }
+};
+
+const seenUpdates: Set<number> = await loadSeenUpdateIds();
+const sentUpdates = new Set<number>();
+let retrievalAvailable = false;
+let retrievalStartupError: string | undefined;
+
+async function markUpdateSentAndRemember(updateId: number): Promise<void> {
+  await markUpdateSent(updateId);
+  sentUpdates.add(updateId);
+}
+
+bot.use(async (ctx, next) => {
+  const updateId = ctx.update.update_id;
+  if (seenUpdates.has(updateId)) {
+    return;
+  }
+
+  seenUpdates.add(updateId);
+  await markUpdateStarted(updateId);
+
+  try {
+    await next();
+    await clearUpdateMarker(updateId);
+    sentUpdates.delete(updateId);
+  } catch (err) {
+    await logDecision({
+      ts: new Date().toISOString(),
+      update_id: updateId,
+      chat_id: ctx.chat?.id ?? 0,
+      message: ctx.message && "text" in ctx.message ? ctx.message.text ?? "" : "",
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: 0,
+      error: err instanceof Error ? err.message : String(err),
+    }).catch(() => undefined);
+    if (!sentUpdates.has(updateId)) {
+      seenUpdates.delete(updateId);
+      await clearUpdateMarker(updateId);
+    }
+    throw err;
+  }
+});
 
 // ============================================================
 // SECURITY: Only respond to authorized user
@@ -173,219 +491,1387 @@ bot.use(async (ctx, next) => {
   if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
     console.log(`Unauthorized: ${userId}`);
     await ctx.reply("This bot is private.");
+    await markUpdateSentAndRemember(ctx.update.update_id);
     return;
   }
 
   await next();
 });
 
+// Per-chat FIFO for every update type. The text handler already calls
+// enqueue(); enqueue is re-entrant so nested calls from inside this middleware
+// run directly instead of deadlocking on their own queue slot.
+bot.use(async (ctx, next) => {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) {
+    await next();
+    return;
+  }
+
+  await enqueue(String(chatId), ctx.update.update_id, next);
+});
+
 // ============================================================
 // CORE: Call Claude CLI
 // ============================================================
 
+function buildClaudeEnv(): Record<string, string> {
+  const names = [
+    "HOME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR",
+  ];
+  const env: Record<string, string> = {};
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return env;
+}
+
+function sanitizeStderr(stderr: string): string {
+  return redactBotToken(
+    stderr.replace(/(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|TELEGRAM_BOT_TOKEN)=\S+/g, "$1=[redacted]"),
+    BOT_TOKEN,
+  ).slice(0, 4000);
+}
+
+function parseClaudeCliOutput(output: string): { text: string; sessionId?: string } {
+  const trimmed = output.trim();
+  if (!trimmed) return { text: "" };
+
+  try {
+    const data = JSON.parse(trimmed) as Record<string, unknown>;
+    const sessionId =
+      typeof data.session_id === "string"
+        ? data.session_id
+        : typeof data.sessionId === "string"
+          ? data.sessionId
+          : undefined;
+    const text =
+      typeof data.result === "string"
+        ? data.result
+        : typeof data.content === "string"
+          ? data.content
+          : typeof data.message === "string"
+            ? data.message
+            : trimmed;
+    return { text: text.trim(), sessionId };
+  } catch {
+    return { text: trimmed };
+  }
+}
+
 async function callClaude(
   prompt: string,
-  options?: { resume?: boolean; imagePath?: string }
+  options?: { resume?: boolean; allowedTools?: string[]; addDirs?: string[]; cwd?: string }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
+  const args = buildClaudeCliArgs({
+    claudePath: CLAUDE_PATH,
+    prompt,
+    allowedTools: options?.allowedTools ?? [],
+    addDirs: options?.addDirs ?? [],
+    resume: options?.resume === true,
+    resumeEnabled: CLAUDE_RESUME_ENABLED,
+    sessionId: session.sessionId,
+  });
+  const userPrompt = args[2] ?? "";
 
-  // Resume previous session if available and requested
-  if (options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
-  }
-
-  args.push("--output-format", "text");
-
-  console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`Calling Claude: ${userPrompt.substring(0, 80)}...`);
 
   try {
     const proc = spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
-      cwd: PROJECT_DIR || undefined,
-      env: {
-        ...process.env,
-        // Pass through any env vars Claude might need
-      },
+      cwd: options?.cwd ?? RELAY_CWD,
+      env: buildClaudeEnv(),
+      timeout: CLAUDE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
     });
 
-    const output = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
+    const [output, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
 
-    const exitCode = await proc.exited;
-
-    if (exitCode !== 0) {
-      console.error("Claude error:", stderr);
-      return `Error: ${stderr || "Claude exited with code " + exitCode}`;
+    const signalCode = (proc as { signalCode?: string | null }).signalCode;
+    if (signalCode === "SIGKILL") {
+      await rotateClaudeSessionAfterTimeout();
+      throw new Error(`claude_timeout_${CLAUDE_TIMEOUT_MS}ms`);
     }
 
-    // Extract session ID from output if present (for --resume)
-    const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
-    if (sessionMatch) {
-      session.sessionId = sessionMatch[1];
+    if (exitCode !== 0) {
+      const sanitized = sanitizeStderr(stderr || `exit_code=${exitCode}`);
+      console.error("Claude error:", sanitized);
+      throw new Error(`claude_exit_${exitCode}: ${sanitized}`);
+    }
+
+    const parsed = parseClaudeCliOutput(output);
+    if (CLAUDE_RESUME_ENABLED && parsed.sessionId) {
+      if (!session.createdAt || session.sessionId !== parsed.sessionId) {
+        session.createdAt = new Date().toISOString();
+      }
+      session.sessionId = parsed.sessionId;
       session.lastActivity = new Date().toISOString();
       await saveSession(session);
     }
 
-    return output.trim();
+    return parsed.text;
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("claude_timeout_")) {
+      throw new Error(`claude_timeout_${CLAUDE_TIMEOUT_MS}ms`);
+    }
+    if (message.startsWith("claude_exit_")) {
+      throw new Error(message);
+    }
     console.error("Spawn error:", error);
-    return `Error: Could not run Claude CLI`;
+    throw new Error(`claude_spawn_failed: ${message}`);
   }
+}
+
+// ============================================================
+// HARDENING HELPERS (Phase 1 v1)
+// ============================================================
+
+// Per-chat FIFO queue. Two messages from the same chat process in order;
+// different chats are independent. Prevents state.json races.
+const chatQueues = new Map<string, Promise<unknown>>();
+const queueContext = new AsyncLocalStorage<string>();
+
+function enqueue<T>(chatId: string, updateId: number, fn: () => Promise<T>): Promise<T> {
+  if (queueContext.getStore() === chatId) return fn();
+
+  const prev = chatQueues.get(chatId) ?? Promise.resolve();
+  const next = prev
+    .catch(() => undefined)
+    .then(() => queueContext.run(chatId, fn));
+  const logged = next.catch(async (err) => {
+    await logDecision({
+      ts: new Date().toISOString(),
+      update_id: updateId,
+      chat_id: chatId,
+      message: "",
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: 0,
+      error: `enqueue_caught: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    throw err;
+  });
+  chatQueues.set(chatId, logged.catch(() => undefined));
+  return logged;
+}
+
+// stripMemoryTags / stripWrapperTags moved to ./response-sanitize.ts so they
+// can be unit-tested without importing the relay module's startup side effects
+// (lock acquisition, bot construction). Layer 1 of the memory-tag leak fix
+// (gating the prompt instruction on `supabase`) is in buildPrompt.
+
+// Plain-text recent-turns renderer (locked v1 decision: no XML in prompts).
+// short-term.ts also exports renderRecentTurns which emits XML; we use this
+// plain-text variant instead.
+function isStaleIMessageAccessFailure(turn: Turn): boolean {
+  return (
+    turn.role === "assistant" &&
+    /cannot read your iMessage history|Full Disk Access for the relay's bun binary|drafting from your description, not from actual prior messages/i.test(turn.content)
+  );
+}
+
+function renderRecentTurnsPlain(
+  turns: Turn[],
+  cap = MAX_RECENT_TURNS_RENDERED,
+  opts?: { suppressStaleIMessageFailures?: boolean },
+): string {
+  if (turns.length === 0) return "";
+  const source = opts?.suppressStaleIMessageFailures
+    ? turns.filter((turn) => !isStaleIMessageAccessFailure(turn))
+    : turns;
+  const trimmed = source.slice(-cap);
+  if (trimmed.length === 0) return "";
+  const lines = trimmed.map((t) => `${t.role}: ${t.content}`);
+  return `RECENT CONVERSATION:\n${lines.join("\n")}`;
+}
+
+function capPrompt(prompt: string, userMessage?: string): string {
+  if (prompt.length <= MAX_PROMPT_CHARS) return prompt;
+  const note =
+    `\n\n[TRUNCATED: prompt exceeded relay safety limit of ${MAX_PROMPT_CHARS} chars]`;
+  const userBlock = userMessage === undefined ? "" : `\nUser: ${userMessage}`;
+
+  if (
+    userBlock &&
+    prompt.endsWith(userBlock) &&
+    userBlock.length + note.length + 1000 < MAX_PROMPT_CHARS
+  ) {
+    const headBudget = MAX_PROMPT_CHARS - userBlock.length - note.length;
+    return prompt.slice(0, headBudget) + note + userBlock;
+  }
+
+  return prompt.slice(0, Math.max(0, MAX_PROMPT_CHARS - note.length)) + note;
+}
+
+function ensureSendableResponse(text: string, fallback: string): string {
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function safeUploadExtension(fileName?: string): string {
+  const ext = extname(basename(fileName ?? "")).toLowerCase();
+  return /^\.[a-z0-9]{1,12}$/.test(ext) ? ext : "";
+}
+
+async function createUploadWorkDir(updateId: number): Promise<string> {
+  const dir = join(UPLOADS_DIR, `${updateId}-${Date.now()}-${randomUUID()}`);
+  await mkdir(dir, { recursive: false, mode: 0o700 });
+  await chmod(dir, 0o700).catch(() => undefined);
+  return dir;
+}
+
+async function downloadTelegramFile(
+  args: {
+    filePath?: string;
+    fileId: string;
+    declaredSize?: number;
+    maxBytes: number;
+    kind: "voice" | "image" | "document";
+  },
+): Promise<Buffer> {
+  if (!args.filePath) {
+    throw new Error(`telegram_${args.kind}_missing_file_path`);
+  }
+  if (declaredSizeTooLarge(args.declaredSize, args.maxBytes)) {
+    throw new Error(
+      `telegram_${args.kind}_too_large_declared_${args.declaredSize}_max_${args.maxBytes}`,
+    );
+  }
+
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${args.filePath}`;
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (err) {
+    // fetch errors can include the full URL (with the bot token) in
+    // err.message; redact before rethrowing so the relay log never leaks it.
+    const safe = redactBotToken(err instanceof Error ? err.message : String(err), BOT_TOKEN);
+    throw new Error(`telegram_${args.kind}_download_fetch_failed: ${safe}`);
+  }
+  if (!response.ok) {
+    throw new Error(`telegram_${args.kind}_download_http_${response.status}`);
+  }
+
+  const contentLength = Number(response.headers.get("content-length") ?? "0");
+  if (contentLength > args.maxBytes) {
+    throw new Error(
+      `telegram_${args.kind}_too_large_content_length_${contentLength}_max_${args.maxBytes}`,
+    );
+  }
+  if (!response.body) {
+    throw new Error(`telegram_${args.kind}_download_missing_body`);
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    received += value.byteLength;
+    if (received > args.maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore stream cleanup failure.
+      }
+      throw new Error(
+        `telegram_${args.kind}_too_large_stream_${received}_max_${args.maxBytes}`,
+      );
+    }
+    chunks.push(value);
+  }
+
+  console.log(
+    `[telegram-file] kind=${args.kind} file_id=${args.fileId} declared_bytes=${args.declaredSize ?? "n/a"} downloaded_bytes=${received} max=${formatBytes(args.maxBytes)} content_type=${response.headers.get("content-type") ?? "n/a"}`,
+  );
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+}
+
+// Concrete reframes for the 90s timeout. "Try a narrower request" was flagged
+// as unactionable (see feedback_timeout_message_unhelpful.md). Pick suggestions
+// that match the shape of the user's question so the next attempt has a path.
+function buildTimeoutFallback(_userMessage: string): string {
+  const sec = Math.round(CLAUDE_TIMEOUT_MS / 1000);
+  return `Claude timed out at ${sec}s. Started a fresh session. Please re-send your request.`;
+}
+
+function shouldAcknowledgeFeedbackWithoutClaude(userMessage: string): boolean {
+  return (
+    /\b(?:please\s+)?log\s+this\b[\s\S]{0,120}\b(?:un+acceptable|wrong|bad|poor)\s+response\b/i.test(userMessage) ||
+    /\bthis\s+response\s+(?:is|was)\s+(?:un+acceptable|wrong|bad|poor)\b/i.test(userMessage)
+  );
+}
+
+function shouldDeclineAlreadyAnsweredLastMessageDraft(
+  text: string,
+  imessageContextResult: IMessageContextResult | null,
+  draftRequest: ReturnType<typeof extractIMessageDraftRequest>,
+): boolean {
+  if (!draftRequest?.wantsPlacement || draftRequest.directBody) return false;
+  if (imessageContextResult?.status !== "found") return false;
+  if (imessageContextResult.messages[0]?.sender !== "me") return false;
+
+  const asksForLastMessageReply =
+    /\b(?:reply|respond)\b[\s\S]{0,80}\blast\s+(?:message|text|imessage|sms|one)\b/i.test(text) ||
+    /\blast\s+(?:message|text|imessage|sms|one)\b[\s\S]{0,80}\b(?:reply|respond)\b/i.test(text);
+
+  return asksForLastMessageReply;
+}
+
+interface PostClaudeResult {
+  text: string;
+  memoryTagsStripped: number;
+  wrapperTagsStripped: number;
+  scaffoldingTagsStripped: number;
+  turnMarkersStripped: number;
+  proseDashesStripped: number;
+}
+
+async function postProcessClaudeResponse(
+  raw: string,
+  fallback: string,
+): Promise<PostClaudeResult> {
+  const intentResult = supabase && supabaseFeatures.durableMemory
+    ? await processMemoryIntents(supabase, raw)
+    : raw;
+  const cleanResult = sanitizeClaudeResponse(intentResult);
+
+  if (cleanResult.wrapperTagsStripped > 0) {
+    console.log(
+      `[wrapper-tag-strip] removed ${cleanResult.wrapperTagsStripped} bare wrapper tag(s)`,
+    );
+    if (CLAUDE_RESUME_ENABLED) {
+      await resetClaudeSession("wrapper tag emitted");
+    }
+  }
+
+  if (cleanResult.scaffoldingTagsStripped > 0) {
+    console.error(
+      `[scaffolding-leak] removed ${cleanResult.scaffoldingTagsStripped} internal scaffolding tag(s) (system-reminder/command-*)`,
+    );
+    if (CLAUDE_RESUME_ENABLED) {
+      await resetClaudeSession("scaffolding tag emitted");
+    }
+  }
+
+  if (cleanResult.turnMarkersStripped > 0) {
+    console.log(
+      `[turn-marker-strip] removed leaked User:/Assistant: turn marker from response`,
+    );
+  }
+
+  const strippedTotal =
+    cleanResult.memoryTagsStripped +
+    cleanResult.wrapperTagsStripped +
+    cleanResult.scaffoldingTagsStripped +
+    cleanResult.turnMarkersStripped +
+    cleanResult.proseDashesStripped;
+  if (strippedTotal > 0) {
+    console.log(
+      `[response-sanitize] memory=${cleanResult.memoryTagsStripped} wrapper=${cleanResult.wrapperTagsStripped} scaffolding=${cleanResult.scaffoldingTagsStripped} turn=${cleanResult.turnMarkersStripped} prose_dashes=${cleanResult.proseDashesStripped}`,
+    );
+  }
+
+  return {
+    text: ensureSendableResponse(cleanResult.clean, fallback),
+    memoryTagsStripped: cleanResult.memoryTagsStripped,
+    wrapperTagsStripped: cleanResult.wrapperTagsStripped,
+    scaffoldingTagsStripped: cleanResult.scaffoldingTagsStripped,
+    turnMarkersStripped: cleanResult.turnMarkersStripped,
+    proseDashesStripped: cleanResult.proseDashesStripped,
+  };
 }
 
 // ============================================================
 // MESSAGE HANDLERS
 // ============================================================
 
-// Text messages
+// Text messages (Phase 1 v1: trigger-gated FTS, short-term ring buffer,
+// per-chat FIFO queue, decision JSONL, two-layer memory-tag leak fix.)
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
-  console.log(`Message: ${text.substring(0, 50)}...`);
+  const chatId = String(ctx.chat.id);
+  const updateId = ctx.update.update_id;
 
-  await ctx.replyWithChatAction("typing");
+  await enqueue(chatId, updateId, async () => {
+    const t0 = Date.now();
+    const ts = new Date().toISOString();
+    console.log(`Message: ${text.substring(0, 50)}...`);
 
-  await saveMessage("user", text);
+    await ctx.replyWithChatAction("typing");
+    await saveMessage("user", text);
 
-  // Gather context: semantic search + facts/goals
-  const [relevantContext, memoryContext] = await Promise.all([
-    getRelevantContext(supabase, text),
-    getMemoryContext(supabase),
-  ]);
+    // Load recent turns for query builder + prompt block; append the user
+    // turn before retrieval so it's persisted even on later failure.
+    const recentTurns = await loadTurns(chatId);
+    const turnBufferSizeBefore = recentTurns.length;
+    await appendTurn(chatId, { role: "user", content: text, ts });
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+    // Trigger gating: run FTS for referential/project-memory messages and for
+    // anesthesia-domain questions that should consult the textbook corpus.
+    const referential = isReferential(text);
+    const corpusQuery = referential || isAnesthesiaCorpusQuery(text);
+    const queryContentTokens = countContentTokens(text);
+    const searchQuery = corpusQuery && retrievalAvailable
+      ? buildSearchQuery(text, recentTurns)
+      : "";
+    const tRetrieval0 = Date.now();
+    let retrievalMs: number | undefined;
+    let timeoutKind: "fts" | "claude" | undefined;
+    let retrievalError: string | undefined = corpusQuery && !retrievalAvailable
+      ? `retrieval_unavailable${retrievalStartupError ? `: ${retrievalStartupError}` : ""}`
+      : undefined;
+    let ftsHits: Awaited<ReturnType<typeof ftsSearch>> = [];
+    if (corpusQuery && searchQuery) {
+      try {
+        ftsHits = await ftsSearch(searchQuery, 8);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        retrievalError = msg;
+        if (msg.startsWith("fts_timeout_")) timeoutKind = "fts";
+        console.error("[retrieval] search failed:", msg);
+      } finally {
+        retrievalMs = Date.now() - tRetrieval0;
+      }
+    }
 
-  // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, rawResponse);
+    // Compose relevant-context block: recent conversation + indexed content
+    // + supabase fallback (inert when Supabase is null).
+    const indexedContent = renderFtsContext(ftsHits);
+    // Higher-level intent: contact + whether the user wants prior thread
+    // context fetched + whether the draft should be placed in Messages.app.
+    // Placement defaults to TRUE for any iMessage/text/SMS draft so the user
+    // doesn't have to repeat "directly in the iMessage box" each time.
+    let draftRequest = extractIMessageDraftRequest(text);
+    let intentClassifierStatus:
+      | "not_attempted"
+      | "resolved"
+      | "not_draft"
+      | "unresolved" = "not_attempted";
+    if (!draftRequest && looksLikeDraftIntent(text)) {
+      const classifiedIntent = await classifyIMessageDraftIntent(text);
+      if (classifiedIntent.kind === "draft") {
+        draftRequest = classifiedIntent.request;
+        intentClassifierStatus = "resolved";
+        console.log(
+          `[intent] classifier resolved imessage draft contact=${draftRequest.contact} placement=${draftRequest.wantsPlacement} direct_body=${Boolean(draftRequest.directBody)}`,
+        );
+      } else if (classifiedIntent.kind === "not_draft") {
+        intentClassifierStatus = "not_draft";
+      } else {
+        intentClassifierStatus = "unresolved";
+        console.error(
+          `[intent] classifier could not resolve likely draft intent: ${classifiedIntent.reason}`,
+        );
+      }
+    }
+    const likelyUnparsedIMessageDraftIntent =
+      !draftRequest &&
+      (detectLikelyIMessageDraftIntent(text) ||
+        intentClassifierStatus === "unresolved");
+    const directIdentifierWithoutContext =
+      draftRequest?.directBody &&
+      !draftRequest.wantsContext &&
+      isDirectMessageIdentifier(draftRequest.contact);
+    const imessageContextResult: IMessageContextResult | null = draftRequest
+      ? await fetchIMessageContext(PROJECT_ROOT, {
+        contact: draftRequest.contact,
+        limit: draftRequest.contextLimit,
+      })
+      : null;
+    const directResolvedRecipient = directIdentifierWithoutContext
+      ? (imessageContextResult?.resolvedRecipient ?? draftRequest?.contact)
+      : undefined;
+    const wantsIMessagePlacement = draftRequest?.wantsPlacement ?? false;
+    // Inject thread context for named iMessage drafts, including direct-body
+    // requests like "Text Jacqueline saying ...". The supplied body is the
+    // user's core meaning, not proof we should skip the user's writing rules or
+    // the last 5-10 messages from the actual thread. Direct phone/email targets
+    // still run the helper so their handle is normalized and recency metadata
+    // reaches the checkpoint line, but they bypass prompt context injection.
+    //
+    // Previously this was gated away whenever `directBody` existed, which made
+    // the relay place literal text and skip Claude entirely. Live failure
+    // 2026-05-17: "Text jacqueline saying where you at?" wrote exactly that
+    // phrase even though the thread context was available.
+    const hasThreadContextForDrafting =
+      Boolean(imessageContextResult) &&
+      !directResolvedRecipient &&
+      (imessageContextResult!.status === "found" ||
+        imessageContextResult!.status === "empty");
+    const shouldInjectContext =
+      Boolean(imessageContextResult) &&
+      !directResolvedRecipient &&
+      (!draftRequest?.directBody || hasThreadContextForDrafting);
+    const imessageContext = shouldInjectContext
+      ? renderIMessageContext(imessageContextResult!)
+      : "";
+    if (imessageContextResult && draftRequest) {
+      console.log(
+        `[imessage-context] contact=${imessageContextResult.request.contact} status=${imessageContextResult.status} messages=${imessageContextResult.messages.length} render_context=${shouldInjectContext} placement=${wantsIMessagePlacement}`,
+      );
+    }
+    if (wantsIMessagePlacement || likelyUnparsedIMessageDraftIntent) {
+      const clearDraft = await clearICloudDriveDraft();
+      if (clearDraft.ok) {
+        console.log(
+          `[imessage-draft] cleared stale iCloud handoff before new placement request path=${clearDraft.path ?? "unknown"}`,
+        );
+      } else {
+        console.error(
+          `[imessage-draft] failed to clear stale iCloud handoff before new placement request: ${clearDraft.error ?? "unknown error"}`,
+        );
+      }
+    }
+    const recentBlock = renderRecentTurnsPlain(recentTurns, MAX_RECENT_TURNS_RENDERED, {
+      suppressStaleIMessageFailures: Boolean(imessageContextResult),
+    });
+    // Project-anchor retrieval: deterministic. If the user message contains
+    // anchors for a known project (e.g. "lawyers / Saint Amman / MIET" →
+    // Medicolegal-Case), pull the top hits from that project's paths and
+    // inject them so Claude has context Saint-Amman-the-supervisor is real,
+    // not invented. See config/project-anchors.json.
+    let projectAnchorBlock = "";
+    let anchoredProjectNames: string[] = [];
+    try {
+      const matches = await findAnchoredProjects(text);
+      anchoredProjectNames = matches.map((m) => m.project.name);
+      if (matches.length > 0) {
+        const anchored = await retrieveAnchoredContext(matches);
+        projectAnchorBlock = renderAnchoredContext(anchored);
+        if (projectAnchorBlock) {
+          console.log(
+            `[project-anchors] injected ${anchored.reduce((n, h) => n + h.chunks.length, 0)} chunk(s) across ${anchored.length} project(s)`,
+          );
+        }
+      }
+    } catch (err) {
+      console.error("[project-anchors] failed:", err instanceof Error ? err.message : err);
+    }
+    const [supabaseContext, memoryContext] = supabase
+      ? await Promise.all([
+          supabaseFeatures.relevantContext
+            ? getRelevantContext(supabase, text)
+            : Promise.resolve(""),
+          supabaseFeatures.durableMemory
+            ? getMemoryContext(supabase)
+            : Promise.resolve(""),
+        ])
+      : ["", ""];
+    const combinedRelevant = [imessageContext, recentBlock, projectAnchorBlock, indexedContent, supabaseContext]
+      .filter(Boolean)
+      .join("\n\n");
+    const directIMessageBody =
+      wantsIMessagePlacement &&
+      draftRequest?.directBody &&
+      !draftRequest.wantsContext &&
+      !hasThreadContextForDrafting
+        ? draftRequest.directBody
+        : undefined;
+    const alreadyAnsweredLastMessageDraft =
+      shouldDeclineAlreadyAnsweredLastMessageDraft(
+        text,
+        imessageContextResult,
+        draftRequest,
+      );
+    const shouldClarifyMissingIMessageBody =
+      shouldClarifyMissingIMessageDraftBody({
+        message: text,
+        request: draftRequest,
+        contextResult: imessageContextResult,
+        alreadyAnsweredLastMessageDraft,
+      });
 
-  await saveMessage("assistant", response);
-  await sendResponse(ctx, response);
+    const enrichedPrompt = capPrompt(
+      buildPrompt(text, combinedRelevant, memoryContext, {
+        iMessageDraftContact: wantsIMessagePlacement
+          ? draftRequest?.contact
+          : undefined,
+      }),
+      text,
+    );
+
+    const tClaude0 = Date.now();
+    let assistantText = "";
+    let memoryTagsStripped = 0;
+    let wrapperTagsStripped = 0;
+    let scaffoldingTagsStripped = 0;
+    let turnMarkersStripped = 0;
+    let proseDashesStripped = 0;
+    let preliminaryIMessageDraftStatus: IMessageDraftStatus | undefined;
+    let errorMsg: string | undefined;
+    const deterministicTextbookResponse = buildSkippedTextbookResponse(text, ftsHits, {
+      referentialFired: referential,
+      contentTokenCount: queryContentTokens,
+    });
+    const deterministicCatalogResponse = buildCatalogResponse(ftsHits);
+    if (deterministicTextbookResponse) {
+      assistantText = deterministicTextbookResponse;
+    } else if (deterministicCatalogResponse) {
+      assistantText = deterministicCatalogResponse;
+    } else if (directIMessageBody) {
+      assistantText = `${DRAFT_MARKER_OPEN}\n${directIMessageBody}\n${DRAFT_MARKER_CLOSE}`;
+    } else if (alreadyAnsweredLastMessageDraft) {
+      const contactLabel = draftRequest?.contact ?? "that contact";
+      const latestText = imessageContextResult?.messages[0]?.text
+        ?.replace(/\s+/g, " ")
+        .trim();
+      const clearDraft = await clearICloudDriveDraft();
+      if (clearDraft.ok) {
+        console.log(
+          `[imessage-draft] cleared stale iCloud handoff after already-answered last-message request path=${clearDraft.path ?? "unknown"}`,
+        );
+      } else {
+        console.error(
+          `[imessage-draft] failed to clear stale iCloud handoff after already-answered request: ${clearDraft.error ?? "unknown error"}`,
+        );
+      }
+      assistantText = latestText
+        ? `The latest message I can see in ${contactLabel}'s thread is already from you: "${latestText}". I did not open a new draft. Tell me what you want to add if you still want a follow up.`
+        : `The latest message I can see in ${contactLabel}'s thread is already from you. I did not open a new draft. Tell me what you want to add if you still want a follow up.`;
+    } else if (shouldClarifyMissingIMessageBody) {
+      const contactLabel = draftRequest?.contact ?? "that contact";
+      assistantText = imessageContextResult?.resolvedRecipient
+        ? `I have ${contactLabel}'s Messages handle, but I don't have the message body yet. Send what you want it to say.`
+        : `I couldn't find a Messages thread for ${contactLabel}, and I don't have the message body yet. Send me the phone/email plus what you want it to say.`;
+    } else if (likelyUnparsedIMessageDraftIntent) {
+      preliminaryIMessageDraftStatus = "unparsed_intent";
+      assistantText =
+        "I did not stage an iMessage because I could not reliably identify one recipient and message body. Use: `text <name> saying <message>`.";
+    } else if (shouldAcknowledgeFeedbackWithoutClaude(text)) {
+      assistantText = "Logged.";
+    } else {
+      try {
+        const raw = await callClaude(enrichedPrompt, { resume: true });
+        const processed = await postProcessClaudeResponse(
+          raw,
+          "Hmm, I didn't generate a useful reply this time. Could you rephrase or ask a more specific question?",
+        );
+        assistantText = processed.text;
+        memoryTagsStripped = processed.memoryTagsStripped;
+        wrapperTagsStripped = processed.wrapperTagsStripped;
+        scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+        turnMarkersStripped = processed.turnMarkersStripped;
+        proseDashesStripped = processed.proseDashesStripped;
+      } catch (err) {
+        errorMsg = err instanceof Error ? err.message : String(err);
+        if (errorMsg.startsWith("claude_timeout_")) {
+          timeoutKind = "claude";
+          assistantText = buildTimeoutFallback(text);
+        } else {
+          assistantText = "Sorry, something went wrong on my end. Try again.";
+        }
+      }
+    }
+    // Strip "Draft above, review and send manually" and similar boilerplate
+    // footers Claude likes to append. Hard-banned by 2026-05-11 feedback.
+    // Applied here (before placement logic) so it works for placement AND
+    // non-placement drafts alike. For placement requests, rebuildAroundDraftBlock
+    // already strips claims from the lead and discards anything after the
+    // marker block — this catches the plain-text case where there are no
+    // markers and Claude just appends the boilerplate.
+    const hasDraftMarkerBlock =
+      assistantText.includes(DRAFT_MARKER_OPEN) &&
+      assistantText.includes(DRAFT_MARKER_CLOSE);
+    if (!(wantsIMessagePlacement && hasDraftMarkerBlock)) {
+      assistantText = stripPlacementClaims(assistantText).trim();
+    }
+    const claudeMs = Date.now() - tClaude0;
+
+    let imessageDraftMode:
+      | "staging_imessage"
+      | "iphone_mirror_typed"
+      | undefined;
+    let imessageDraftStatus: IMessageDraftStatus | undefined =
+      preliminaryIMessageDraftStatus;
+    let imessageDraftHandoffPath: string | undefined;
+    let imessageDraftPayloadSha256: string | undefined;
+    let imessageDraftShortcutUrl: string | undefined;
+    let imessageDraftId: string | undefined;
+    // PR 3 (Option D vault writer): the relay records every staged draft to
+    // the user's Obsidian vault. The write is fire-and-forget AFTER the
+    // Telegram reply has been sent. Staging success queues the input here,
+    // and the actual write fires below, after sendTelegramResponse and
+    // markUpdateSentAndRemember resolve. This matches the contract in
+    // src/vault-writer.ts and ensures a slow disk write can never delay or
+    // perturb the reply path. PR3.5 audit #8-timing (Codex 2026-05-21).
+    let vaultWriteAttempted = false;
+    let vaultDraftId: string | undefined;
+    let pendingVaultWriteInput:
+      | Parameters<typeof writeRelayVaultArtifacts>[0]
+      | null = null;
+    if (shouldClarifyMissingIMessageBody) {
+      imessageDraftStatus = imessageContextResult?.resolvedRecipient
+        ? "empty_body"
+        : "no_recipient";
+    }
+    if (
+      wantsIMessagePlacement &&
+      !shouldClarifyMissingIMessageBody &&
+      !alreadyAnsweredLastMessageDraft
+    ) {
+      let body = extractDraftBody(assistantText);
+      if (body) {
+        const sanitizedBody = stripProseDashes(body);
+        if (sanitizedBody.stripped > 0) {
+          proseDashesStripped += sanitizedBody.stripped;
+          body = sanitizedBody.clean;
+          // NOTE: do NOT call rebuildAroundDraftBlock here. Each branch below
+          // performs its own rebuildAroundDraftBlock against the ORIGINAL
+          // assistantText (markers intact). A rebuild here would strip the
+          // markers, and the next rebuild would fall into the no-markers
+          // branch and duplicate the body in the user-visible reply
+          // (regression 2026-05-20, see imessage-draft.test.ts).
+        }
+      }
+      const resolved = imessageContextResult?.resolvedRecipient;
+      const contactLabel =
+        draftRequest?.contact ?? resolved ?? "this contact";
+
+      if (!body) {
+        imessageDraftStatus = "markers_missing";
+        // No marker block means Claude ignored the placement instruction. Strip
+        // any orphan markers AND any hallucinated "Draft is placed" lines so
+        // the relay's "couldn't place" message isn't contradicted.
+        const stripped = stripPlacementClaims(
+          replaceDraftBlock(assistantText, ""),
+          { preserveNonEmpty: false },
+        ).trim();
+        assistantText = stripped.length > 0
+          ? `${stripped}\n\n(I couldn't place this in Messages this time.)`
+          : "(I couldn't place this in Messages this time.)";
+        console.error(
+          `[imessage-draft] markers_missing for ${contactLabel}; resp_chars=${assistantText.length}`,
+        );
+      } else {
+        // Staging handoff:
+        //   - resolved -> send a structured CLDRAFT/1 payload to the configured
+        //     staging iMessage handle. A Shortcuts automation watching that
+        //     thread opens the final target compose sheet.
+        //   - unresolved -> fail closed. The relay must not open a blank compose
+        //     or drive Messages UI directly from launchd.
+        // Context lookup failures are setup/runtime problems, not a safe reason
+        // to guess a recipient.
+        const contextStatus = imessageContextResult?.status;
+        if (
+          !resolved &&
+          (contextStatus === "fda_denied" ||
+            contextStatus === "error" ||
+            contextStatus === "timeout")
+        ) {
+          imessageDraftStatus = "no_recipient";
+          const hint = contextStatus === "fda_denied"
+            ? "Couldn't open Messages on your Mac - Full Disk Access is missing. See docs/IMESSAGE-SETUP.md."
+            : "Couldn't place this in Messages because contact resolution failed. Run `bun run setup:verify` on the Mac and check the relay logs.";
+          assistantText = rebuildAroundDraftBlock(
+            assistantText,
+            `${body}\n\n${hint}`,
+          );
+          console.error(
+            `[imessage-draft] no_recipient for ${contactLabel} (context_status=${contextStatus}${imessageContextResult?.error ? ` error=${JSON.stringify(imessageContextResult.error)}` : ""})`,
+          );
+        } else if (!resolved) {
+          imessageDraftStatus = "no_recipient";
+          assistantText = rebuildAroundDraftBlock(
+            assistantText,
+            `${body}\n\nCouldn't stage this in Messages because I couldn't resolve ${contactLabel} to a phone number or iMessage email. Send the phone/email plus what you want it to say.`,
+          );
+          console.error(
+            `[imessage-draft] no_recipient for ${contactLabel} (context_status=${contextStatus ?? "unknown"})`,
+          );
+        } else {
+          const recipientGate = await gateForIMessageRecipient(resolved);
+          if (!recipientGate.ok) {
+            imessageDraftStatus = "recipient_not_allowlisted";
+            assistantText = rebuildAroundDraftBlock(
+              assistantText,
+              `${body}\n\nCouldn't stage this in Messages because ${contactLabel} is not on the approved iMessage recipient list.`,
+            );
+            console.error(
+              `[imessage-draft] recipient_not_allowlisted for ${contactLabel}`,
+            );
+          } else {
+            const stagedReplacement = () => {
+              const selectionLine = buildContactSelectionLine(
+                imessageContextResult,
+                contactLabel,
+              );
+              return selectionLine
+                ? `${selectionLine}\n\n${body}`
+                : body;
+            };
+            const queueVaultWrite = (draftId: string) => {
+              vaultWriteAttempted = true;
+              vaultDraftId = draftId;
+              const vaultContextMessages = (imessageContextResult?.messages ?? []).map(
+                (m) => ({ ts: m.ts, sender: m.sender, text: m.text }),
+              );
+              pendingVaultWriteInput = {
+                draftId,
+                contactDisplayName:
+                  imessageContextResult?.resolvedDisplayName ?? contactLabel,
+                contactHandle: resolved,
+                userInstruction: text,
+                draftBody: body,
+                contextMessages: vaultContextMessages,
+              };
+            };
+
+            let placedByMirror = false;
+            if (shouldUseIPhoneMirrorPlacement(process.env)) {
+              const mirrored = await placeIPhoneMirrorDraft(resolved, body, {
+                projectRoot: PROJECT_ROOT,
+              });
+              if (mirrored.ok) {
+                placedByMirror = true;
+                imessageDraftStatus = "placed";
+                imessageDraftMode = "iphone_mirror_typed";
+                imessageDraftId = randomUUID();
+                assistantText = rebuildAroundDraftBlock(
+                  assistantText,
+                  stagedReplacement(),
+                );
+                console.log(
+                  `[imessage-draft] iphone_mirror_typed for ${contactLabel} (${resolved}) draft_id=${imessageDraftId}`,
+                );
+                queueVaultWrite(imessageDraftId);
+              } else {
+                console.error(
+                  `[imessage-draft] iphone mirror placement failed for ${contactLabel}; falling back to staging handoff: ${mirrored.error ?? "unknown error"}`,
+                );
+              }
+            }
+
+            if (!placedByMirror) {
+              const staged = await stageIMessageDraft(
+                PROJECT_ROOT,
+                resolved,
+                contactLabel,
+                body,
+              );
+              if (staged.ok) {
+                imessageDraftStatus = "staging_handoff_sent";
+                imessageDraftMode = "staging_imessage";
+                imessageDraftPayloadSha256 = staged.payloadSha256;
+                imessageDraftId = staged.draftId;
+                assistantText = rebuildAroundDraftBlock(
+                  assistantText,
+                  stagedReplacement(),
+                );
+                console.log(
+                  `[imessage-draft] staging_handoff_sent for ${contactLabel} (${resolved}) draft_id=${staged.draftId ?? "unknown"} payload_sha256=${staged.payloadSha256 ?? "unknown"}`,
+                );
+                // Queue the vault write input. The actual write fires AFTER
+                // sendTelegramResponse and markUpdateSentAndRemember below, so a
+                // slow disk write cannot delay or perturb the Telegram reply.
+                // See src/vault-writer.ts (Option D full indexing). Its
+                // docstring is the contract this defers to. PR3.5 audit #8.
+                queueVaultWrite(staged.draftId ?? randomUUID());
+              } else {
+                imessageDraftStatus = "helper_failed";
+                imessageDraftId = staged.draftId;
+                imessageDraftPayloadSha256 = staged.payloadSha256;
+                assistantText = rebuildAroundDraftBlock(
+                  assistantText,
+                  `${body}\n\n(Couldn't stage this through the iMessage watcher: ${staged.error ?? "unknown error"}.)`,
+                );
+                console.error(
+                  `[imessage-draft] staging helper failed for ${contactLabel} draft_id=${staged.draftId ?? "unknown"}: ${staged.error ?? "unknown error"}`,
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Defensive: ensure no raw iMessage-draft markers reach Telegram even if
+    // Claude emitted them outside a placement request or left a second pair.
+    if (
+      assistantText.includes(DRAFT_MARKER_OPEN) ||
+      assistantText.includes(DRAFT_MARKER_CLOSE)
+    ) {
+      assistantText = replaceDraftBlock(assistantText, "").trim();
+    }
+
+    // Compute the actually-sendable text ONCE so Telegram, the short-term
+    // turn buffer, and Supabase all agree. 2026-05-11 the Conor turn
+    // persisted an empty string here while sendResponse substituted the
+    // "I generated an empty response" apology. 2026-05-14 the iPhone Shortcut
+    // handoff path had the same class of bug: Telegram saw "Open on iPhone",
+    // but short-term state saved the internal "Phone handoff ready" line.
+    const sendableText = prepareTelegramResponseText(assistantText);
+    const sendResult = await sendTelegramResponse(ctx, sendableText);
+    if (sendResult.partialFailure) {
+      errorMsg = [errorMsg, sendResult.partialFailure].filter(Boolean).join("; ");
+    }
+    await markUpdateSentAndRemember(updateId);
+
+    // Vault write fires only after the reply is durably sent and remembered.
+    // Fire-and-forget so a slow disk write does not delay the rest of post-
+    // send work. PR3.5 audit #8-timing (Codex 2026-05-21). See
+    // src/vault-writer.ts docstring for the AFTER-reply contract.
+    if (pendingVaultWriteInput) {
+      const queuedInput = pendingVaultWriteInput;
+      const correlator = queuedInput.draftId || "unknown";
+      void writeRelayVaultArtifacts(queuedInput)
+        .then((r) => {
+          if (r.ok) {
+            console.log(
+              `[vault-writer] ok draft_id=${correlator} per_thread=${r.perThreadPath ?? "n/a"} contact=${r.contactSummaryPath ?? "n/a"} daily=${r.dailySessionPath ?? "n/a"}`,
+            );
+          } else {
+            console.error(
+              `[vault-writer] partial_failure draft_id=${correlator} errors=${r.errors.join("; ")}`,
+            );
+          }
+        })
+        .catch((err) => {
+          console.error(
+            `[vault-writer] write threw draft_id=${correlator}:`,
+            err instanceof Error ? err.message : String(err),
+          );
+        });
+    }
+
+    await saveMessage("assistant", sendableText);
+    await appendTurn(chatId, { role: "assistant", content: sendableText, ts: new Date().toISOString() });
+
+    // Background memory capture. Synchronous classification (regex match) so
+    // the decision record can include the reason; the actual file write is
+    // fire-and-forget: never blocks the reply, never throws into the queue.
+    const memoryCandidate = classifyMemoryCandidate({
+      userText: text,
+      assistantText: sendableText,
+      anchoredProjects: anchoredProjectNames,
+      retrievalUsed: corpusQuery,
+      retrievalHitCount: ftsHits.length,
+    });
+    if (memoryCandidate) {
+      void writeMemoryCandidate(memoryCandidate)
+        .then((r) => {
+          console.log(
+            `[memory-capture] ${r.reason} kind=${memoryCandidate.kind} dest=${memoryCandidate.destination} path=${r.path ?? "n/a"}`,
+          );
+        })
+        .catch((err) => {
+          console.error(
+            "[memory-capture] write failed:",
+            err instanceof Error ? err.message : String(err),
+          );
+        });
+    }
+
+    const rec: DecisionRecord = {
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: text,
+      trigger_fired: corpusQuery,
+      hit_count: ftsHits.length,
+      hits_summary: ftsHits.slice(0, 5).map((h) => ({
+        path: h.file_path,
+        sim: Number(h.display_score.toFixed(3)),
+      })),
+      injected_count: corpusQuery ? Math.min(ftsHits.length, 3) : 0,
+      claude_ms: claudeMs,
+      total_ms: Date.now() - t0,
+      error: errorMsg ?? retrievalError,
+      query_content_tokens: queryContentTokens,
+      fts_query: searchQuery,
+      retrieval_ms: retrievalMs,
+      top_rank_score: ftsHits[0]?.rank_score,
+      second_rank_score: ftsHits[1]?.rank_score,
+      prompt_chars: enrichedPrompt.length,
+      turn_buffer_size_before: turnBufferSizeBefore,
+      timeout_kind: timeoutKind,
+      intent_classifier_status: intentClassifierStatus,
+      imessage_context_status: imessageContextResult?.status,
+      imessage_context_count: imessageContextResult?.messages.length,
+      imessage_context_contact: imessageContextResult?.request.contact,
+      imessage_resolved_recipient: imessageContextResult?.resolvedRecipient,
+      imessage_resolved_display_name: imessageContextResult?.resolvedDisplayName,
+      imessage_resolved_last_messaged_at: imessageContextResult?.resolvedLastMessagedAt,
+      imessage_draft_status: imessageDraftStatus,
+      imessage_draft_mode: imessageDraftMode,
+      imessage_draft_handoff_path: imessageDraftHandoffPath,
+      imessage_draft_payload_sha256: imessageDraftPayloadSha256,
+      imessage_draft_shortcut_url: imessageDraftShortcutUrl,
+      imessage_draft_id: imessageDraftId,
+      vault_write_attempted: vaultWriteAttempted ? true : undefined,
+      vault_draft_id: vaultDraftId,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: sendableText.length,
+      catalog_response_used: Boolean(deterministicCatalogResponse),
+      skipped_textbook_response_used: Boolean(deterministicTextbookResponse),
+      memory_capture_attempted: Boolean(memoryCandidate),
+      memory_capture_reason: memoryCandidate?.reason,
+      memory_capture_confidence: memoryCandidate?.confidence,
+      memory_capture_kind: memoryCandidate?.kind,
+      memory_capture_destination: memoryCandidate?.destination,
+      memory_capture_project: memoryCandidate?.project ?? undefined,
+    };
+    await logDecision(rec);
+  });
 });
 
 // Voice messages
 bot.on("message:voice", async (ctx) => {
   const voice = ctx.message.voice;
+  const updateId = ctx.update.update_id;
+  const chatId = String(ctx.chat.id);
+  const t0 = Date.now();
+  const ts = new Date().toISOString();
   console.log(`Voice message: ${voice.duration}s`);
-  await ctx.replyWithChatAction("typing");
 
-  if (!process.env.VOICE_PROVIDER) {
-    await ctx.reply(
-      "Voice transcription is not set up yet. " +
-        "Run the setup again and choose a voice provider (Groq or local Whisper)."
-    );
-    return;
-  }
-
+  let errorMsg: string | undefined;
+  let assistantText = "";
+  let memoryTagsStripped = 0;
+  let wrapperTagsStripped = 0;
+  let scaffoldingTagsStripped = 0;
+  let turnMarkersStripped = 0;
+  let proseDashesStripped = 0;
   try {
+    await ctx.replyWithChatAction("typing");
+
+    if (!process.env.VOICE_PROVIDER) {
+      await ctx.reply(
+        "Voice transcription is not set up yet. " +
+          "Run the setup again and choose a voice provider (Groq or local Whisper)."
+      );
+      await markUpdateSentAndRemember(updateId);
+      return;
+    }
+
     const file = await ctx.getFile();
-    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-    const response = await fetch(url);
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const buffer = await downloadTelegramFile({
+      filePath: file.file_path,
+      fileId: voice.file_id,
+      declaredSize: voice.file_size ?? file.file_size,
+      maxBytes: MAX_VOICE_BYTES,
+      kind: "voice",
+    });
 
     const transcription = await transcribe(buffer);
     if (!transcription) {
       await ctx.reply("Could not transcribe voice message.");
+      await markUpdateSentAndRemember(updateId);
       return;
     }
 
-    await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
+    const userTurn = `[Voice ${voice.duration}s]: ${transcription}`;
+    await saveMessage("user", userTurn);
+    await appendTurn(chatId, { role: "user", content: userTurn, ts });
 
-    const [relevantContext, memoryContext] = await Promise.all([
-      getRelevantContext(supabase, transcription),
-      getMemoryContext(supabase),
-    ]);
+    const [relevantContext, memoryContext] = supabase
+      ? await Promise.all([
+          supabaseFeatures.relevantContext
+            ? getRelevantContext(supabase, transcription)
+            : Promise.resolve(""),
+          supabaseFeatures.durableMemory
+            ? getMemoryContext(supabase)
+            : Promise.resolve(""),
+        ])
+      : ["", ""];
 
-    const enrichedPrompt = buildPrompt(
-      `[Voice message transcribed]: ${transcription}`,
+    const voiceUserMessage = `[Voice message transcribed]: ${transcription}`;
+    const enrichedPrompt = capPrompt(buildPrompt(
+      voiceUserMessage,
       relevantContext,
       memoryContext
-    );
+    ), voiceUserMessage);
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = await processMemoryIntents(supabase, rawResponse);
+    const processed = await postProcessClaudeResponse(
+      rawResponse,
+      "I transcribed the voice message, but I didn't generate a useful reply. Could you ask again more specifically?",
+    );
+    assistantText = processed.text;
+    memoryTagsStripped = processed.memoryTagsStripped;
+    wrapperTagsStripped = processed.wrapperTagsStripped;
+    scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+    turnMarkersStripped = processed.turnMarkersStripped;
+    proseDashesStripped = processed.proseDashesStripped;
 
-    await saveMessage("assistant", claudeResponse);
-    await sendResponse(ctx, claudeResponse);
+    assistantText = prepareTelegramResponseText(assistantText);
+    const sendResult = await sendTelegramResponse(ctx, assistantText);
+    if (sendResult.partialFailure) {
+      errorMsg = [errorMsg, sendResult.partialFailure].filter(Boolean).join("; ");
+    }
+    await markUpdateSentAndRemember(updateId);
+    await saveMessage("assistant", assistantText);
+    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
   } catch (error) {
+    errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Voice error:", error);
-    await ctx.reply("Could not process voice message. Check logs for details.");
+    try {
+      await ctx.reply("Could not process voice message. Check logs for details.");
+      await markUpdateSentAndRemember(updateId);
+    } catch {
+      // Telegram send failure remains visible in stderr via the original error.
+    }
+  } finally {
+    // Persist update_id so loadSeenUpdateIds() blocks Telegram redelivery on
+    // restart. Without this, voice updates are only tracked via the in-memory
+    // seen-set and short-lived marker file, both lost on relay restart.
+    await logDecision({
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: `[voice ${voice.duration}s]`,
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: Date.now() - t0,
+      error: errorMsg,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: assistantText.length,
+    }).catch(() => undefined);
   }
 });
 
 // Photos/Images
 bot.on("message:photo", async (ctx) => {
+  const updateId = ctx.update.update_id;
+  const chatId = String(ctx.chat.id);
+  const t0 = Date.now();
+  const ts = new Date().toISOString();
   console.log("Image received");
-  await ctx.replyWithChatAction("typing");
 
+  let errorMsg: string | undefined;
+  let assistantText = "";
+  let memoryTagsStripped = 0;
+  let wrapperTagsStripped = 0;
+  let scaffoldingTagsStripped = 0;
+  let turnMarkersStripped = 0;
+  let proseDashesStripped = 0;
+  let uploadDir: string | undefined;
+  let filePath: string | undefined;
   try {
+    await ctx.replyWithChatAction("typing");
+
     // Get highest resolution photo
     const photos = ctx.message.photo;
     const photo = photos[photos.length - 1];
     const file = await ctx.api.getFile(photo.file_id);
 
-    // Download the image
+    // Download the image into a per-update private directory. Claude receives
+    // Read access to this directory only, never the shared uploads root.
     const timestamp = Date.now();
-    const filePath = join(UPLOADS_DIR, `image_${timestamp}.jpg`);
+    uploadDir = await createUploadWorkDir(updateId);
+    filePath = join(uploadDir, `image_${timestamp}.jpg`);
 
-    const response = await fetch(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
-    );
-    const buffer = await response.arrayBuffer();
-    await writeFile(filePath, Buffer.from(buffer));
+    const buffer = await downloadTelegramFile({
+      filePath: file.file_path,
+      fileId: photo.file_id,
+      declaredSize: photo.file_size ?? file.file_size,
+      maxBytes: MAX_IMAGE_BYTES,
+      kind: "image",
+    });
+    await writeFile(filePath, buffer);
 
     // Claude Code can see images via file path
     const caption = ctx.message.caption || "Analyze this image.";
-    const prompt = `[Image: ${filePath}]\n\n${caption}`;
+    const prompt = capPrompt(`[Image: ${filePath}]\n\n${caption}`);
 
-    await saveMessage("user", `[Image]: ${caption}`);
+    const userTurn = `[Image]: ${caption}`;
+    await saveMessage("user", userTurn);
+    await appendTurn(chatId, { role: "user", content: userTurn, ts });
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, {
+      resume: true,
+      allowedTools: ["Read"],
+      addDirs: [uploadDir],
+      cwd: uploadDir,
+    });
 
-    // Cleanup after processing
-    await unlink(filePath).catch(() => {});
-
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
-    await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    const processed = await postProcessClaudeResponse(
+      claudeResponse,
+      "I looked at the image, but I didn't generate a useful reply. Could you ask again more specifically?",
+    );
+    assistantText = processed.text;
+    memoryTagsStripped = processed.memoryTagsStripped;
+    wrapperTagsStripped = processed.wrapperTagsStripped;
+    scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+    turnMarkersStripped = processed.turnMarkersStripped;
+    proseDashesStripped = processed.proseDashesStripped;
+    assistantText = prepareTelegramResponseText(assistantText);
+    const sendResult = await sendTelegramResponse(ctx, assistantText);
+    if (sendResult.partialFailure) {
+      errorMsg = [errorMsg, sendResult.partialFailure].filter(Boolean).join("; ");
+    }
+    await markUpdateSentAndRemember(updateId);
+    await saveMessage("assistant", assistantText);
+    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
   } catch (error) {
+    errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Image error:", error);
-    await ctx.reply("Could not process image.");
+    try {
+      await ctx.reply("Could not process image.");
+      await markUpdateSentAndRemember(updateId);
+    } catch {
+      // Telegram send failure remains visible in stderr via the original error.
+    }
+  } finally {
+    if (uploadDir) {
+      await rm(uploadDir, { recursive: true, force: true }).catch(() => {});
+    } else if (filePath) {
+      await unlink(filePath).catch(() => {});
+    }
+    await logDecision({
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: "[photo]",
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: Date.now() - t0,
+      error: errorMsg,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: assistantText.length,
+    }).catch(() => undefined);
   }
 });
 
 // Documents
 bot.on("message:document", async (ctx) => {
   const doc = ctx.message.document;
+  const updateId = ctx.update.update_id;
+  const chatId = String(ctx.chat.id);
+  const t0 = Date.now();
+  const ts = new Date().toISOString();
   console.log(`Document: ${doc.file_name}`);
-  await ctx.replyWithChatAction("typing");
 
+  let errorMsg: string | undefined;
+  let assistantText = "";
+  let memoryTagsStripped = 0;
+  let wrapperTagsStripped = 0;
+  let scaffoldingTagsStripped = 0;
+  let turnMarkersStripped = 0;
+  let proseDashesStripped = 0;
+  let uploadDir: string | undefined;
+  let filePath: string | undefined;
   try {
+    await ctx.replyWithChatAction("typing");
+
     const file = await ctx.getFile();
     const timestamp = Date.now();
     const fileName = doc.file_name || `file_${timestamp}`;
-    const filePath = join(UPLOADS_DIR, `${timestamp}_${fileName}`);
+    uploadDir = await createUploadWorkDir(updateId);
+    filePath = join(uploadDir, `document_${timestamp}${safeUploadExtension(fileName)}`);
 
-    const response = await fetch(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
-    );
-    const buffer = await response.arrayBuffer();
-    await writeFile(filePath, Buffer.from(buffer));
+    const buffer = await downloadTelegramFile({
+      filePath: file.file_path,
+      fileId: doc.file_id,
+      declaredSize: doc.file_size ?? file.file_size,
+      maxBytes: MAX_DOCUMENT_BYTES,
+      kind: "document",
+    });
+    await writeFile(filePath, buffer);
 
     const caption = ctx.message.caption || `Analyze: ${doc.file_name}`;
-    const prompt = `[File: ${filePath}]\n\n${caption}`;
+    const prompt = capPrompt(`[File: ${filePath}]\nOriginal filename: ${basename(fileName)}\n\n${caption}`);
 
-    await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
+    const userTurn = `[Document: ${doc.file_name}]: ${caption}`;
+    await saveMessage("user", userTurn);
+    await appendTurn(chatId, { role: "user", content: userTurn, ts });
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, {
+      resume: true,
+      allowedTools: ["Read"],
+      addDirs: [uploadDir],
+      cwd: uploadDir,
+    });
 
-    await unlink(filePath).catch(() => {});
-
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
-    await saveMessage("assistant", cleanResponse);
-    await sendResponse(ctx, cleanResponse);
+    const processed = await postProcessClaudeResponse(
+      claudeResponse,
+      "I looked at the document, but I didn't generate a useful reply. Could you ask again more specifically?",
+    );
+    assistantText = processed.text;
+    memoryTagsStripped = processed.memoryTagsStripped;
+    wrapperTagsStripped = processed.wrapperTagsStripped;
+    scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+    turnMarkersStripped = processed.turnMarkersStripped;
+    proseDashesStripped = processed.proseDashesStripped;
+    assistantText = prepareTelegramResponseText(assistantText);
+    const sendResult = await sendTelegramResponse(ctx, assistantText);
+    if (sendResult.partialFailure) {
+      errorMsg = [errorMsg, sendResult.partialFailure].filter(Boolean).join("; ");
+    }
+    await markUpdateSentAndRemember(updateId);
+    await saveMessage("assistant", assistantText);
+    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
   } catch (error) {
+    errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Document error:", error);
-    await ctx.reply("Could not process document.");
+    try {
+      await ctx.reply("Could not process document.");
+      await markUpdateSentAndRemember(updateId);
+    } catch {
+      // Telegram send failure remains visible in stderr via the original error.
+    }
+  } finally {
+    if (uploadDir) {
+      await rm(uploadDir, { recursive: true, force: true }).catch(() => {});
+    } else if (filePath) {
+      await unlink(filePath).catch(() => {});
+    }
+    await logDecision({
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: `[document: ${doc.file_name ?? "unnamed"}]`,
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: Date.now() - t0,
+      error: errorMsg,
+      memory_tags_stripped: memoryTagsStripped,
+      wrapper_tags_stripped: wrapperTagsStripped,
+      scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
+      prose_dashes_stripped: proseDashesStripped,
+      response_chars: assistantText.length,
+    }).catch(() => undefined);
   }
 });
 
@@ -407,7 +1893,8 @@ const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolve
 function buildPrompt(
   userMessage: string,
   relevantContext?: string,
-  memoryContext?: string
+  memoryContext?: string,
+  opts?: { iMessageDraftContact?: string },
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -421,7 +1908,44 @@ function buildPrompt(
   });
 
   const parts = [
-    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+    "You are a personal AI assistant responding via Telegram.",
+    ENGLISH_ONLY_DIRECTIVE,
+    "Default to concise, scannable replies: lead with the answer, prefer short bullets for multi-part technical or factual responses, and avoid long paragraphs unless the user explicitly asks for depth or nuance. Match the user's tone; this is a conversational chat, not a report.",
+    "Reply in plain text. Never wrap your response in XML or HTML tags such as <response>, </response>, <answer>, or <reply>. If you have nothing useful to say, ask a clarifying question instead of returning an empty or tag-only reply.",
+    ANESTHESIA_CORPUS_INSTRUCTIONS,
+    // Runtime context so the bot stops giving wrong macOS FDA advice. The
+    // relay does not run from a terminal, and iMessage context prefetch no
+    // longer routes through Claude. The protected-file reader is bun.
+    "Runtime context: you run as a macOS launchd service named com.claude.telegram-relay. You are NOT running inside Terminal, iTerm, Warp, or any GUI shell, and there is no Claude Code session attached. The relay process is bun, and it deterministically reads iMessage context before Claude runs by spawning scripts/imessage-thread.sh. If macOS denies access to ~/Library/Messages/chat.db, tell the user to run `bun run setup:verify` and grant Full Disk Access to the path printed as `FDA responsible target`. Do not tell the user to grant FDA to Terminal, a GUI shell, the Claude CLI, or to compute a path manually with `readlink`; those are not the bun binary launchd executes for this relay.",
+    // Hard rule logged 2026-05-11 after the user asked for an iMessage and
+    // an email draft. The bot must NEVER send; only draft. Full policy in
+    // ~/.claude/projects/.../memory/feedback_drafts_never_send.md.
+    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft body as the body of your reply with no policy footer, no \"Draft above\", no \"send manually\", no \"review and send\", and no \"I can't send for you\". The relay tells the user where the draft is; you do not need to remind them. If the user later says \"just send it\" or \"you send it\", refuse politely in one sentence and stop.",
+    // Helper scripts the bot can invoke via its Bash tool. Documented in
+    // docs/IMESSAGE-SETUP.md. The two draft helpers do NOT require Full Disk
+    // Access; they drop the draft into the native compose surface and the
+    // user reviews/sends. The read helper DOES require FDA on the Claude
+    // binary and will return an error message if FDA is not granted.
+    // Hard rule logged 2026-05-11 after the user asked for context-aware
+    // drafts. Always read 5 to 10 prior messages before drafting a reply.
+    // See feedback_context_before_drafting.md for the durable policy.
+    "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage, text, SMS, or email to someone, work from the injected context. For iMessage/text/SMS, the relay always attempts to fetch the last 5 to 10 messages from the relevant thread before you run. The result appears as an 'IMESSAGE CONTEXT FOR <name>' block above. If the block says messages were found, use them to match the relationship, cadence, and level of warmth while preserving the user's exact intended meaning. If the block says the thread was not found or context could not be read, draft from the user's description as best you can. Do NOT ask the user for a phone number, prior messages, or any other clarifying information. Do not claim you lack iMessage access; the relay owns that lookup. For email replies, ask the user to paste the most recent thread only if no context was supplied at all.",
+    "Context cleanup rule (hard): never save the fetched context to a local file. The read helper streams JSON to stdout; consume it in your working memory only. Do NOT write context to ~/Projects/claude-telegram-relay/data/ or anywhere else on disk. If you find an existing cached context file from a prior session (e.g. data/mom-imessages.json), delete it after use rather than reusing it. The user's machine is the source of truth; re-read fresh from chat.db each time rather than caching.",
+    "iMessage handling is deterministic in this runtime. The relay reads thread context before you run and stages drafts after you run by sending a structured payload to the configured iMessage staging thread. A Shortcuts automation watches that staging thread and opens the final Messages compose sheet. Do NOT attempt to call scripts/imessage-thread.sh, scripts/stage-imessage.sh, or scripts/draft-imessage.sh yourself; in headless mode you have no Bash approval surface and the call will surface as a confusing 'blocked for approval' message to the user. Just respond in text and use the markers when asked to place a draft.",
+    "For email drafts in this runtime, produce the draft text only. Do NOT call scripts/draft-email.sh or any mail client helper; ordinary Telegram turns do not expose Bash tools.",
+    // Durable writing-style rules for any outgoing draft the user will send
+    // under his own name. Source of truth (verbatim) lives at
+    //   ~/ObsidianVault/02-Cross-Project/writing_style_for_william.md
+    //   ~/.claude/projects/-Users-williamregan-ObsidianVault/memory/feedback_writing_style.md
+    // Applied automatically; do not require the user to invoke them.
+    "When drafting outgoing text on the user's behalf (emails, iMessages, letters, notes, anything that will go out under his name), follow these rules verbatim:",
+    "Remember to always follow the following:",
+    "You must act as an expert human-writing editor and rewrite your output so it reads as entirely organic, authentic, and written by a confident, experienced human.",
+    "Please apply the following guidelines:",
+    "- Tone & Voice: Make it sound conversational, warm, and engaging, like a knowledgeable expert explaining something casually but professionally. Add subtle human emotion and natural emphasis to make the writing feel alive.",
+    "- Rhythm & Flow: Master the pacing. Actively vary sentence lengths, improve transitions, and ensure a smooth, natural rhythm that carries the reader effortlessly.",
+    "- What to Eliminate: Strip out any robotic phrasing, stiff structures, monotone patterns, and overly formal jargon. Remove repetitive, predictable AI-like word choices and avoid adding unnecessary fluff.",
+    "- The Golden Rule: Preserve the original meaning and core message completely intact while making the text completely undetectable as AI. Ensure absolutely no \"-\" \"em dashes\" in your final output.",
   ];
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
@@ -430,64 +1954,250 @@ function buildPrompt(
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
 
-  parts.push(
-    "\nMEMORY MANAGEMENT:" +
-      "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
-      "include these tags in your response (they are processed automatically and hidden from the user):" +
-      "\n[REMEMBER: fact to store]" +
-      "\n[GOAL: goal text | DEADLINE: optional date]" +
-      "\n[DONE: search text for completed goal]"
-  );
+  if (opts?.iMessageDraftContact) {
+    const contact = opts.iMessageDraftContact;
+    parts.push(
+      `\niMessage handoff (this message): the user wants a draft for ${contact}. The relay will handle placement after you respond by sending a structured payload to the iMessage staging thread for the Shortcut watcher. Output the iMessage body, and only the body, between the literal marker lines below, each on its own line:`,
+      DRAFT_MARKER_OPEN,
+      "(the iMessage body)",
+      DRAFT_MARKER_CLOSE,
+      `Treat any phrase after "saying", "say", "asking", "ask", or "with" in the user's message as the core meaning to preserve, not necessarily as verbatim wording. Use the injected iMessage context when present, then rewrite the body so it sounds organic, confident, warm, and human. Keep it concise enough for a real text message unless the user asks for length. Do not use hyphen, en dash, or em dash characters in the draft body. Write NOTHING before the opening marker and NOTHING after the closing marker. The relay inserts its own contact-selection line above the body (e.g. "Drafting for ${contact} (3d ago):") and a handoff status line as needed; if you also write "Here's the draft for ${contact}:" before the marker, the user sees two introduction lines for the same message. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation. The relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval. There is no approval surface in this runtime.`,
+    );
+  }
+
+  // Layer 1 of memory-tag leak fix: only ask Claude to emit tags when Supabase
+  // is explicitly the durable memory authority. In the default Obsidian-first
+  // mode, Supabase may still store/search Telegram history, but it must not
+  // compete with vault Markdown memories.
+  if (supabase && supabaseFeatures.durableMemory) {
+    parts.push(
+      "\nMEMORY MANAGEMENT:" +
+        "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
+        "include these tags in your response (they are processed automatically and hidden from the user):" +
+        "\n[REMEMBER: fact to store]" +
+        "\n[GOAL: goal text | DEADLINE: optional date]" +
+        "\n[DONE: search text for completed goal]"
+    );
+  }
 
   parts.push(`\nUser: ${userMessage}`);
 
   return parts.join("\n");
 }
 
-async function sendResponse(ctx: Context, response: string): Promise<void> {
-  // Telegram has a 4096 character limit
-  const MAX_LENGTH = 4000;
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
 
-  if (response.length <= MAX_LENGTH) {
-    await ctx.reply(response);
+async function verifyClaudeExecutable(): Promise<void> {
+  if (CLAUDE_PATH.includes("/")) {
+    try {
+      await access(CLAUDE_PATH, constants.X_OK);
+    } catch {
+      throw new Error(
+        `preflight: CLAUDE_PATH is not executable: ${CLAUDE_PATH}`,
+      );
+    }
+    console.log(`[preflight] Claude CLI: ${CLAUDE_PATH}`);
     return;
   }
 
-  // Split long responses
-  const chunks = [];
-  let remaining = response;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= MAX_LENGTH) {
-      chunks.push(remaining);
-      break;
-    }
-
-    // Try to split at a natural boundary
-    let splitIndex = remaining.lastIndexOf("\n\n", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = remaining.lastIndexOf("\n", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = remaining.lastIndexOf(" ", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = MAX_LENGTH;
-
-    chunks.push(remaining.substring(0, splitIndex));
-    remaining = remaining.substring(splitIndex).trim();
+  const result = Bun.spawnSync({
+    cmd: ["/bin/sh", "-lc", `command -v ${shellQuote(CLAUDE_PATH)}`],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `preflight: Claude CLI '${CLAUDE_PATH}' not found on PATH; set CLAUDE_PATH`,
+    );
   }
-
-  for (const chunk of chunks) {
-    await ctx.reply(chunk);
-  }
+  console.log(
+    `[preflight] Claude CLI: ${new TextDecoder().decode(result.stdout).trim()}`,
+  );
 }
 
 // ============================================================
 // START
 // ============================================================
 
-console.log("Starting Claude Telegram Relay...");
-console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
-console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+async function runStartupPreflight(): Promise<void> {
+  console.log("Starting Claude Telegram Relay...");
+  console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
+  console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+  console.log("[relay] RELAY_CWD:", RELAY_CWD);
+  console.log(`[relay] Claude resume: ${CLAUDE_RESUME_ENABLED ? "enabled" : "disabled"}`);
+  console.log(`[relay] Claude timeout: ${CLAUDE_TIMEOUT_MS}ms`);
 
-bot.start({
-  onStart: () => {
-    console.log("Bot is running!");
-  },
+  await verifyClaudeExecutable();
+
+  // Architecture check — warns if bun or claude are Intel-only (will break in macOS 28).
+  try {
+    const archReport = checkRelayBinaries(CLAUDE_PATH);
+    console.log(`[preflight] bun arch: ${archLabel(archReport.bun.arch)} (${archReport.bun.path})`);
+    console.log(`[preflight] claude arch: ${archLabel(archReport.claude.arch)} (${archReport.claude.path})`);
+    if (archReport.currentProcessRosetta) {
+      console.error(
+        "[preflight] WARNING: bun is running under Rosetta translation. " +
+        "This relay will stop working in macOS 28. " +
+        "Reinstall bun for Apple silicon: curl -fsSL https://bun.sh/install | bash",
+      );
+    } else if (archReport.hasWarnings) {
+      console.error(
+        "[preflight] WARNING: one or more relay binaries are Intel-only and will stop working in macOS 28. " +
+        "Update them to a Universal or Apple silicon version.",
+      );
+    }
+  } catch (err) {
+    console.error("[preflight] arch check failed:", err instanceof Error ? err.message : String(err));
+  }
+
+  console.log("[relay] running retrieval preflight...");
+  try {
+    await retrievalPreflight();
+    retrievalAvailable = true;
+    retrievalStartupError = undefined;
+  } catch (err) {
+    // Startup preflight is diagnostic only. SQLite can transiently lock while
+    // the indexer is active; permanently disabling retrieval for the whole
+    // launch would leave FTS off until the next manual restart. Per-request
+    // searches already catch and log their own errors, so keep retrieval
+    // enabled and retry when the user actually asks a referential question.
+    retrievalAvailable = true;
+    retrievalStartupError = err instanceof Error ? err.message : String(err);
+    console.error(
+      "[relay] retrieval preflight failed; will retry indexed retrieval per request:",
+      retrievalStartupError,
+    );
+  }
+
+  try {
+    const removed = await sweepOldDecisionLogs();
+    if (removed > 0) {
+      console.log(`[preflight] removed ${removed} old decision log(s)`);
+    }
+  } catch (err) {
+    console.error("[preflight] decision log sweep failed:", err instanceof Error ? err.message : String(err));
+  }
+
+  const watcher = Bun.spawnSync({ cmd: ["pgrep", "-f", "watcher.py"] });
+  if (watcher.exitCode !== 0) {
+    console.error("[preflight] watcher.py not running; indexed content may be stale");
+  } else {
+    console.log("[preflight] watcher.py: alive");
+  }
+
+  await mkdir(join(homedir(), ".claude-relay", "state", "updates"), { recursive: true });
+  await mkdir(join(homedir(), ".claude-relay", "logs"), { recursive: true });
+  await Bun.write(join(homedir(), ".claude-relay", "state", ".write-probe"), "");
+
+  const me = await bot.api.getMe();
+  if (!me.is_bot) throw new Error("preflight: getMe returned non-bot");
+  console.log(`[preflight] Telegram getMe: @${me.username} (id=${me.id})`);
+
+  console.log("[relay] retrieval preflight complete");
+}
+
+await runStartupPreflight();
+
+// Catch unhandled errors from any middleware or message handler. Without this,
+// a GrammyError (e.g. 400 Bad Request from an invalid URL in a keyboard button)
+// propagates as an unhandled rejection → Bun crashes → launchd restarts →
+// Telegram re-delivers the same update (since markUpdateSentAndRemember was
+// never called) → infinite crash loop. Registering bot.catch keeps the relay
+// alive and logs the error.
+bot.catch((err) => {
+  const ctx = err.ctx;
+  const updateId = ctx?.update?.update_id;
+  const chatId = ctx?.chat?.id;
+  const innerErr = err.error instanceof Error ? err.error : new Error(String(err.error));
+  console.error(
+    `[bot] unhandled error update_id=${updateId ?? "?"} chat_id=${chatId ?? "?"}: ${innerErr.message}`,
+    innerErr,
+  );
+  // Best-effort: tell the user something went wrong so they know to retry.
+  ctx?.reply("Something went wrong on my end. Please try again.").catch(() => undefined);
+  // Mark the update as seen if we have the update ID, so the crash-loop guard
+  // also prevents duplicate processing via the duplicate-detection path.
+  if (updateId !== undefined) {
+    markUpdateSent(updateId).catch(() => undefined);
+  }
 });
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runStartupTelegramProbe(): Promise<void> {
+  try {
+    const me = await bot.api.getMe();
+    console.log(`[telegram] startup probe: getMe ok username=@${me.username} pid=${process.pid}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[telegram] startup probe: getMe failed: ${message}`);
+    throw err;
+  }
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
+    console.log("[telegram] startup probe: deleteWebhook ok (idempotent, pending updates preserved)");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[telegram] startup probe: deleteWebhook failed: ${message}`);
+  }
+}
+
+async function startTelegramPolling(): Promise<void> {
+  let conflictAttempts = 0;
+  let firstConflictAt = 0;
+  const claudePluginEnvPath = join(homedir(), ".claude", "channels", "telegram", ".env");
+
+  for (;;) {
+    try {
+      await bot.start({
+        onStart: () => {
+          console.log("Bot polling loop started.");
+          console.log(
+            `[telegram] long polling attempt: claude-telegram-relay pid=${process.pid}`,
+          );
+        },
+      });
+      return;
+    } catch (err) {
+      const diagnosis = classifyTelegramPollingConflictError(err);
+      if (!diagnosis) throw err;
+
+      conflictAttempts += 1;
+      if (firstConflictAt === 0) firstConflictAt = Date.now();
+      const pluginEnvExists = existsSync(claudePluginEnvPath);
+      console.error(
+        formatTelegramPollingConflictLog({
+          diagnosis,
+          attempt: conflictAttempts,
+          elapsedMs: Date.now() - firstConflictAt,
+          pid: process.pid,
+          retryDelayMs: TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
+          lockFile: TOKEN_LOCK_PATH,
+          pluginEnvExists,
+        }),
+      );
+      if (
+        shouldPrintConflictHint(conflictAttempts) ||
+        shouldEscalateTelegramPollingConflict(conflictAttempts)
+      ) {
+        console.error(formatTelegramPollingConflictHint({ diagnosis, pluginEnvExists }));
+      }
+      if (shouldExitAfterTelegramPollingConflict(conflictAttempts)) {
+        console.error(
+          `[telegram] giving up after ${conflictAttempts}/${TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS} ` +
+          "409 attempts; exiting so launchd ThrottleInterval owns restart pacing",
+        );
+        await shutdown("polling_conflict_exhausted", 75);
+        return;
+      }
+      await sleep(TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS);
+    }
+  }
+}
+
+await runStartupTelegramProbe();
+await startTelegramPolling();

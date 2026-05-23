@@ -1,13 +1,16 @@
 /**
  * Claude Telegram Relay — Test Supabase Connection
  *
- * Verifies Supabase URL and anon key are valid, and checks if
- * required tables exist.
+ * Verifies Supabase URL and service_role key are valid, and checks if
+ * required tables exist. The env var name SUPABASE_ANON_KEY is preserved
+ * for backwards compatibility, but the configured RLS policies in
+ * db/schema.sql only grant access to service_role.
  *
  * Usage: bun run setup/test-supabase.ts
  */
 
 import { join, dirname } from "path";
+import { getSupabaseFeatureConfig } from "../src/supabase-config.ts";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 
@@ -41,7 +44,7 @@ async function loadEnv(): Promise<Record<string, string>> {
   }
 }
 
-const REQUIRED_TABLES = ["messages", "memory", "logs"];
+type TableCheck = { table: string; required: boolean };
 
 async function main() {
   console.log("");
@@ -51,6 +54,7 @@ async function main() {
   const env = await loadEnv();
   const url = env.SUPABASE_URL || process.env.SUPABASE_URL || "";
   const key = env.SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || "";
+  const features = getSupabaseFeatureConfig({ ...process.env, ...env });
 
   // Check URL
   if (!url || url === "your_project_url") {
@@ -61,19 +65,34 @@ async function main() {
   console.log(`  ${PASS} Supabase URL: ${url}`);
 
   // Check key
-  if (!key || key === "your_anon_key") {
-    console.log(`  ${FAIL} SUPABASE_ANON_KEY not set in .env`);
-    console.log(`      ${dim("Get it from Supabase > Project Settings > API")}`);
+  if (!key || key === "your_anon_key" || key === "your_service_role_key") {
+    console.log(`  ${FAIL} SUPABASE_ANON_KEY (service_role key) not set in .env`);
+    console.log(`      ${dim("Get the service_role key from Supabase > Project Settings > API")}`);
     process.exit(1);
   }
-  console.log(`  ${PASS} Anon key found`);
+  console.log(`  ${PASS} Service-role key found`);
 
-  // Test connection by querying each required table
+  console.log(
+    `  ${PASS} Memory authority: ${features.memoryAuthority}` +
+      (features.durableMemory ? " (Supabase durable memory enabled)" : " (Obsidian durable memory)"),
+  );
+
+  // Test connection by querying required and optional tables.
   console.log(`\n  Testing connection...`);
 
-  let allTablesExist = true;
+  let allRequiredTablesExist = true;
+  const checks: TableCheck[] = [];
+  if (features.messageHistory || features.relevantContext) {
+    checks.push({ table: "messages", required: true });
+  }
+  if (features.durableMemory) {
+    checks.push({ table: "memory", required: true });
+  } else {
+    checks.push({ table: "memory", required: false });
+  }
+  checks.push({ table: "logs", required: false });
 
-  for (const table of REQUIRED_TABLES) {
+  for (const { table, required } of checks) {
     try {
       const res = await fetch(`${url}/rest/v1/${table}?select=*&limit=1`, {
         headers: {
@@ -83,14 +102,14 @@ async function main() {
       });
 
       if (res.status === 200) {
-        console.log(`  ${PASS} Table "${table}" exists`);
+        console.log(`  ${PASS} ${required ? "Required" : "Optional"} table "${table}" exists`);
       } else if (res.status === 404 || res.status === 406) {
-        console.log(`  ${FAIL} Table "${table}" not found`);
-        allTablesExist = false;
+        console.log(`  ${required ? FAIL : WARN} ${required ? "Required" : "Optional"} table "${table}" not found`);
+        if (required) allRequiredTablesExist = false;
       } else {
         const body = await res.text();
-        console.log(`  ${FAIL} Table "${table}": ${res.status} ${body.slice(0, 100)}`);
-        allTablesExist = false;
+        console.log(`  ${required ? FAIL : WARN} Table "${table}": ${res.status} ${body.slice(0, 100)}`);
+        if (required) allRequiredTablesExist = false;
       }
     } catch (err: any) {
       console.log(`  ${FAIL} Could not reach Supabase`);
@@ -99,14 +118,17 @@ async function main() {
     }
   }
 
-  if (!allTablesExist) {
-    console.log(`\n  ${WARN} Some tables are missing. Run the schema in your Supabase SQL Editor:`);
+  if (!allRequiredTablesExist) {
+    console.log(`\n  ${WARN} Some required tables are missing. Run the schema in your Supabase SQL Editor:`);
     console.log(`      ${dim("1. Open your Supabase dashboard > SQL Editor")}`);
     console.log(`      ${dim("2. Paste contents of db/schema.sql")}`);
     console.log(`      ${dim("3. Click Run")}`);
     console.log(`      ${dim("4. Re-run this test")}`);
   } else {
-    console.log(`\n  ${green("All good!")} Supabase is configured correctly.`);
+    console.log(`\n  ${green("All good!")} Supabase is configured for the selected role.`);
+    if (!features.durableMemory) {
+      console.log(`      ${dim("Obsidian remains the durable memory source of truth.")}`);
+    }
   }
 
   console.log("");

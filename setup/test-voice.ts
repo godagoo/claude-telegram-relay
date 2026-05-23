@@ -5,8 +5,27 @@
  * Run: bun run test:voice
  */
 
-import "dotenv/config";
+import { existsSync, readFileSync } from "fs";
+import { dirname, join } from "path";
 
+const PROJECT_ROOT = dirname(import.meta.dir);
+
+function loadEnv(): void {
+  const envPath = join(PROJECT_ROOT, ".env");
+  if (!existsSync(envPath)) return;
+
+  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    if (process.env[key] !== undefined) continue;
+    process.env[key] = rawValue.replace(/^["']|["']$/g, "");
+  }
+}
+
+loadEnv();
 const VOICE_PROVIDER = process.env.VOICE_PROVIDER || "";
 
 async function testGroq(): Promise<boolean> {

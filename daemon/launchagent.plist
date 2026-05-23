@@ -25,10 +25,17 @@
     <dict>
         <key>PATH</key>
         <!-- UPDATE THIS: Include paths to bun, node, claude -->
-        <string>/Users/YOUR_USERNAME/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/YOUR_USERNAME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <!-- UPDATE THIS -->
         <string>/Users/YOUR_USERNAME</string>
+        <key>CLAUDE_PATH</key>
+        <!-- UPDATE THIS: launchd does not inherit your interactive shell PATH -->
+        <string>/Users/YOUR_USERNAME/.local/bin/claude</string>
+        <key>CLAUDE_TIMEOUT_MS</key>
+        <string>90000</string>
+        <key>CLAUDE_RESUME</key>
+        <string>0</string>
     </dict>
 
     <!-- Start when loaded -->
@@ -59,7 +66,11 @@ SETUP INSTRUCTIONS:
 
 1. Replace all YOUR_USERNAME with your actual macOS username
 
-2. Copy to LaunchAgents:
+2. Prefer the generated installer, which keeps PATH, logs, RELAY_DIR, and
+   launchctl bootstrap behavior in sync:
+   bun run setup:launchd -- --service relay
+
+   Manual fallback: copy to LaunchAgents:
    cp daemon/launchagent.plist ~/Library/LaunchAgents/com.claude.telegram-relay.plist
 
 3. Make sure your .env file exists in the relay directory

@@ -44,17 +44,21 @@ Your bot's memory lives in Supabase: conversation history, facts, goals, and sem
 
 **You need from the user:**
 - Supabase Project URL
-- Supabase anon public key
+- Supabase service_role key (NOT the anon key — the RLS policies in
+  `db/schema.sql` only grant access to `service_role`).
 
 **What to tell them:**
 1. Go to supabase.com, create a free account
 2. Create a new project (any name, any region close to them)
 3. Wait ~2 minutes for it to provision
 4. Go to Project Settings > API
-5. Copy: Project URL and anon public key
+5. Reveal and copy the `service_role` key (not the public `anon` key).
+   Warn them this key bypasses RLS — treat it like a database password.
 
 **What you do:**
-1. Save `SUPABASE_URL` and `SUPABASE_ANON_KEY` to `.env`
+1. Save `SUPABASE_URL` and the service_role key as `SUPABASE_ANON_KEY` in
+   `.env`. The env var name is preserved for backwards compatibility; the
+   value must be the service_role key.
 
 ### Step 2: Connect Supabase MCP
 

@@ -1,6 +1,8 @@
--- Optional: Supabase Schema for Cloud Memory
+-- Optional: Supabase Schema for Cloud History/Search
 -- Run this in Supabase SQL Editor if you want cloud persistence
--- This enables: conversation history, semantic search, goals tracking
+-- This enables: conversation history, semantic search, and optional goals.
+-- Keep Obsidian as durable memory with MEMORY_AUTHORITY=obsidian unless you
+-- intentionally want Supabase to own durable facts/goals.
 
 -- Enable vector extension for semantic search (optional)
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -64,10 +66,22 @@ ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memory ENABLE ROW LEVEL SECURITY;
 ALTER TABLE logs ENABLE ROW LEVEL SECURITY;
 
--- Allow all for service role (your bot uses service key)
-CREATE POLICY "Allow all for service role" ON messages FOR ALL USING (true);
-CREATE POLICY "Allow all for service role" ON memory FOR ALL USING (true);
-CREATE POLICY "Allow all for service role" ON logs FOR ALL USING (true);
+-- Service-role only. Configure the relay with a Supabase service_role key
+-- so it bypasses RLS via these policies. Anon and authenticated roles are
+-- denied implicitly. The previous `FOR ALL USING (true)` was a misnomer:
+-- it permitted every role and defeated RLS.
+DROP POLICY IF EXISTS "Allow all for service role" ON messages;
+DROP POLICY IF EXISTS "Allow all for service role" ON memory;
+DROP POLICY IF EXISTS "Allow all for service role" ON logs;
+DROP POLICY IF EXISTS "service_role full access" ON messages;
+DROP POLICY IF EXISTS "service_role full access" ON memory;
+DROP POLICY IF EXISTS "service_role full access" ON logs;
+CREATE POLICY "service_role full access" ON messages
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY "service_role full access" ON memory
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY "service_role full access" ON logs
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
 
 -- ============================================================
 -- HELPER FUNCTIONS
